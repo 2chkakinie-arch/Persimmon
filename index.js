@@ -1,688 +1,957 @@
-const express = require('express');
-const path = require('path');
-const youtubesearchapi = require('youtube-search-api');
+// ============================================================
+//  Persimmon — 柿Tube (YouTube frontend) + WebUnblocker host
+//  Author: Genspark for user
+//  All pages except /home.html live inline here as regex routes.
+// ============================================================
 
-const app = express();
+const express  = require('express');
+const path     = require('path');
+const ytsr     = require('youtube-search-api');
+
+const app  = express();
 const PORT = process.env.PORT || 3000;
 
-const ORBY_HOSTS = [
+/* ---------- API base fallback ---------- */
+const API_BASES = [
   'https://orby-api.vercel.app',
   'https://orby-api.onrender.com'
 ];
-
-app.use(express.static(path.join(__dirname, 'public')));
-
-/* ---------- ORBY fetch with fallback ---------- */
-async function orbyFetch(pathAndQuery){
+async function orby(pathAndQuery){
   let lastErr;
-  for(const host of ORBY_HOSTS){
+  for(const base of API_BASES){
     try{
-      const r = await fetch(host + pathAndQuery, { headers:{ 'accept':'application/json' } });
-      if(!r.ok) { lastErr = new Error(host+' -> '+r.status); continue; }
-      const ct = r.headers.get('content-type')||'';
-      if(ct.includes('application/json')) return await r.json();
-      return await r.text();
+      const r = await fetch(base + pathAndQuery, { headers:{ 'accept':'application/json' } });
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      return await r.json();
     }catch(e){ lastErr = e; }
   }
-  throw lastErr || new Error('All Orby hosts failed');
+  throw lastErr || new Error('All Orby API bases failed');
 }
 
-/* =============================================================
- *  API PROXIES
- * ============================================================= */
-app.get('/api/search', async (req,res)=>{
-  const q = (req.query.q||'').trim();
-  const page = parseInt(req.query.page||'1',10);
-  if(!q) return res.status(400).json({error:'q required'});
-  try{
-    const data = await youtubesearchapi.GetListByKeyword(q, false, 30, [{type:'video'},{type:'channel'}]);
-    res.json(data);
-  }catch(e){
-    try{
-      const fallback = await orbyFetch(`/orby/yt/search?q=${encodeURIComponent(q)}&page=${page}`);
-      res.json({ items: (fallback.results||[]).map(v=>({
-        id:v.videoId, type:'video',
-        title:v.title,
-        thumbnail:{thumbnails:[{url:v.thumbnail}]},
-        channelTitle:v.channelName,
-        length:{simpleText:v.duration},
-        viewCount: v.views,
-        publishedTime: v.publishedTime,
-        channelThumbnail: v.channelThumbnail
-      })), nextPage:fallback.nextPage });
-    }catch(err){
-      res.status(500).json({error:String(err.message||err)});
-    }
-  }
-});
+/* ---------- Static: only /home.html + /img + /embed.html live in /public ---------- */
+app.use(express.static(path.join(__dirname, 'public'), { index: false }));
 
-app.get('/api/meta/:videoId', async (req,res)=>{
-  try{ res.json(await orbyFetch('/orby/yt/meta/'+encodeURIComponent(req.params.videoId))); }
-  catch(e){ res.status(500).json({error:String(e.message||e)}); }
-});
-app.get('/api/channel/:channelId', async (req,res)=>{
-  try{ res.json(await orbyFetch('/orby/yt/channel/'+encodeURIComponent(req.params.channelId))); }
-  catch(e){ res.status(500).json({error:String(e.message||e)}); }
-});
-app.get('/api/comments/:videoId', async (req,res)=>{
-  const page = req.query.page||1;
-  const cont = req.query.continuation ? `&continuation=${encodeURIComponent(req.query.continuation)}` : '';
-  try{ res.json(await orbyFetch(`/orby/yt/comments/${encodeURIComponent(req.params.videoId)}?page=${page}${cont}`)); }
-  catch(e){ res.status(500).json({error:String(e.message||e)}); }
-});
-app.get('/api/recommend/:videoId', async (req,res)=>{
-  try{ res.json(await orbyFetch('/orby/yt/recommend/'+encodeURIComponent(req.params.videoId))); }
-  catch(e){ res.status(500).json({error:String(e.message||e)}); }
-});
-app.get('/api/formats/:videoId', async (req,res)=>{
-  try{ res.json(await orbyFetch(`/orby/yt/${encodeURIComponent(req.params.videoId)}?format=json&provider=Orby-MAX`)); }
-  catch(e){ res.status(500).json({error:String(e.message||e)}); }
-});
-app.get('/api/channel-videos', async (req,res)=>{
-  const name = (req.query.name||'').trim();
-  if(!name) return res.status(400).json({error:'name required'});
-  try{
-    const data = await youtubesearchapi.GetListByKeyword(name, false, 40, [{type:'video'}]);
-    res.json(data);
-  }catch(e){ res.status(500).json({error:String(e.message||e)}); }
-});
-
-/* =============================================================
- *  SHARED HTML SHELL
- * ============================================================= */
-const SHARED_CSS = `
+/* ============================================================
+   SHARED HTML — layout, header, styles, client bootstrap
+   ============================================================ */
+const SHARED_HEAD = /*html*/`
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<link rel="icon" href="/img/kaki.png">
+<style>
 :root{
-  --persimmon:#F2731A;--persimmon-dark:#D45A0A;--persimmon-soft:#FFE4CC;
-  --leaf:#3E7C4A;--bg:#FFFBF7;--surface:#fff;--surface-2:#faf5f0;
-  --text:#1a1a1a;--text-sub:#666;--text-mute:#999;
-  --border:rgba(0,0,0,.08);--shadow:0 4px 20px rgba(0,0,0,.06);
+  --bg-0:#0a0a0d; --bg-1:#111116; --bg-2:#1a1a22; --bg-3:#22222c;
+  --fg-0:#f5f5f7; --fg-1:#a8a8b3; --fg-2:#6b6b78;
+  --accent:#ff7a3d; --accent-2:#ff9a5a; --accent-glow:rgba(255,122,61,.35);
+  --line:rgba(255,255,255,.08);
+  --radius:16px;
+  --ease:cubic-bezier(.22,1,.36,1);
 }
 *{box-sizing:border-box;margin:0;padding:0}
-html,body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Sans","Noto Sans JP",sans-serif;min-height:100vh}
+html,body{background:var(--bg-0);color:var(--fg-0);
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Helvetica Neue","Hiragino Sans","Noto Sans JP",sans-serif;
+  -webkit-font-smoothing:antialiased}
 a{color:inherit;text-decoration:none}
 img{display:block;max-width:100%}
-.topbar{
-  position:sticky;top:0;z-index:100;background:rgba(255,251,247,.92);backdrop-filter:blur(14px);
-  border-bottom:1px solid var(--border);padding:12px 24px;display:flex;align-items:center;gap:20px;
+button{font-family:inherit;cursor:pointer;border:0;background:none;color:inherit}
+input,select{font-family:inherit}
+::selection{background:var(--accent);color:#1a0e05}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#2a2a35;border-radius:10px}
+::-webkit-scrollbar-thumb:hover{background:#3a3a48}
+
+/* Header */
+.hdr{
+  position:sticky;top:0;z-index:50;
+  display:flex;align-items:center;gap:24px;
+  padding:14px 28px;
+  background:rgba(10,10,13,.75);
+  backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);
+  border-bottom:1px solid var(--line);
 }
-.topbar .brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:22px;
-  background:linear-gradient(135deg,var(--persimmon),var(--persimmon-dark));
-  -webkit-background-clip:text;background-clip:text;color:transparent;letter-spacing:-.5px}
-.topbar .brand img{width:32px;height:32px}
-.topbar .search{flex:1;max-width:640px;display:flex;background:var(--surface);border:1px solid var(--border);border-radius:999px;padding:4px 4px 4px 20px;align-items:center;transition:box-shadow .2s}
-.topbar .search:focus-within{box-shadow:0 4px 20px rgba(242,115,26,.15);border-color:var(--persimmon-soft)}
-.topbar .search input{flex:1;border:none;outline:none;background:transparent;padding:10px 8px;font-size:14px;font-family:inherit}
-.topbar .search button{background:linear-gradient(135deg,var(--persimmon),var(--persimmon-dark));color:#fff;border:none;border-radius:999px;padding:8px 18px;font-weight:600;cursor:pointer;font-size:13px}
-.topbar .home-link{color:var(--text-sub);font-size:13px;padding:8px 12px;border-radius:8px;transition:background .15s}
-.topbar .home-link:hover{background:var(--surface-2)}
-.container{max-width:1400px;margin:0 auto;padding:24px}
-.skeleton{background:linear-gradient(90deg,#eee 0%,#f5f5f5 50%,#eee 100%);background-size:200% 100%;animation:sh 1.4s infinite;border-radius:8px}
-@keyframes sh{from{background-position:200% 0}to{background-position:-200% 0}}
-.chip{display:inline-flex;align-items:center;gap:6px;background:var(--surface-2);border:1px solid var(--border);padding:6px 12px;border-radius:999px;font-size:12px;color:var(--text-sub)}
-button.btn{background:linear-gradient(135deg,var(--persimmon),var(--persimmon-dark));color:#fff;border:none;border-radius:999px;padding:10px 20px;font-weight:600;cursor:pointer;font-size:14px;transition:transform .15s;font-family:inherit}
-button.btn:hover{transform:translateY(-1px)}
-button.btn.ghost{background:var(--surface);color:var(--text);border:1px solid var(--border);box-shadow:none}
+.hdr .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:18px;letter-spacing:-.02em}
+.hdr .brand img{width:32px;height:32px;filter:drop-shadow(0 4px 12px var(--accent-glow))}
+.hdr .brand span{background:linear-gradient(135deg,#fff,var(--accent-2));-webkit-background-clip:text;background-clip:text;color:transparent}
+.hdr form{flex:1;max-width:640px;margin:0 auto}
+.hdr .sbox{
+  display:flex;align-items:center;
+  background:var(--bg-2);border:1px solid var(--line);
+  border-radius:999px;padding:4px 4px 4px 20px;
+  transition:all .3s var(--ease);
+}
+.hdr .sbox:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-glow)}
+.hdr .sbox input{flex:1;background:transparent;border:0;outline:0;color:var(--fg-0);padding:12px 12px;font-size:14px}
+.hdr .sbox button{
+  background:linear-gradient(135deg,var(--accent),var(--accent-2));
+  color:#1a0e05;border-radius:999px;padding:10px 18px;font-weight:600;font-size:13px;
+  display:flex;align-items:center;gap:6px;transition:transform .25s var(--ease);
+}
+.hdr .sbox button:hover{transform:translateY(-1px)}
+.hdr .home-link{
+  color:var(--fg-1);font-size:13px;padding:8px 14px;border-radius:10px;
+  transition:all .25s var(--ease);
+}
+.hdr .home-link:hover{background:var(--bg-2);color:var(--fg-0)}
+
+main{max-width:1400px;margin:0 auto;padding:28px}
+
+/* Card / Skeleton */
+.skl{background:linear-gradient(90deg,#1a1a22 0%,#22222c 50%,#1a1a22 100%);
+  background-size:200% 100%;animation:shimmer 1.5s linear infinite;border-radius:12px}
+@keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+
+/* Toast */
+.toast{
+  position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(80px);
+  background:var(--bg-2);border:1px solid var(--line);
+  padding:12px 20px;border-radius:12px;font-size:14px;
+  box-shadow:0 20px 60px rgba(0,0,0,.5);
+  opacity:0;transition:all .4s var(--ease);z-index:1000;
+}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* Page fade */
+main{animation:fadein .5s var(--ease) both}
+@keyframes fadein{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+</style>
 `;
 
-function shell(title, body, extraCss=''){
-  return `<!DOCTYPE html><html lang="ja"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${title}</title><link rel="icon" href="/img/kaki.png">
-<style>${SHARED_CSS}${extraCss}</style></head><body>
-<header class="topbar">
-  <a class="brand" href="/"><img src="/img/kaki.png" onerror="this.style.display='none'"/><span>柿Tube</span></a>
-  <form class="search" onsubmit="var v=this.q.value.trim();if(!v)return false;var m=v.match(/([\\w-]{11})/);if(/youtu/.test(v)&&m){location.href='/watch?v='+m[1];}else{location.href='/search?q='+encodeURIComponent(v);}return false;">
-    <input name="q" placeholder="柿Tubeを検索…" autocomplete="off"/>
-    <button type="submit">検索</button>
+const SHARED_HEADER = /*html*/`
+<div class="hdr">
+  <a href="/" class="brand">
+    <img src="/img/kaki.png" alt="柿" onerror="this.style.display='none'">
+    <span>柿Tube</span>
+  </a>
+  <form onsubmit="event.preventDefault();const v=this.q.value.trim();if(!v)return;const m=v.match(/(?:youtu\\.be\\/|v=|shorts\\/)([A-Za-z0-9_-]{11})/);location.href=m?'/watch?v='+m[1]:'/search?q='+encodeURIComponent(v);">
+    <div class="sbox">
+      <input name="q" placeholder="動画・チャンネルを検索…" autocomplete="off">
+      <button type="submit">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.35-4.35"/></svg>
+        検索
+      </button>
+    </div>
   </form>
-  <a class="home-link" href="/">ホーム</a>
-</header>
-${body}
-</body></html>`;
+  <a href="/" class="home-link">Home</a>
+</div>
+`;
+
+const SHARED_TOAST_JS = /*js*/`
+function toast(msg){
+  let t = document.querySelector('.toast');
+  if(!t){t=document.createElement('div');t.className='toast';document.body.appendChild(t);}
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(t._tm); t._tm = setTimeout(()=>t.classList.remove('show'), 2600);
 }
+function fmtViews(n){
+  n = Number(n)||0;
+  if(n>=1e8) return (n/1e8).toFixed(1)+'億';
+  if(n>=1e4) return (n/1e4).toFixed(1)+'万';
+  if(n>=1e3) return (n/1e3).toFixed(1)+'K';
+  return String(n);
+}
+function fmtDur(sec){
+  sec = Number(sec)||0;
+  const h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60), s=Math.floor(sec%60);
+  return h ? h+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')
+           : m+':'+String(s).padStart(2,'0');
+}
+function timeAgo(iso){
+  if(!iso) return '';
+  const d = new Date(iso); if(isNaN(d)) return iso;
+  const s = (Date.now()-d.getTime())/1000;
+  if(s<60) return '数秒前';
+  if(s<3600) return Math.floor(s/60)+'分前';
+  if(s<86400) return Math.floor(s/3600)+'時間前';
+  if(s<2592000) return Math.floor(s/86400)+'日前';
+  if(s<31536000) return Math.floor(s/2592000)+'ヶ月前';
+  return Math.floor(s/31536000)+'年前';
+}
+`;
 
-/* =============================================================
- *  /search
- * ============================================================= */
-app.get('/search', (req,res)=>{
-  const q = req.query.q || '';
-  const css = `
-    .layout{display:grid;grid-template-columns:1fr;gap:16px;max-width:1100px;margin:0 auto}
-    .result{display:grid;grid-template-columns:360px 1fr;gap:20px;background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:14px;transition:transform .2s,box-shadow .2s;cursor:pointer}
-    .result:hover{transform:translateY(-2px);box-shadow:0 12px 30px rgba(242,115,26,.12);border-color:var(--persimmon-soft)}
-    .thumb{position:relative;aspect-ratio:16/9;background:#000;border-radius:12px;overflow:hidden}
-    .thumb img{width:100%;height:100%;object-fit:cover}
-    .duration{position:absolute;bottom:8px;right:8px;background:rgba(0,0,0,.85);color:#fff;padding:2px 8px;border-radius:6px;font-size:12px;font-weight:600}
-    .meta h3{font-size:18px;font-weight:700;margin-bottom:8px;line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-    .channel-line{display:flex;align-items:center;gap:10px;margin:12px 0;color:var(--text-sub);font-size:13px}
-    .channel-line img{width:28px;height:28px;border-radius:50%;object-fit:cover;background:var(--surface-2)}
-    .stats{color:var(--text-mute);font-size:13px}
-    .stats span+span::before{content:"·";margin:0 8px}
-    .channel-card{background:linear-gradient(135deg,#fff,var(--surface-2));border:1px solid var(--persimmon-soft);border-radius:16px;padding:16px 20px;display:flex;align-items:center;gap:20px;cursor:pointer}
-    .channel-card img{width:80px;height:80px;border-radius:50%;object-fit:cover;background:#eee}
-    .channel-card .n{font-weight:700;font-size:18px}
-    .channel-card .s{color:var(--text-sub);font-size:13px;margin-top:4px}
-    .heading{padding:20px 0 8px;font-size:14px;color:var(--text-sub);font-weight:600;letter-spacing:.5px;text-transform:uppercase}
-    @media(max-width:720px){.result{grid-template-columns:1fr}}
-    .empty{text-align:center;padding:80px 20px;color:var(--text-sub)}
-  `;
-  const body = `
-  <main class="container">
-    <div id="results" class="layout"></div>
-  </main>
-  <script>
-  const q = ${JSON.stringify(q)};
-  const box = document.getElementById('results');
-  box.innerHTML = '<div class="skeleton" style="height:120px"></div><div class="skeleton" style="height:120px"></div><div class="skeleton" style="height:120px"></div>';
+/* ============================================================
+   ROUTES
+   ============================================================ */
 
-  function fmtViews(v){
-    if(!v)return '';
-    if(typeof v==='string') return v;
-    if(v>=1e8)return (v/1e8).toFixed(1)+'億回視聴';
-    if(v>=1e4)return (v/1e4).toFixed(1)+'万回視聴';
-    return v.toLocaleString()+' 回視聴';
-  }
-
-  fetch('/api/search?q='+encodeURIComponent(q)).then(r=>r.json()).then(data=>{
-    const items = data.items||[];
-    if(!items.length){ box.innerHTML='<div class="empty">結果が見つかりませんでした</div>'; return; }
-    const chans=[], vids=[];
-    items.forEach(it=>{
-      if(it.type==='channel') chans.push(it);
-      else if(it.type==='video'||it.videoId||it.id) vids.push(it);
-    });
-    let html='';
-    if(chans.length){
-      html += '<div class="heading">チャンネル</div>';
-      chans.slice(0,3).forEach(c=>{
-        const cid = c.channelId || c.id;
-        const av = (c.thumbnail && (c.thumbnail.thumbnails? c.thumbnail.thumbnails.slice(-1)[0].url : c.thumbnail)) || '';
-        html += \`<a class="channel-card" href="/channel/\${cid}">
-          <img src="\${av}" onerror="this.style.visibility='hidden'"/>
-          <div><div class="n">\${c.title||c.name||''}</div>
-          <div class="s">\${c.videoCount? c.videoCount+' 本の動画':''} \${c.subscriberCount||''}</div></div>
-        </a>\`;
-      });
-    }
-    html += '<div class="heading">動画</div>';
-    vids.forEach(v=>{
-      const id = v.id || v.videoId;
-      const t  = v.title;
-      const th = (v.thumbnail && (v.thumbnail.thumbnails? v.thumbnail.thumbnails.slice(-1)[0].url : v.thumbnail)) || '';
-      const dur = (v.length && (v.length.simpleText||v.length)) || v.duration || '';
-      const ch = v.channelTitle || v.channelName || (v.shortBylineText && v.shortBylineText.runs && v.shortBylineText.runs[0].text) || '';
-      const cThumb = v.channelThumbnail || '';
-      const views = fmtViews(v.viewCount || v.views);
-      const pub = v.publishedTime || v.publishedTimeText || '';
-      html += \`<a class="result" href="/watch?v=\${id}">
-        <div class="thumb"><img loading="lazy" src="\${th}"/>\${dur?\`<span class="duration">\${dur}</span>\`:''}</div>
-        <div class="meta">
-          <h3>\${t}</h3>
-          <div class="channel-line">
-            \${cThumb?\`<img src="\${cThumb}"/>\`:'<div style="width:28px;height:28px;border-radius:50%;background:var(--surface-2)"></div>'}
-            <span>\${ch}</span>
-          </div>
-          <div class="stats">\${views?\`<span>\${views}</span>\`:''}\${pub?\`<span>\${pub}</span>\`:''}</div>
-        </div>
-      </a>\`;
-    });
-    box.innerHTML = html;
-  }).catch(e=>{ box.innerHTML='<div class="empty">エラー: '+e.message+'</div>'; });
-  </script>`;
-  res.send(shell('「'+q+'」の検索結果 · 柿Tube', body, css));
+// ---------- Home ----------
+app.get('/', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'home.html'));
 });
 
-/* =============================================================
- *  /watch
- * ============================================================= */
-app.get(/^\/watch\/?$/, (req,res)=>{
-  const vid = req.query.v || '';
-  const css = `
-    .watch{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:28px;max-width:1600px;margin:0 auto}
-    @media(max-width:1100px){.watch{grid-template-columns:1fr}}
-    .player-wrap{background:#000;border-radius:16px;overflow:hidden;aspect-ratio:16/9;position:relative;box-shadow:0 20px 60px rgba(0,0,0,.25)}
-    .player-wrap video{width:100%;height:100%;background:#000}
-    .player-loading{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#fff;font-size:14px;background:radial-gradient(circle at center,#333,#000)}
-    .player-loading .spin{width:48px;height:48px;border:3px solid rgba(255,255,255,.15);border-top-color:var(--persimmon);border-radius:50%;animation:spin 1s linear infinite}
-    @keyframes spin{to{transform:rotate(360deg)}}
-    .quality-bar{position:absolute;bottom:12px;right:12px;display:flex;gap:6px;opacity:0;transition:opacity .25s;pointer-events:none}
-    .player-wrap:hover .quality-bar,.quality-bar.open{opacity:1;pointer-events:auto}
-    .quality-btn{background:rgba(0,0,0,.75);color:#fff;border:none;padding:6px 12px;border-radius:8px;font-size:12px;cursor:pointer;font-family:inherit;backdrop-filter:blur(6px)}
-    .quality-menu{position:absolute;bottom:52px;right:12px;background:rgba(24,24,24,.95);backdrop-filter:blur(10px);border-radius:12px;padding:6px;min-width:160px;display:none;box-shadow:0 20px 40px rgba(0,0,0,.5)}
-    .quality-menu.open{display:block}
-    .quality-menu button{display:block;width:100%;background:transparent;color:#fff;border:none;padding:8px 12px;border-radius:8px;text-align:left;cursor:pointer;font-size:13px;font-family:inherit}
-    .quality-menu button:hover{background:rgba(255,255,255,.1)}
-    .quality-menu button.active{background:var(--persimmon)}
-    .title{font-size:22px;font-weight:700;margin:20px 0 12px;line-height:1.4}
-    .video-meta{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px;padding:12px 0;border-bottom:1px solid var(--border)}
-    .ch-info{display:flex;align-items:center;gap:14px}
-    .ch-info img{width:48px;height:48px;border-radius:50%;object-fit:cover;background:var(--surface-2)}
-    .ch-info .name{font-weight:700;font-size:15px}
-    .ch-info .subs{color:var(--text-sub);font-size:12px;margin-top:2px}
-    .actions{display:flex;gap:8px;flex-wrap:wrap}
-    .actions button{background:var(--surface-2);border:1px solid var(--border);color:var(--text);padding:9px 16px;border-radius:999px;font-size:13px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:6px;font-family:inherit;transition:background .15s}
-    .actions button:hover{background:var(--persimmon-soft)}
-    .actions button.active{background:linear-gradient(135deg,var(--persimmon),var(--persimmon-dark));color:#fff;border-color:transparent}
-    .subscribe{background:linear-gradient(135deg,var(--persimmon),var(--persimmon-dark))!important;color:#fff!important;border:none!important}
-    .subscribe.subd{background:var(--surface-2)!important;color:var(--text)!important;border:1px solid var(--border)!important}
-    .desc{background:var(--surface-2);border-radius:12px;padding:16px;margin-top:16px;white-space:pre-wrap;font-size:14px;line-height:1.7;max-height:150px;overflow:hidden;position:relative;cursor:pointer;transition:max-height .3s}
-    .desc.open{max-height:none}
-    .desc .fade{position:absolute;bottom:0;left:0;right:0;height:40px;background:linear-gradient(transparent,var(--surface-2));pointer-events:none}
-    .desc.open .fade{display:none}
-    .desc .stats{color:var(--text-sub);font-size:13px;margin-bottom:8px;font-weight:600}
-    .side{display:flex;flex-direction:column;gap:12px}
-    .side h3{font-size:15px;font-weight:700;margin-bottom:4px}
-    .rec{display:grid;grid-template-columns:168px 1fr;gap:10px;cursor:pointer;padding:6px;border-radius:10px;transition:background .15s}
-    .rec:hover{background:var(--surface-2)}
-    .rec .th{aspect-ratio:16/9;background:#000;border-radius:8px;overflow:hidden;position:relative}
-    .rec .th img{width:100%;height:100%;object-fit:cover}
-    .rec .dur{position:absolute;bottom:4px;right:4px;background:rgba(0,0,0,.85);color:#fff;padding:1px 6px;border-radius:4px;font-size:11px}
-    .rec .t{font-size:14px;font-weight:600;line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-    .rec .c{color:var(--text-sub);font-size:12px;margin-top:4px}
-    .comments{margin-top:32px}
-    .comments h3{font-size:18px;font-weight:700;margin-bottom:20px}
-    .comment{display:grid;grid-template-columns:40px 1fr;gap:12px;padding:14px 0;border-bottom:1px solid var(--border)}
-    .comment img{width:40px;height:40px;border-radius:50%;background:var(--surface-2);object-fit:cover}
-    .comment .head{font-size:13px;font-weight:600;margin-bottom:4px}
-    .comment .head span{color:var(--text-mute);font-weight:400;margin-left:8px;font-size:12px}
-    .comment .body{font-size:14px;line-height:1.5;white-space:pre-wrap}
-    .comment .like{color:var(--text-sub);font-size:12px;margin-top:6px}
-    .load-more{background:var(--surface-2);border:1px solid var(--border);padding:12px;border-radius:12px;width:100%;cursor:pointer;font-family:inherit;font-size:13px;font-weight:600;color:var(--text-sub)}
-    .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1a1a1a;color:#fff;padding:12px 24px;border-radius:999px;font-size:14px;z-index:9999;opacity:0;transition:opacity .3s,transform .3s;pointer-events:none}
-    .toast.show{opacity:1;transform:translate(-50%,-8px)}
-  `;
-  const body = `
-  <main class="container">
-    <div class="watch">
-      <div>
-        <div class="player-wrap" id="playerWrap">
-          <video id="video" playsinline controls></video>
-          <video id="audio" style="display:none" playsinline></video>
-          <div class="player-loading" id="loading"><div class="spin"></div></div>
-          <div class="quality-bar">
-            <button class="quality-btn" id="qBtn">画質: 360p ▾</button>
-          </div>
-          <div class="quality-menu" id="qMenu"></div>
+// ---------- Suggest (uses youtube-search-api under the hood) ----------
+app.get(/^\/api\/suggest$/, async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if(!q) return res.json([]);
+  try{
+    const r = await ytsr.GetListByKeyword(q, false, 10, [{type:'video'}]);
+    const titles = (r.items||[]).map(i=>i.title).filter(Boolean);
+    res.json([...new Set(titles)].slice(0,8));
+  }catch(e){ res.json([]); }
+});
+
+// ---------- Search API (youtube-search-api, richer result w/ channel) ----------
+app.get(/^\/api\/search$/, async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if(!q) return res.json({ items:[] });
+  try{
+    const r = await ytsr.GetListByKeyword(q, false, 30, [{type:'video'},{type:'channel'}]);
+    res.json(r);
+  }catch(e){
+    res.status(500).json({ error:e.message });
+  }
+});
+
+// ---------- Channel resolve by name (used by watch page for avatar) ----------
+app.get(/^\/api\/resolve-channel$/, async (req, res) => {
+  const name = String(req.query.name || '').trim();
+  if(!name) return res.json({});
+  try{
+    const r = await ytsr.GetListByKeyword(name, false, 8, [{type:'channel'}]);
+    const items = (r.items||[]).filter(i => (i.type==='channel'));
+    // Try exact match, else fallback to first
+    const exact = items.find(i => (i.title||i.name||'').toLowerCase() === name.toLowerCase());
+    const pick = exact || items[0];
+    if(!pick) return res.json({});
+    const thumbs = pick.thumbnail && (pick.thumbnail.thumbnails || pick.thumbnail);
+    const url = Array.isArray(thumbs) ? (thumbs[thumbs.length-1]?.url || thumbs[0]?.url) : (thumbs?.url || null);
+    res.json({
+      channelId: pick.id || pick.channelId,
+      name: pick.title || pick.name,
+      avatar: url ? (url.startsWith('//') ? 'https:'+url : url) : null
+    });
+  }catch(e){ res.json({}); }
+});
+
+// ---------- Channel videos via youtube-search-api ----------
+app.get(/^\/api\/channel-videos$/, async (req, res) => {
+  const name = String(req.query.name || '').trim();
+  if(!name) return res.json({ items:[] });
+  try{
+    const r = await ytsr.GetListByKeyword(name + ' チャンネル', false, 30, [{type:'video'}]);
+    res.json(r);
+  }catch(e){ res.json({ items:[] }); }
+});
+
+// ---------- Meta / Comments / Channel / Recommend / Stream (proxy to Orby) ----------
+async function proxyOrby(res, pathAndQuery){
+  try{
+    const data = await orby(pathAndQuery);
+    res.json(data);
+  }catch(e){ res.status(502).json({ error:e.message }); }
+}
+app.get(/^\/api\/meta\/([\w-]{11})$/,    (req,res)=>proxyOrby(res, `/orby/yt/meta/${req.params[0]}`));
+app.get(/^\/api\/comments\/([\w-]{11})$/,(req,res)=>{
+  const page = req.query.page ? `?page=${encodeURIComponent(req.query.page)}` : '';
+  proxyOrby(res, `/orby/yt/comments/${req.params[0]}${page}`);
+});
+app.get(/^\/api\/channel\/(UC[\w-]{22})$/,(req,res)=>proxyOrby(res, `/orby/yt/channel/${req.params[0]}`));
+app.get(/^\/api\/recommend\/([\w-]{11})$/,(req,res)=>proxyOrby(res, `/orby/yt/recommend/${req.params[0]}`));
+app.get(/^\/api\/streams\/([\w-]{11})$/,  (req,res)=>proxyOrby(res, `/orby/yt/${req.params[0]}?format=json&provider=Orby-MAX`));
+
+/* ============================================================
+   /search  — 検索結果ページ
+   ============================================================ */
+app.get(/^\/search$/, (req, res) => {
+  const q = String(req.query.q || '');
+  res.send(`<!DOCTYPE html><html lang="ja"><head><title>${escapeHtml(q)} — 柿Tube</title>${SHARED_HEAD}
+<style>
+.results{display:flex;flex-direction:column;gap:20px;max-width:960px;margin:0 auto}
+.result{display:flex;gap:20px;padding:14px;border-radius:16px;transition:all .3s var(--ease)}
+.result:hover{background:var(--bg-1);transform:translateX(4px)}
+.result .thumb{position:relative;width:340px;aspect-ratio:16/9;flex-shrink:0;border-radius:12px;overflow:hidden;background:var(--bg-2)}
+.result .thumb img{width:100%;height:100%;object-fit:cover;transition:transform .5s var(--ease)}
+.result:hover .thumb img{transform:scale(1.06)}
+.result .dur{position:absolute;bottom:8px;right:8px;background:rgba(0,0,0,.85);padding:2px 8px;border-radius:6px;font-size:12px;font-weight:600}
+.result .live{position:absolute;top:8px;left:8px;background:#e53935;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;letter-spacing:.05em}
+.result .info{flex:1;min-width:0}
+.result h3{font-size:18px;font-weight:600;line-height:1.35;margin-bottom:8px;color:var(--fg-0)}
+.result .meta{color:var(--fg-1);font-size:13px;margin-bottom:12px}
+.result .ch{display:flex;align-items:center;gap:8px;color:var(--fg-1);font-size:13px}
+.result .ch img{width:24px;height:24px;border-radius:50%;object-fit:cover;background:var(--bg-2)}
+.result .ch:hover{color:var(--fg-0)}
+.channel-card{display:flex;align-items:center;gap:20px;padding:20px;background:var(--bg-1);border:1px solid var(--line);border-radius:16px}
+.channel-card img{width:120px;height:120px;border-radius:50%;object-fit:cover;background:var(--bg-2)}
+.channel-card h3{font-size:22px;margin-bottom:6px}
+.channel-card .sub{color:var(--fg-1);font-size:13px}
+.head{margin-bottom:24px;display:flex;align-items:baseline;gap:12px}
+.head h2{font-size:22px;font-weight:600}
+.head .count{color:var(--fg-1);font-size:14px}
+.skl-row{display:flex;gap:20px;padding:14px}
+.skl-row .thumb{width:340px;aspect-ratio:16/9;flex-shrink:0}
+.skl-row .lines{flex:1;display:flex;flex-direction:column;gap:10px}
+.skl-row .lines .l{height:16px;border-radius:8px}
+.empty{padding:60px;text-align:center;color:var(--fg-1)}
+@media(max-width:800px){.result{flex-direction:column}.result .thumb{width:100%}}
+</style></head><body>
+${SHARED_HEADER}
+<main>
+  <div class="head"><h2>検索結果</h2><span class="count">「${escapeHtml(q)}」</span></div>
+  <div class="results" id="list">
+    ${Array(6).fill(0).map(()=>`
+      <div class="skl-row">
+        <div class="thumb skl"></div>
+        <div class="lines">
+          <div class="l skl" style="width:80%"></div>
+          <div class="l skl" style="width:40%"></div>
+          <div class="l skl" style="width:60%"></div>
         </div>
-        <h1 class="title" id="title">読み込み中…</h1>
-        <div class="video-meta">
-          <div class="ch-info">
-            <a id="chAvatarLink" href="#"><img id="chAvatar" src=""/></a>
+      </div>`).join('')}
+  </div>
+</main>
+<script>
+${SHARED_TOAST_JS}
+const q = ${JSON.stringify(q)};
+(async()=>{
+  const list = document.getElementById('list');
+  try{
+    const r = await fetch('/api/search?q=' + encodeURIComponent(q));
+    const data = await r.json();
+    const items = (data.items||[]).filter(i=>i.id||i.channelId);
+    if(!items.length){ list.innerHTML = '<div class="empty">結果が見つかりませんでした</div>'; return; }
+    list.innerHTML = items.map(it=>{
+      if(it.type === 'channel'){
+        const th = it.thumbnail?.thumbnails || it.thumbnail || [];
+        const av = Array.isArray(th) ? (th[th.length-1]?.url || '') : (th.url||'');
+        const url = av && av.startsWith('//') ? 'https:'+av : av;
+        return \`
+          <a href="/channel/\${it.id}" class="channel-card">
+            <img src="\${url}" onerror="this.style.visibility='hidden'">
             <div>
-              <a id="chNameLink" href="#" class="name" style="display:block" id="chName">—</a>
-              <div class="subs" id="chSubs"></div>
+              <h3>\${escapeHtml(it.title||it.name||'')}</h3>
+              <div class="sub">チャンネル</div>
             </div>
-            <button class="btn subscribe" id="subBtn">チャンネル登録</button>
+          </a>\`;
+      }
+      const th = it.thumbnail?.thumbnails || [];
+      const thumb = th[th.length-1]?.url || '';
+      const dur = it.length?.simpleText || (it.isLive?'LIVE':'');
+      const views = it.viewCount || (it.videoInfo?.text) || '';
+      const pub = it.publishedTime || '';
+      const chName = it.channelTitle || it.shortBylineText?.runs?.[0]?.text || '';
+      return \`
+        <div class="result">
+          <a class="thumb" href="/watch?v=\${it.id}">
+            <img src="\${thumb}" loading="lazy">
+            \${it.isLive ? '<span class="live">LIVE</span>' : ''}
+            \${dur && !it.isLive ? '<span class="dur">'+escapeHtml(dur)+'</span>' : ''}
+          </a>
+          <div class="info">
+            <a href="/watch?v=\${it.id}"><h3>\${escapeHtml(it.title||'')}</h3></a>
+            <div class="meta">\${escapeHtml(views)}\${views&&pub?' · ':''}\${escapeHtml(pub)}</div>
+            <a class="ch" href="/search?q=\${encodeURIComponent(chName)}">
+              <span>\${escapeHtml(chName)}</span>
+            </a>
           </div>
-          <div class="actions">
-            <button id="likeBtn">👍 <span id="likeCount">—</span></button>
-            <button id="favBtn">☆ お気に入り</button>
-            <button id="shareBtn">🔗 共有</button>
-            <a id="ytOpen" target="_blank"><button>▶ YouTube で開く</button></a>
-          </div>
-        </div>
-        <div class="desc" id="desc" onclick="this.classList.toggle('open')">
-          <div class="stats" id="descStats"></div>
-          <div id="descText"></div>
-          <div class="fade"></div>
-        </div>
-        <div class="comments">
-          <h3 id="commentsHeading">コメント</h3>
-          <div id="commentsList"></div>
-          <button class="load-more" id="loadMoreC" style="display:none">さらに読み込む</button>
-        </div>
-      </div>
-      <aside class="side">
-        <h3>関連動画</h3>
-        <div id="recs"></div>
-      </aside>
+        </div>\`;
+    }).join('');
+  }catch(e){
+    list.innerHTML = '<div class="empty">読み込みに失敗しました: '+e.message+'</div>';
+  }
+})();
+function escapeHtml(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c])}
+</script>
+</body></html>`);
+});
+
+/* ============================================================
+   /watch  — 動画ページ
+   ============================================================ */
+app.get(/^\/watch$/, (req, res) => {
+  const v = String(req.query.v || '').trim();
+  if(!/^[A-Za-z0-9_-]{11}$/.test(v)) return res.redirect('/');
+  res.send(`<!DOCTYPE html><html lang="ja"><head><title>再生中 — 柿Tube</title>${SHARED_HEAD}
+<style>
+.watch{display:grid;grid-template-columns:1fr 380px;gap:32px}
+@media(max-width:1100px){.watch{grid-template-columns:1fr}}
+.player-wrap{position:relative;width:100%;aspect-ratio:16/9;background:#000;border-radius:16px;overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.6)}
+video{width:100%;height:100%;background:#000;object-fit:contain}
+.player-status{position:absolute;top:16px;left:16px;background:rgba(0,0,0,.7);padding:6px 12px;border-radius:20px;font-size:12px;color:var(--fg-1);display:flex;align-items:center;gap:8px;pointer-events:none;opacity:0;transition:opacity .3s}
+.player-status.show{opacity:1}
+.player-status .dot{width:8px;height:8px;border-radius:50%;background:var(--accent);animation:pulse 1.2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:.4}50%{opacity:1}}
+.quality-btn{position:absolute;bottom:16px;right:16px;background:rgba(0,0,0,.75);color:#fff;padding:8px 14px;border-radius:8px;font-size:13px;font-weight:600;backdrop-filter:blur(10px);display:flex;align-items:center;gap:6px;transition:all .25s var(--ease);z-index:5}
+.quality-btn:hover{background:rgba(0,0,0,.9)}
+.quality-menu{position:absolute;bottom:60px;right:16px;background:rgba(20,20,26,.95);backdrop-filter:blur(20px);border:1px solid var(--line);border-radius:12px;padding:8px;min-width:150px;z-index:6;opacity:0;pointer-events:none;transform:translateY(6px);transition:all .25s var(--ease);max-height:280px;overflow-y:auto}
+.quality-menu.show{opacity:1;pointer-events:auto;transform:translateY(0)}
+.quality-menu button{display:flex;justify-content:space-between;align-items:center;width:100%;padding:8px 12px;border-radius:8px;font-size:13px;color:var(--fg-0);text-align:left}
+.quality-menu button:hover{background:var(--bg-2)}
+.quality-menu button.active{background:var(--accent);color:#1a0e05;font-weight:600}
+.title{font-size:22px;font-weight:600;line-height:1.35;margin-top:20px}
+.meta-row{display:flex;justify-content:space-between;align-items:center;margin-top:16px;padding-bottom:16px;border-bottom:1px solid var(--line);flex-wrap:wrap;gap:16px}
+.channel-block{display:flex;align-items:center;gap:14px;flex:1;min-width:0}
+.channel-block .av{width:48px;height:48px;border-radius:50%;background:var(--bg-2);flex-shrink:0;object-fit:cover}
+.channel-block .info{min-width:0}
+.channel-block .name{font-weight:600;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.channel-block .subs{color:var(--fg-1);font-size:12px}
+.actions{display:flex;gap:8px;flex-wrap:wrap}
+.actions button, .actions a{
+  display:flex;align-items:center;gap:8px;
+  padding:10px 16px;border-radius:999px;
+  background:var(--bg-2);border:1px solid var(--line);
+  font-size:13px;font-weight:500;
+  transition:all .25s var(--ease);
+}
+.actions button:hover, .actions a:hover{background:var(--bg-3);transform:translateY(-1px)}
+.actions button.active{background:var(--accent);color:#1a0e05;border-color:var(--accent)}
+.actions svg{width:16px;height:16px}
+.sub-btn{background:linear-gradient(135deg,var(--accent),var(--accent-2)) !important;color:#1a0e05 !important;border:0 !important;font-weight:700 !important}
+.sub-btn.subbed{background:var(--bg-2) !important;color:var(--fg-0) !important;border:1px solid var(--line) !important}
+.desc{background:var(--bg-1);border-radius:12px;padding:16px;margin-top:16px;font-size:14px;color:var(--fg-1);line-height:1.6;white-space:pre-wrap;max-height:80px;overflow:hidden;position:relative;transition:max-height .4s var(--ease);cursor:pointer}
+.desc.open{max-height:2000px}
+.desc .stats{color:var(--fg-0);font-weight:600;margin-bottom:8px}
+.desc:not(.open)::after{content:"…続きを表示";position:absolute;bottom:8px;right:16px;background:var(--bg-1);padding-left:20px;color:var(--accent);font-size:12px;font-weight:600}
+
+.side h3{font-size:16px;font-weight:600;margin-bottom:16px;color:var(--fg-1)}
+.reco{display:flex;flex-direction:column;gap:12px}
+.reco a{display:flex;gap:10px;padding:6px;border-radius:10px;transition:background .25s var(--ease)}
+.reco a:hover{background:var(--bg-1)}
+.reco .th{width:168px;aspect-ratio:16/9;border-radius:8px;overflow:hidden;flex-shrink:0;background:var(--bg-2);position:relative}
+.reco .th img{width:100%;height:100%;object-fit:cover}
+.reco .th .d{position:absolute;bottom:4px;right:4px;background:rgba(0,0,0,.85);padding:1px 6px;border-radius:4px;font-size:11px}
+.reco .t{font-size:13px;font-weight:500;line-height:1.35;color:var(--fg-0);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.reco .c{color:var(--fg-1);font-size:12px;margin-top:6px}
+
+.comments{margin-top:32px}
+.comments h3{font-size:18px;font-weight:600;margin-bottom:20px}
+.comment{display:flex;gap:12px;margin-bottom:20px}
+.comment .av{width:40px;height:40px;border-radius:50%;background:var(--bg-2);flex-shrink:0;object-fit:cover}
+.comment .body{flex:1;min-width:0}
+.comment .top{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.comment .top .n{font-weight:600;font-size:13px}
+.comment .top .p{color:var(--fg-1);font-size:12px}
+.comment .top .pin{background:var(--accent);color:#1a0e05;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700}
+.comment .text{font-size:14px;line-height:1.5;color:var(--fg-0);white-space:pre-wrap;word-wrap:break-word}
+.comment .likes{display:flex;align-items:center;gap:14px;margin-top:6px;color:var(--fg-1);font-size:12px}
+.comment .likes svg{width:14px;height:14px}
+.load-more{display:block;margin:20px auto;padding:10px 24px;background:var(--bg-2);border:1px solid var(--line);border-radius:999px;font-size:13px;transition:all .25s var(--ease)}
+.load-more:hover{background:var(--bg-3)}
+
+.share-modal{position:fixed;inset:0;background:rgba(0,0,0,.7);backdrop-filter:blur(10px);z-index:100;display:none;align-items:center;justify-content:center;opacity:0;transition:opacity .3s var(--ease)}
+.share-modal.show{display:flex;opacity:1}
+.share-box{background:var(--bg-1);border:1px solid var(--line);border-radius:20px;padding:28px;width:min(440px,92vw);transform:scale(.9);transition:transform .3s var(--ease)}
+.share-modal.show .share-box{transform:scale(1)}
+.share-box h3{font-size:18px;margin-bottom:20px}
+.share-input{display:flex;gap:8px}
+.share-input input{flex:1;background:var(--bg-2);border:1px solid var(--line);border-radius:10px;padding:12px;color:var(--fg-0);font-size:13px;outline:none}
+.share-input button{background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#1a0e05;padding:12px 20px;border-radius:10px;font-weight:600}
+.share-close{margin-top:16px;padding:10px;width:100%;background:var(--bg-2);border-radius:10px;font-size:13px}
+</style></head><body>
+${SHARED_HEADER}
+<main>
+<div class="watch">
+  <div>
+    <div class="player-wrap">
+      <video id="player" controls playsinline crossorigin="anonymous"></video>
+      <audio id="audio" crossorigin="anonymous" style="display:none"></audio>
+      <div class="player-status" id="pstatus"><span class="dot"></span><span id="pstext">読み込み中…</span></div>
+      <button class="quality-btn" id="qBtn" style="display:none">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+        <span id="qLabel">360p</span>
+      </button>
+      <div class="quality-menu" id="qMenu"></div>
     </div>
-  </main>
-  <div class="toast" id="toast"></div>
-  <script>
-  const VID = ${JSON.stringify(vid)};
-  if(!VID){ document.body.innerHTML='<p style="padding:40px">動画IDがありません</p>'; }
 
-  const video = document.getElementById('video');
-  const audio = document.getElementById('audio');
-  const loading = document.getElementById('loading');
-  const qBtn = document.getElementById('qBtn');
-  const qMenu = document.getElementById('qMenu');
-  const toast = document.getElementById('toast');
+    <h1 class="title" id="title"><div class="skl" style="height:24px;width:80%"></div></h1>
 
-  function showToast(msg){ toast.textContent=msg; toast.classList.add('show'); setTimeout(()=>toast.classList.remove('show'),1800); }
-  function fmtViews(v){ if(!v)return '';v=Number(v); if(v>=1e8)return(v/1e8).toFixed(1)+'億回視聴';if(v>=1e4)return(v/1e4).toFixed(1)+'万回視聴'; return v.toLocaleString()+' 回視聴'; }
-  function fmtSubs(v){ if(!v)return '';v=Number(String(v).replace(/[^0-9]/g,''))||v;if(!v||isNaN(v))return arguments[0]||'';if(v>=1e8)return(v/1e8).toFixed(1)+'億人';if(v>=1e4)return(v/1e4).toFixed(1)+'万人';return v.toLocaleString()+'人'; }
+    <div class="meta-row">
+      <div class="channel-block">
+        <img class="av" id="chAv" src="" alt="" onerror="this.style.visibility='hidden'">
+        <div class="info">
+          <div class="name" id="chName"><div class="skl" style="height:14px;width:120px"></div></div>
+          <div class="subs" id="chSubs"></div>
+        </div>
+        <button class="sub-btn" id="subBtn" style="margin-left:14px;padding:10px 18px;border-radius:999px;font-size:13px">チャンネル登録</button>
+      </div>
+      <div class="actions">
+        <button id="likeBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 10v12M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H7"/></svg><span id="likeTxt">高評価</span></button>
+        <button id="favBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>お気に入り</button>
+        <button id="shareBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="m8.59 13.51 6.83 3.98M15.41 6.51l-6.82 3.98"/></svg>共有</button>
+        <a href="https://www.youtube.com/watch?v=${v}" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14 21 3"/></svg>YouTube</a>
+      </div>
+    </div>
 
-  /* ---- Player: start with 360p (itag=18) as combined stream ---- */
-  video.src = '/orby/yt/'+VID+'?itag=18';
-  video.addEventListener('loadeddata',()=>{ loading.style.display='none'; });
-  video.addEventListener('error',()=>{ loading.innerHTML='<div style="color:#fff">再生に失敗しました</div>'; });
+    <div class="desc" id="desc" onclick="this.classList.toggle('open')"><div class="skl" style="height:60px"></div></div>
 
-  /* ---- Sync engine for adaptive formats ---- */
-  let currentVideoUrl=null, currentAudioUrl=null, syncing=false, formats=null;
-  const SYNC_THRESHOLD = 0.15;
+    <div class="comments">
+      <h3 id="commentsHead">コメント</h3>
+      <div id="commentsList"></div>
+      <button class="load-more" id="loadMore" style="display:none">もっと読み込む</button>
+    </div>
+  </div>
 
-  function attachSync(){
-    if(syncing) return;
-    syncing=true;
-    audio.addEventListener('timeupdate', driftCheck);
-    video.addEventListener('play',()=>{ audio.play().catch(()=>{}); });
-    video.addEventListener('pause',()=>audio.pause());
-    video.addEventListener('seeking',()=>{ audio.currentTime = video.currentTime; });
-    video.addEventListener('ratechange',()=>{ audio.playbackRate = video.playbackRate; });
-    video.addEventListener('volumechange',()=>{ audio.volume = video.volume; audio.muted = video.muted; });
-  }
-  function driftCheck(){
-    if(!currentAudioUrl) return;
-    const diff = video.currentTime - audio.currentTime;
-    if(Math.abs(diff) > SYNC_THRESHOLD) audio.currentTime = video.currentTime;
-  }
+  <aside class="side">
+    <h3>おすすめの動画</h3>
+    <div class="reco" id="reco">
+      ${Array(8).fill(0).map(()=>'<div style="display:flex;gap:10px;padding:6px"><div class="skl" style="width:168px;aspect-ratio:16/9;flex-shrink:0"></div><div style="flex:1;display:flex;flex-direction:column;gap:8px"><div class="skl" style="height:14px"></div><div class="skl" style="height:14px;width:70%"></div><div class="skl" style="height:12px;width:50%"></div></div></div>').join('')}
+    </div>
+  </aside>
+</div>
+</main>
 
-  function pickFormats(fmts){
-    // Video-only (adaptive) list
-    const videoOnly = fmts.filter(f=>f.hasVideo && !f.hasAudio && f.qualityLabel).sort((a,b)=>parseInt(b.qualityLabel)-parseInt(a.qualityLabel));
-    const combined  = fmts.filter(f=>f.hasVideo && f.hasAudio && f.qualityLabel);
-    const audioOnly = fmts.filter(f=>f.hasAudio && !f.hasVideo).sort((a,b)=>(b.bitrate||b.audioBitrate||0)-(a.bitrate||a.audioBitrate||0));
-    return {videoOnly, combined, audioOnly};
-  }
+<div class="share-modal" id="shareModal">
+  <div class="share-box">
+    <h3>この動画を共有</h3>
+    <div class="share-input">
+      <input id="shareUrl" readonly>
+      <button id="shareCopy">コピー</button>
+    </div>
+    <button class="share-close" onclick="document.getElementById('shareModal').classList.remove('show')">閉じる</button>
+  </div>
+</div>
 
-  async function loadQualityMenu(){
-    try{
-      const j = await fetch('/api/formats/'+VID).then(r=>r.json());
-      const fmts = (j.formats || j.adaptiveFormats || []).concat(j.formats||[]);
-      // Some providers put streams under different keys
-      let all = [];
-      if(Array.isArray(j.formats)) all = all.concat(j.formats);
-      if(Array.isArray(j.adaptiveFormats)) all = all.concat(j.adaptiveFormats);
-      if(Array.isArray(j.streams)) all = all.concat(j.streams);
-      if(!all.length && Array.isArray(fmts)) all = fmts;
-      const picked = pickFormats(all);
-      formats = picked;
-      const bestAudio = picked.audioOnly[0];
-      const opts = [];
-      // Always keep 360p combined option
-      const combined360 = picked.combined.find(f=>/360/.test(f.qualityLabel)) || picked.combined[0];
-      if(combined360) opts.push({label:'360p (標準)', url: combined360.url, mode:'combined'});
-      picked.videoOnly.forEach(f=>{
-        if(bestAudio) opts.push({label:f.qualityLabel, url:f.url, mode:'split', audioUrl:bestAudio.url});
-      });
-      // dedupe
-      const seen = new Set();
-      const uniq = opts.filter(o=>{ if(seen.has(o.label))return false; seen.add(o.label);return true;});
-      renderQualityMenu(uniq);
-    }catch(e){ /* silent */ }
-  }
+<script>
+${SHARED_TOAST_JS}
+const VID = ${JSON.stringify(v)};
+const video = document.getElementById('player');
+const audio = document.getElementById('audio');
+const pstatus = document.getElementById('pstatus');
+const pstext = document.getElementById('pstext');
 
-  function renderQualityMenu(opts){
-    if(!opts.length) return;
-    qMenu.innerHTML = opts.map((o,i)=>\`<button data-i="\${i}" class="\${i===0?'active':''}">\${o.label}</button>\`).join('');
-    qBtn.addEventListener('click',()=>qMenu.classList.toggle('open'));
-    qMenu.querySelectorAll('button').forEach(b=>{
-      b.addEventListener('click',()=>{
-        const i = +b.dataset.i;
-        const o = opts[i];
-        qMenu.querySelectorAll('button').forEach(x=>x.classList.remove('active'));
-        b.classList.add('active');
-        qBtn.textContent = '画質: '+o.label+' ▾';
-        qMenu.classList.remove('open');
-        switchQuality(o);
-      });
-    });
-  }
+function setStatus(t, show=true){ pstext.textContent = t; pstatus.classList.toggle('show', show); }
 
-  function switchQuality(o){
-    const t = video.currentTime, wasPlaying = !video.paused;
-    if(o.mode==='combined'){
-      audio.pause(); audio.removeAttribute('src'); currentAudioUrl=null;
-      video.muted = false;
-      video.src = o.url;
-    } else {
-      // split: mute video, play audio track in parallel
-      video.muted = true;
-      video.src = o.url;
-      audio.src = o.audioUrl;
-      currentAudioUrl = o.audioUrl;
-      attachSync();
+/* -- Sync audio+video for HQ streams -- */
+let syncMode = false;
+video.addEventListener('play',  ()=>{ if(syncMode){ audio.currentTime = video.currentTime; audio.play().catch(()=>{}); }});
+video.addEventListener('pause', ()=>{ if(syncMode){ audio.pause(); }});
+video.addEventListener('seeking',()=>{ if(syncMode){ audio.currentTime = video.currentTime; }});
+video.addEventListener('ratechange',()=>{ if(syncMode){ audio.playbackRate = video.playbackRate; }});
+video.addEventListener('volumechange',()=>{ audio.volume = video.volume; audio.muted = video.muted });
+setInterval(()=>{ if(syncMode && !video.paused){
+  const diff = Math.abs(video.currentTime - audio.currentTime);
+  if(diff > 0.35) audio.currentTime = video.currentTime;
+}}, 800);
+
+/* -- 1) Start with 360p redirect stream ASAP -- */
+setStatus('360p を読み込み中…');
+video.src = '/stream/' + VID;
+video.muted = false;
+
+video.addEventListener('loadeddata', ()=>{ setStatus('再生準備完了', false); });
+video.addEventListener('error', ()=>{ setStatus('動画の読み込みに失敗しました'); });
+
+/* -- 2) Load full stream list & build quality menu -- */
+let allStreams = null;
+let currentItag = 18;
+const qBtn  = document.getElementById('qBtn');
+const qMenu = document.getElementById('qMenu');
+qBtn.addEventListener('click', e=>{ e.stopPropagation(); qMenu.classList.toggle('show'); });
+document.addEventListener('click', ()=>qMenu.classList.remove('show'));
+
+fetch('/api/streams/' + VID).then(r=>r.json()).then(data=>{
+  if(!data || data.error){ return; }
+  allStreams = data;
+  const formats = data.formats || [];
+  const adaptive = data.adaptiveFormats || [];
+  const videoStreams = [
+    ...formats.filter(f=>f.mimeType?.startsWith('video/') && f.hasAudio!==false && f.qualityLabel),
+    ...adaptive.filter(f=>f.mimeType?.startsWith('video/') && f.qualityLabel)
+  ];
+  const audioStreams = adaptive.filter(f=>f.mimeType?.startsWith('audio/')).sort((a,b)=>(b.bitrate||0)-(a.bitrate||0));
+  const bestAudio = audioStreams[0];
+
+  // Dedupe by qualityLabel, prefer combined (audio+video) if exists
+  const byLabel = new Map();
+  videoStreams.forEach(f=>{
+    const label = f.qualityLabel;
+    if(!label) return;
+    const hasA = f.hasAudio !== false && !!f.audioCodec;
+    const existing = byLabel.get(label);
+    if(!existing || (hasA && !existing._hasA)){
+      byLabel.set(label, { ...f, _hasA: hasA });
     }
-    video.addEventListener('loadedmetadata',function once(){
-      video.currentTime = t;
-      if(currentAudioUrl){ audio.currentTime = t; }
-      if(wasPlaying){ video.play(); if(currentAudioUrl) audio.play(); }
-      video.removeEventListener('loadedmetadata',once);
+  });
+  const sorted = [...byLabel.values()].sort((a,b)=>parseInt(b.qualityLabel)-parseInt(a.qualityLabel));
+
+  if(!sorted.length) return;
+  qBtn.style.display = 'flex';
+  qMenu.innerHTML = sorted.map(f=>{
+    const active = f.itag === 18 ? ' active' : '';
+    return \`<button data-itag="\${f.itag}" data-hasa="\${f._hasA?1:0}" data-url="\${encodeURIComponent(f.url||'')}" class="\${active.trim()}"><span>\${f.qualityLabel}\${f.fps>30?' '+f.fps:''}</span><span style="color:var(--fg-2);font-size:11px">\${f._hasA?'♪':''}</span></button>\`;
+  }).join('');
+
+  qMenu.querySelectorAll('button').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const itag = Number(btn.dataset.itag);
+      const hasA = btn.dataset.hasa === '1';
+      const url  = decodeURIComponent(btn.dataset.url);
+      switchQuality(itag, hasA, url, btn.querySelector('span').textContent, bestAudio);
+      qMenu.querySelectorAll('button').forEach(b=>b.classList.remove('active'));
+      btn.classList.add('active');
+      qMenu.classList.remove('show');
     });
+  });
+});
+
+function switchQuality(itag, hasA, url, label, bestAudio){
+  currentItag = itag;
+  document.getElementById('qLabel').textContent = label;
+  const t = video.currentTime, wasPlaying = !video.paused;
+  setStatus(label + ' に切替中…');
+
+  if(hasA){
+    syncMode = false;
+    audio.pause(); audio.removeAttribute('src'); audio.load();
+    video.src = url && url !== 'undefined' ? url : '/stream/' + VID + '?itag=' + itag;
+  } else {
+    if(!bestAudio || !bestAudio.url){ toast('音声ストリームが見つかりません'); return; }
+    syncMode = true;
+    video.src = url;
+    audio.src = bestAudio.url;
   }
-
-  /* ---- Metadata ---- */
-  fetch('/api/meta/'+VID).then(r=>r.json()).then(m=>{
-    document.title = (m.title||'') + ' · 柿Tube';
-    document.getElementById('title').textContent = m.title||'';
-    document.getElementById('descStats').textContent = [fmtViews(m.viewCount), m.publishedAt||''].filter(Boolean).join(' · ');
-    document.getElementById('descText').textContent = m.description||'';
-    document.getElementById('likeCount').textContent = m.likeCount? Number(m.likeCount).toLocaleString():'—';
-    document.getElementById('ytOpen').href='https://www.youtube.com/watch?v='+VID;
-    if(m.channelId){
-      document.getElementById('chNameLink').href='/channel/'+m.channelId;
-      document.getElementById('chAvatarLink').href='/channel/'+m.channelId;
-      document.getElementById('chNameLink').textContent = m.author||'';
-      fetch('/api/channel/'+m.channelId).then(r=>r.json()).then(c=>{
-        if(c.avatar) document.getElementById('chAvatar').src = c.avatar;
-        if(c.subscriberCount) document.getElementById('chSubs').textContent = fmtSubs(c.subscriberCount)+' チャンネル登録者';
-      }).catch(()=>{});
-      // subscribe state
-      const subs = JSON.parse(localStorage.getItem('persimmon.subs')||'[]');
-      const isSub = subs.includes(m.channelId);
-      const sb = document.getElementById('subBtn');
-      const paint=()=>{ sb.classList.toggle('subd',isSub); sb.textContent = isSub? '✓ 登録済み':'チャンネル登録'; };
-      paint();
-      sb.addEventListener('click',()=>{
-        const s = JSON.parse(localStorage.getItem('persimmon.subs')||'[]');
-        const i = s.indexOf(m.channelId);
-        if(i>=0){ s.splice(i,1); showToast('登録解除しました'); }
-        else{ s.push(m.channelId); showToast('チャンネル登録しました'); }
-        localStorage.setItem('persimmon.subs',JSON.stringify(s));
-        location.reload();
-      });
-    }
-    loadQualityMenu();
+  video.addEventListener('loadedmetadata', function once(){
+    video.removeEventListener('loadedmetadata', once);
+    video.currentTime = t;
+    if(syncMode){ audio.currentTime = t; }
+    if(wasPlaying){ video.play(); if(syncMode) audio.play().catch(()=>{}); }
+    setStatus('', false);
   });
+}
 
-  /* ---- Favorite / Share ---- */
-  const favs = JSON.parse(localStorage.getItem('persimmon.favs')||'[]');
-  const favBtn = document.getElementById('favBtn');
-  const isFav = ()=>favs.includes(VID);
-  const paintFav=()=>{ favBtn.classList.toggle('active',isFav()); favBtn.innerHTML = isFav()?'★ お気に入り済み':'☆ お気に入り'; };
-  paintFav();
-  favBtn.addEventListener('click',()=>{
-    const arr = JSON.parse(localStorage.getItem('persimmon.favs')||'[]');
-    const i = arr.indexOf(VID);
-    if(i>=0){arr.splice(i,1);showToast('お気に入りから削除');}
-    else{arr.unshift(VID);showToast('お気に入りに追加');}
-    localStorage.setItem('persimmon.favs',JSON.stringify(arr));
-    paintFav();
-  });
-  document.getElementById('shareBtn').addEventListener('click',async()=>{
-    const url = location.href;
-    try{ await navigator.clipboard.writeText(url); showToast('リンクをコピーしました'); }
-    catch{ prompt('リンクをコピー', url); }
-  });
+/* -- Meta -- */
+fetch('/api/meta/' + VID).then(r=>r.json()).then(m=>{
+  if(m.error) return;
+  document.title = (m.title||'動画') + ' — 柿Tube';
+  document.getElementById('title').textContent = m.title || '';
+  document.getElementById('chName').innerHTML = '<a href="/channel/'+ (m.channelId||'') +'">'+ escapeHtml(m.author||'') +'</a>';
+  const stats = [
+    fmtViews(m.viewCount) + ' 回視聴',
+    timeAgo(m.publishedAt)
+  ].filter(Boolean).join(' · ');
+  document.getElementById('desc').innerHTML =
+    '<div class="stats">'+ escapeHtml(stats) +'</div>' + escapeHtml(m.description||'').replace(/\\n/g,'<br>');
+  document.getElementById('likeTxt').textContent = m.likeCount ? fmtViews(m.likeCount) : '高評価';
 
-  /* ---- Recommendations ---- */
-  fetch('/api/recommend/'+VID).then(r=>r.json()).then(d=>{
-    const list = d.recommendations||[];
-    const box = document.getElementById('recs');
-    box.innerHTML = list.map(r=>\`
-      <a class="rec" href="/watch?v=\${r.videoId}">
-        <div class="th"><img loading="lazy" src="\${r.thumbnail||''}"/></div>
-        <div><div class="t">\${r.title||''}</div><div class="c">\${r.author||''}</div></div>
-      </a>\`).join('');
-  }).catch(()=>{ document.getElementById('recs').innerHTML='<div style="color:#999;font-size:13px">関連動画を取得できませんでした</div>'; });
-
-  /* ---- Comments ---- */
-  let contToken=null, cPage=1;
-  function loadComments(){
-    const url = contToken? '/api/comments/'+VID+'?continuation='+encodeURIComponent(contToken) : '/api/comments/'+VID+'?page='+cPage;
-    fetch(url).then(r=>r.json()).then(d=>{
-      const list = d.comments||[];
-      const box = document.getElementById('commentsList');
-      list.forEach(c=>{
-        const el = document.createElement('div');
-        el.className='comment';
-        el.innerHTML = \`
-          <img src="\${c.authorThumbnail||''}"/>
-          <div>
-            <div class="head">\${c.author||''}<span>\${c.publishedTime||''}</span></div>
-            <div class="body">\${(c.text||'').replace(/</g,'&lt;')}</div>
-            <div class="like">👍 \${c.likeCountText||c.likeCount||0}</div>
-          </div>\`;
-        box.appendChild(el);
-      });
-      const btn = document.getElementById('loadMoreC');
-      if(d.hasNextPage){
-        contToken = d.continuationToken || null;
-        cPage++;
-        btn.style.display='block';
-      } else { btn.style.display='none'; }
+  // Channel meta (subs, avatar via API)
+  if(m.channelId){
+    fetch('/api/channel/' + m.channelId).then(r=>r.json()).then(c=>{
+      if(c.avatar) document.getElementById('chAv').src = c.avatar;
+      if(c.subscriberCount) document.getElementById('chSubs').textContent = fmtViews(c.subscriberCount)+' 人の登録者';
+      applySubState(m.channelId);
     }).catch(()=>{});
   }
-  loadComments();
-  document.getElementById('loadMoreC').addEventListener('click',loadComments);
-  </script>`;
-  res.send(shell('柿Tube 視聴', body, css));
+  // Also try to find channel avatar via youtube-search-api by author name (spec-required)
+  if(m.author){
+    fetch('/api/resolve-channel?name=' + encodeURIComponent(m.author)).then(r=>r.json()).then(c=>{
+      if(c.avatar && !document.getElementById('chAv').src) document.getElementById('chAv').src = c.avatar;
+    }).catch(()=>{});
+  }
+}).catch(()=>{});
+
+/* -- Recommendations -- */
+fetch('/api/recommend/' + VID).then(r=>r.json()).then(d=>{
+  const list = d.recommendations || [];
+  if(!list.length){ document.getElementById('reco').innerHTML = '<div style="color:var(--fg-2);padding:20px;text-align:center">おすすめが見つかりませんでした</div>'; return; }
+  document.getElementById('reco').innerHTML = list.map(r=>\`
+    <a href="/watch?v=\${r.videoId}">
+      <div class="th">
+        <img src="\${r.thumbnail||('https://i.ytimg.com/vi/'+r.videoId+'/mqdefault.jpg')}" loading="lazy">
+      </div>
+      <div>
+        <div class="t">\${escapeHtml(r.title||'')}</div>
+        <div class="c">\${escapeHtml(r.author||r.channelName||'')}</div>
+      </div>
+    </a>\`).join('');
+}).catch(()=>{});
+
+/* -- Comments -- */
+let commentPage = 1, loadingComments = false;
+const commentsList = document.getElementById('commentsList');
+const loadMoreBtn = document.getElementById('loadMore');
+loadMoreBtn.addEventListener('click', ()=>loadComments());
+
+async function loadComments(){
+  if(loadingComments) return;
+  loadingComments = true;
+  try{
+    const r = await fetch('/api/comments/' + VID + '?page=' + commentPage);
+    const d = await r.json();
+    const arr = d.comments || [];
+    if(commentPage === 1) document.getElementById('commentsHead').textContent = 'コメント ' + (d.totalComments ? fmtViews(d.totalComments) : arr.length);
+    arr.forEach(c=>{
+      const el = document.createElement('div');
+      el.className = 'comment';
+      el.innerHTML = \`
+        <img class="av" src="\${c.authorThumbnail||''}" onerror="this.style.visibility='hidden'">
+        <div class="body">
+          <div class="top">
+            <span class="n">\${escapeHtml(c.author||'')}</span>
+            \${c.isPinned?'<span class="pin">📌 固定</span>':''}
+            <span class="p">\${escapeHtml(c.publishedTime||'')}</span>
+          </div>
+          <div class="text">\${escapeHtml(c.text||'').replace(/\\n/g,'<br>')}</div>
+          <div class="likes">
+            <span>👍 \${escapeHtml(c.likeCountText||String(c.likeCount||0))}</span>
+            \${c.replyCount?('<span>💬 '+c.replyCount+' 件の返信</span>'):''}
+          </div>
+        </div>\`;
+      commentsList.appendChild(el);
+    });
+    loadMoreBtn.style.display = d.hasNextPage ? 'block':'none';
+    commentPage++;
+  }catch(e){}
+  loadingComments = false;
+}
+loadComments();
+
+/* -- Subscribe / Like / Favorite (localStorage) -- */
+const subBtn = document.getElementById('subBtn');
+function applySubState(cid){
+  const subs = JSON.parse(localStorage.getItem('kt_subs')||'{}');
+  const on = !!subs[cid];
+  subBtn.classList.toggle('subbed', on);
+  subBtn.textContent = on ? '登録済み' : 'チャンネル登録';
+  subBtn.onclick = ()=>{
+    const s = JSON.parse(localStorage.getItem('kt_subs')||'{}');
+    if(s[cid]){ delete s[cid]; toast('登録を解除しました'); }
+    else { s[cid] = { at: Date.now() }; toast('チャンネル登録しました'); }
+    localStorage.setItem('kt_subs', JSON.stringify(s));
+    applySubState(cid);
+  };
+}
+const likeBtn = document.getElementById('likeBtn');
+function applyLikeState(){
+  const l = JSON.parse(localStorage.getItem('kt_likes')||'{}');
+  likeBtn.classList.toggle('active', !!l[VID]);
+}
+likeBtn.addEventListener('click', ()=>{
+  const l = JSON.parse(localStorage.getItem('kt_likes')||'{}');
+  if(l[VID]){ delete l[VID]; toast('高評価を取り消しました'); }
+  else { l[VID] = 1; toast('高評価しました'); }
+  localStorage.setItem('kt_likes', JSON.stringify(l));
+  applyLikeState();
+});
+applyLikeState();
+
+const favBtn = document.getElementById('favBtn');
+function applyFavState(){
+  const f = JSON.parse(localStorage.getItem('kt_favs')||'{}');
+  favBtn.classList.toggle('active', !!f[VID]);
+}
+favBtn.addEventListener('click', ()=>{
+  const f = JSON.parse(localStorage.getItem('kt_favs')||'{}');
+  if(f[VID]){ delete f[VID]; toast('お気に入りから削除しました'); }
+  else {
+    f[VID] = { title: document.getElementById('title').textContent, at: Date.now() };
+    toast('お気に入りに追加しました');
+  }
+  localStorage.setItem('kt_favs', JSON.stringify(f));
+  applyFavState();
+});
+applyFavState();
+
+/* -- Share -- */
+document.getElementById('shareBtn').addEventListener('click', ()=>{
+  const url = location.origin + '/watch?v=' + VID;
+  document.getElementById('shareUrl').value = url;
+  document.getElementById('shareModal').classList.add('show');
+});
+document.getElementById('shareCopy').addEventListener('click', async ()=>{
+  const url = document.getElementById('shareUrl').value;
+  try{
+    if(navigator.share){ await navigator.share({ url, title: document.title }); }
+    else { await navigator.clipboard.writeText(url); toast('リンクをコピーしました'); }
+  }catch(e){ try{ await navigator.clipboard.writeText(url); toast('リンクをコピーしました'); }catch(_){} }
+});
+document.getElementById('shareModal').addEventListener('click', e=>{
+  if(e.target.id === 'shareModal') e.target.classList.remove('show');
 });
 
-/* =============================================================
- *  /channel/:id
- * ============================================================= */
-app.get(/^\/channel\/([\w-]+)\/?$/, (req,res)=>{
-  const cid = req.params[0];
-  const css = `
-    .banner{aspect-ratio:6/1;background:linear-gradient(135deg,var(--persimmon-soft),#fff);border-radius:20px;overflow:hidden;position:relative;background-size:cover;background-position:center}
-    .ch-header{display:flex;gap:24px;align-items:center;padding:24px 0;flex-wrap:wrap}
-    .ch-header img.av{width:120px;height:120px;border-radius:50%;background:var(--surface-2);object-fit:cover;box-shadow:0 10px 30px rgba(0,0,0,.1)}
-    .ch-title{font-size:32px;font-weight:800;letter-spacing:-.5px}
-    .ch-sub{color:var(--text-sub);margin-top:6px;font-size:14px}
-    .ch-desc{max-width:800px;color:var(--text-sub);font-size:14px;margin-top:12px;line-height:1.6;white-space:pre-wrap;max-height:80px;overflow:hidden;cursor:pointer}
-    .ch-desc.open{max-height:none}
-    .ch-actions{margin-left:auto;display:flex;gap:8px}
-    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:20px;margin-top:24px}
-    .card{cursor:pointer;background:var(--surface);border-radius:14px;overflow:hidden;border:1px solid var(--border);transition:transform .2s,box-shadow .2s}
-    .card:hover{transform:translateY(-3px);box-shadow:0 12px 30px rgba(0,0,0,.08)}
-    .card .th{aspect-ratio:16/9;background:#000;position:relative;overflow:hidden}
-    .card .th img{width:100%;height:100%;object-fit:cover}
-    .card .th .d{position:absolute;bottom:6px;right:6px;background:rgba(0,0,0,.85);color:#fff;padding:2px 6px;border-radius:4px;font-size:11px}
-    .card .info{padding:12px 14px}
-    .card .t{font-weight:600;font-size:14px;line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-    .card .m{color:var(--text-sub);font-size:12px;margin-top:6px}
-    .section-title{font-size:20px;font-weight:700;margin-top:32px}
-    .empty{padding:60px;text-align:center;color:var(--text-sub)}
-    .subscribe{background:linear-gradient(135deg,var(--persimmon),var(--persimmon-dark));color:#fff;border:none;border-radius:999px;padding:12px 28px;font-weight:700;cursor:pointer;font-family:inherit;font-size:14px}
-    .subscribe.subd{background:var(--surface-2);color:var(--text);border:1px solid var(--border)}
-  `;
-  const body = `
-  <main class="container">
-    <div class="banner" id="banner"></div>
-    <div class="ch-header">
-      <img class="av" id="avatar"/>
-      <div style="flex:1;min-width:260px">
-        <div class="ch-title" id="chName">読み込み中…</div>
-        <div class="ch-sub" id="chSub"></div>
-        <div class="ch-desc" id="chDesc" onclick="this.classList.toggle('open')"></div>
-      </div>
-      <div class="ch-actions">
-        <button class="subscribe" id="subBtn">チャンネル登録</button>
-      </div>
-    </div>
-    <div class="section-title">投稿動画</div>
-    <div class="grid" id="grid"></div>
-  </main>
-  <script>
-  const CID = ${JSON.stringify(cid)};
-  function fmtSubs(v){if(!v)return '';v=Number(String(v).replace(/[^0-9]/g,''))||v;if(!v||isNaN(v))return '';if(v>=1e8)return(v/1e8).toFixed(1)+'億人';if(v>=1e4)return(v/1e4).toFixed(1)+'万人';return v.toLocaleString()+'人';}
-
-  fetch('/api/channel/'+CID).then(r=>r.json()).then(c=>{
-    document.title = (c.name||'')+ ' · 柿Tube';
-    document.getElementById('chName').textContent = c.name||'';
-    document.getElementById('chSub').textContent = [c.vanityUrl?'@'+c.vanityUrl.replace(/^@/,''):'', fmtSubs(c.subscriberCount)+' 登録者', (c.videoCount||'')+(c.videoCount?' 本の動画':'')].filter(Boolean).join(' · ');
-    document.getElementById('chDesc').textContent = c.description||'';
-    if(c.avatar) document.getElementById('avatar').src = c.avatar;
-    if(c.banner) document.getElementById('banner').style.backgroundImage = 'url('+c.banner+')';
-
-    const subs = JSON.parse(localStorage.getItem('persimmon.subs')||'[]');
-    const sb = document.getElementById('subBtn');
-    const paint=()=>{ const on=subs.includes(CID); sb.classList.toggle('subd',on); sb.textContent = on?'✓ 登録済み':'チャンネル登録'; };
-    paint();
-    sb.addEventListener('click',()=>{
-      const arr = JSON.parse(localStorage.getItem('persimmon.subs')||'[]');
-      const i = arr.indexOf(CID); if(i>=0)arr.splice(i,1); else arr.push(CID);
-      localStorage.setItem('persimmon.subs',JSON.stringify(arr));
-      location.reload();
-    });
-
-    // Load videos via youtube-search-api by channel name
-    fetch('/api/channel-videos?name='+encodeURIComponent(c.name||'')).then(r=>r.json()).then(d=>{
-      const grid = document.getElementById('grid');
-      const items = (d.items||[]).filter(v=>v.type==='video'||v.videoId||v.id);
-      if(!items.length){ grid.innerHTML='<div class="empty">投稿動画が取得できませんでした</div>'; return; }
-      grid.innerHTML = items.slice(0,40).map(v=>{
-        const id=v.id||v.videoId;
-        const t=v.title;
-        const th=(v.thumbnail&&(v.thumbnail.thumbnails?v.thumbnail.thumbnails.slice(-1)[0].url:v.thumbnail))||'';
-        const dur=(v.length&&(v.length.simpleText||v.length))||v.duration||'';
-        return \`<a class="card" href="/watch?v=\${id}">
-          <div class="th"><img loading="lazy" src="\${th}"/>\${dur?\`<span class="d">\${dur}</span>\`:''}</div>
-          <div class="info"><div class="t">\${t}</div><div class="m">\${v.channelTitle||v.channelName||''}</div></div>
-        </a>\`;
-      }).join('');
-    });
-  }).catch(()=>{ document.getElementById('chName').textContent='チャンネルを取得できませんでした'; });
-  </script>`;
-  res.send(shell('チャンネル · 柿Tube', body, css));
+function escapeHtml(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c])}
+</script>
+</body></html>`);
 });
 
-/* =============================================================
- *  /orby/yt/* — direct passthrough to Orby (302 or JSON)
- * ============================================================= */
-app.get(/^\/orby\/yt\/([^\/]+)\/?$/, async (req,res)=>{
+/* -- Direct stream redirect wrapper (for CORS-avoidance in some cases) -- */
+app.get(/^\/stream\/([A-Za-z0-9_-]{11})$/, async (req, res) => {
   const id = req.params[0];
-  const qs = new URLSearchParams(req.query).toString();
-  const target = `/orby/yt/${id}${qs?'?'+qs:''}`;
-  if(req.query.format==='json'){
-    try{ return res.json(await orbyFetch(target)); }
-    catch(e){ return res.status(502).json({error:String(e.message||e)}); }
-  }
-  // Redirect chain (Orby returns 302). We proxy the redirect so the browser hits us for range requests.
-  for(const host of ORBY_HOSTS){
-    try{
-      const r = await fetch(host+target, { redirect:'manual' });
-      const loc = r.headers.get('location');
-      if(loc){ return res.redirect(302, loc); }
-      if(r.ok){ return res.redirect(302, host+target); }
-    }catch(e){}
-  }
-  res.status(502).send('upstream unavailable');
+  const itag = req.query.itag ? `?itag=${encodeURIComponent(req.query.itag)}` : '';
+  // Just redirect to Orby's 302 endpoint
+  res.redirect(302, `${API_BASES[0]}/orby/yt/${id}${itag}`);
 });
 
-/* =============================================================
- *  /embed.html — placeholder (user implements WebUnblocker)
- * ============================================================= */
-app.get('/embed.html', (req,res)=>{
-  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Proxy</title>
-  <style>body{font-family:sans-serif;padding:40px;background:#FFFBF7;color:#333}</style></head>
-  <body><h2>🔒 WebUnblocker</h2><p>ここにあなたのプロキシ実装を配置してください。URLは <code>location.hash</code> から取得できます。</p>
-  <script>document.body.insertAdjacentHTML('beforeend','<p>Target: <code>'+decodeURIComponent(location.hash.slice(1)||'(none)')+'</code></p>');</script>
-  </body></html>`);
+/* ============================================================
+   /channel/:id — チャンネルページ
+   ============================================================ */
+app.get(/^\/channel\/(UC[\w-]{22})$/, (req, res) => {
+  const cid = req.params[0];
+  res.send(`<!DOCTYPE html><html lang="ja"><head><title>チャンネル — 柿Tube</title>${SHARED_HEAD}
+<style>
+.banner{width:100%;aspect-ratio:6.2/1;background:linear-gradient(135deg,#22222c,#0a0a0d);border-radius:16px;overflow:hidden;position:relative}
+.banner img{width:100%;height:100%;object-fit:cover}
+.ch-header{display:flex;align-items:flex-end;gap:24px;margin-top:-40px;padding:0 24px;position:relative;z-index:2;flex-wrap:wrap}
+.ch-header .av{width:130px;height:130px;border-radius:50%;object-fit:cover;background:var(--bg-2);border:6px solid var(--bg-0);flex-shrink:0}
+.ch-header .info h1{font-size:28px;font-weight:700;letter-spacing:-.02em}
+.ch-header .info .handle{color:var(--fg-1);font-size:14px;margin-top:4px}
+.ch-header .info .stats{color:var(--fg-1);font-size:13px;margin-top:10px}
+.ch-header .info .desc{color:var(--fg-1);font-size:13px;margin-top:8px;max-width:640px;line-height:1.5;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.ch-header .sub-btn{margin-left:auto;padding:14px 28px;border-radius:999px;background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#1a0e05;font-weight:700;font-size:14px;box-shadow:0 10px 24px var(--accent-glow)}
+.ch-header .sub-btn.subbed{background:var(--bg-2);color:var(--fg-0);border:1px solid var(--line);box-shadow:none}
+.tabs{margin-top:32px;border-bottom:1px solid var(--line);display:flex;gap:8px}
+.tabs button{padding:14px 20px;font-size:14px;font-weight:600;color:var(--fg-1);border-bottom:2px solid transparent;transition:all .25s var(--ease)}
+.tabs button.active{color:var(--fg-0);border-color:var(--accent)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:22px;margin-top:24px}
+.vcard{transition:transform .3s var(--ease)}
+.vcard:hover{transform:translateY(-4px)}
+.vcard .th{aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:var(--bg-2);position:relative}
+.vcard .th img{width:100%;height:100%;object-fit:cover;transition:transform .5s var(--ease)}
+.vcard:hover .th img{transform:scale(1.06)}
+.vcard .th .d{position:absolute;bottom:8px;right:8px;background:rgba(0,0,0,.85);padding:2px 8px;border-radius:6px;font-size:12px;font-weight:600}
+.vcard .t{margin-top:10px;font-size:14px;font-weight:600;line-height:1.35;color:var(--fg-0);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.vcard .m{color:var(--fg-1);font-size:12px;margin-top:4px}
+.about{margin-top:24px;background:var(--bg-1);border:1px solid var(--line);border-radius:16px;padding:24px;line-height:1.6;font-size:14px;color:var(--fg-1);white-space:pre-wrap;max-width:900px}
+</style></head><body>
+${SHARED_HEADER}
+<main>
+  <div class="banner" id="banner"><div class="skl" style="width:100%;height:100%;border-radius:16px"></div></div>
+  <div class="ch-header">
+    <img class="av" id="chAv" src="" onerror="this.style.visibility='hidden'">
+    <div class="info" style="flex:1;min-width:200px">
+      <h1 id="chName"><div class="skl" style="height:24px;width:200px"></div></h1>
+      <div class="handle" id="chHandle"></div>
+      <div class="stats" id="chStats"></div>
+      <div class="desc" id="chDesc"></div>
+    </div>
+    <button class="sub-btn" id="subBtn">チャンネル登録</button>
+  </div>
+
+  <div class="tabs">
+    <button class="active" data-tab="videos">動画</button>
+    <button data-tab="about">概要</button>
+  </div>
+
+  <div id="tab-videos" class="grid" style="display:grid">
+    ${Array(8).fill(0).map(()=>'<div><div class="skl" style="aspect-ratio:16/9"></div><div class="skl" style="height:16px;margin-top:10px;width:80%"></div><div class="skl" style="height:12px;margin-top:6px;width:50%"></div></div>').join('')}
+  </div>
+  <div id="tab-about" style="display:none">
+    <div class="about" id="aboutText"></div>
+  </div>
+</main>
+<script>
+${SHARED_TOAST_JS}
+const CID = ${JSON.stringify(cid)};
+let CHANNEL_NAME = '';
+
+fetch('/api/channel/' + CID).then(r=>r.json()).then(c=>{
+  if(c.error) throw c;
+  CHANNEL_NAME = c.name || '';
+  document.title = CHANNEL_NAME + ' — 柿Tube';
+  if(c.banner) document.getElementById('banner').innerHTML = '<img src="'+c.banner+'" onerror="this.style.display=\\'none\\'">';
+  if(c.avatar) document.getElementById('chAv').src = c.avatar;
+  document.getElementById('chName').textContent = c.name || '';
+  document.getElementById('chHandle').textContent = c.vanityUrl ? '@'+c.vanityUrl : '';
+  const parts=[];
+  if(c.subscriberCount) parts.push(fmtViews(c.subscriberCount)+' 人の登録者');
+  if(c.videoCount) parts.push(c.videoCount+' 本の動画');
+  document.getElementById('chStats').textContent = parts.join(' · ');
+  document.getElementById('chDesc').textContent = c.description || '';
+  document.getElementById('aboutText').textContent = c.description || '説明はありません';
+  applySub();
+  loadVideos();
+}).catch(()=>{
+  document.getElementById('chName').textContent = 'チャンネルが見つかりません';
 });
 
-/* ---------- Fallback ---------- */
-app.use((req,res)=>{
-  res.status(404).send(shell('404 · 柿Tube',
-    '<main class="container" style="text-align:center;padding:80px 20px"><h1 style="font-size:48px;color:var(--persimmon)">404</h1><p style="color:#666;margin-top:12px">ページが見つかりませんでした</p><a href="/" style="display:inline-block;margin-top:24px;background:linear-gradient(135deg,var(--persimmon),var(--persimmon-dark));color:#fff;padding:12px 24px;border-radius:999px;font-weight:600">ホームへ戻る</a></main>'
-  ));
+function loadVideos(){
+  if(!CHANNEL_NAME) return;
+  fetch('/api/channel-videos?name=' + encodeURIComponent(CHANNEL_NAME)).then(r=>r.json()).then(d=>{
+    const items = (d.items||[]).filter(i=>i.id && i.type==='video').slice(0,30);
+    if(!items.length){
+      document.getElementById('tab-videos').innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:60px;color:var(--fg-1)">動画が見つかりませんでした</div>';
+      return;
+    }
+    document.getElementById('tab-videos').innerHTML = items.map(it=>{
+      const th = it.thumbnail?.thumbnails || [];
+      const thumb = th[th.length-1]?.url || '';
+      const dur = it.length?.simpleText || (it.isLive?'LIVE':'');
+      return \`<a class="vcard" href="/watch?v=\${it.id}">
+        <div class="th">
+          <img src="\${thumb}" loading="lazy">
+          \${dur?'<span class="d">'+escapeHtml(dur)+'</span>':''}
+        </div>
+        <div class="t">\${escapeHtml(it.title||'')}</div>
+        <div class="m">\${escapeHtml(it.channelTitle||'')}</div>
+      </a>\`;
+    }).join('');
+  });
+}
+
+/* Tabs */
+document.querySelectorAll('.tabs button').forEach(b=>{
+  b.addEventListener('click',()=>{
+    document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');
+    const t = b.dataset.tab;
+    document.getElementById('tab-videos').style.display = t==='videos'?'grid':'none';
+    document.getElementById('tab-about').style.display  = t==='about' ?'block':'none';
+  });
 });
+
+/* Subscribe */
+const subBtn = document.getElementById('subBtn');
+function applySub(){
+  const s = JSON.parse(localStorage.getItem('kt_subs')||'{}');
+  const on = !!s[CID];
+  subBtn.classList.toggle('subbed', on);
+  subBtn.textContent = on ? '登録済み' : 'チャンネル登録';
+}
+subBtn.addEventListener('click',()=>{
+  const s = JSON.parse(localStorage.getItem('kt_subs')||'{}');
+  if(s[CID]){ delete s[CID]; toast('登録を解除しました'); }
+  else { s[CID] = { at:Date.now(), name:CHANNEL_NAME }; toast('チャンネル登録しました'); }
+  localStorage.setItem('kt_subs', JSON.stringify(s));
+  applySub();
+});
+
+function escapeHtml(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c])}
+</script>
+</body></html>`);
+});
+
+/* ============================================================
+   /favorites, /subscriptions — user pages
+   ============================================================ */
+app.get(/^\/favorites$/, (_req,res)=>{
+  res.send(`<!DOCTYPE html><html lang="ja"><head><title>お気に入り — 柿Tube</title>${SHARED_HEAD}</head><body>
+${SHARED_HEADER}
+<main>
+  <h1 style="font-size:24px;margin-bottom:20px">お気に入り</h1>
+  <div id="list" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:22px"></div>
+</main>
+<script>
+const f = JSON.parse(localStorage.getItem('kt_favs')||'{}');
+const list = document.getElementById('list');
+const keys = Object.keys(f);
+if(!keys.length){ list.innerHTML = '<div style="grid-column:1/-1;text-align:center;color:var(--fg-1);padding:60px">お気に入りはまだありません</div>'; }
+else{
+  list.innerHTML = keys.map(id=>\`
+    <a href="/watch?v=\${id}" style="display:block">
+      <div style="aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:var(--bg-2)">
+        <img src="https://i.ytimg.com/vi/\${id}/mqdefault.jpg" style="width:100%;height:100%;object-fit:cover">
+      </div>
+      <div style="margin-top:10px;font-size:14px;font-weight:600">\${(f[id].title||id)}</div>
+    </a>\`).join('');
+}
+</script>
+</body></html>`);
+});
+
+/* ============================================================
+   404
+   ============================================================ */
+app.use((_req,res)=>{
+  res.status(404).send(`<!DOCTYPE html><html><head><title>404 — 柿Tube</title>${SHARED_HEAD}</head><body>
+${SHARED_HEADER}
+<main style="text-align:center;padding:80px 20px">
+  <div style="font-size:120px;background:linear-gradient(135deg,var(--accent),var(--accent-2));-webkit-background-clip:text;background-clip:text;color:transparent;font-weight:900">404</div>
+  <h1 style="font-size:24px;margin-top:20px">ページが見つかりません</h1>
+  <a href="/" style="display:inline-block;margin-top:24px;padding:14px 28px;border-radius:999px;background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#1a0e05;font-weight:700">ホームに戻る</a>
+</main>
+</body></html>`);
+});
+
+/* ---------- helpers ---------- */
+function escapeHtml(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c])}
+
+app.listen(PORT, ()=>console.log(`🍊 Persimmon listening on ${PORT}`));
 
 module.exports = app;
-
-if(require.main === module){
-  app.listen(PORT, ()=>console.log('🍊 Persimmon running on :'+PORT));
-}
