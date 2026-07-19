@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Persimmon — 柿Tube & Proxy</title>
+<link rel="icon" href="/img/kaki.png" />
+<style>
+  :root{
+    --persimmon:#F2731A;
+    --persimmon-dark:#D45A0A;
+    --persimmon-soft:#FFE4CC;
+    --leaf:#3E7C4A;
+    --bg:#FFFBF7;
+    --surface:#ffffff;
+    --text:#1a1a1a;
+    --text-sub:#666;
+    --border:rgba(0,0,0,.08);
+    --shadow:0 10px 40px rgba(242,115,26,.12);
+    --shadow-hover:0 20px 60px rgba(242,115,26,.25);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Sans","Noto Sans JP",sans-serif;
+    background:
+      radial-gradient(1200px 600px at 15% -10%, #FFDDBB 0%, transparent 60%),
+      radial-gradient(1000px 500px at 100% 110%, #FFE9D3 0%, transparent 60%),
+      var(--bg);
+    color:var(--text);
+    min-height:100vh;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    padding:40px 20px;
+    overflow-x:hidden;
+  }
+  .stage{
+    width:100%;max-width:720px;
+    display:flex;flex-direction:column;align-items:center;
+    animation:rise .8s cubic-bezier(.2,.8,.2,1);
+  }
+  @keyframes rise{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
+  .logo{
+    display:flex;align-items:center;gap:22px;margin-bottom:14px;
+  }
+  .logo img{
+    width:110px;height:110px;object-fit:contain;
+    filter:drop-shadow(0 10px 25px rgba(242,115,26,.35));
+    animation:float 4s ease-in-out infinite;
+  }
+  @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
+  .brand{
+    font-size:64px;font-weight:800;letter-spacing:-2px;
+    background:linear-gradient(135deg,var(--persimmon) 0%,var(--persimmon-dark) 60%,var(--leaf) 130%);
+    -webkit-background-clip:text;background-clip:text;color:transparent;
+  }
+  .tagline{color:var(--text-sub);font-size:15px;margin-bottom:36px;letter-spacing:.5px}
+  .search-wrap{
+    width:100%;position:relative;
+    background:var(--surface);
+    border-radius:999px;
+    box-shadow:var(--shadow);
+    display:flex;align-items:center;
+    padding:6px 8px 6px 26px;
+    transition:box-shadow .25s,transform .25s;
+    border:1px solid var(--border);
+  }
+  .search-wrap:focus-within{box-shadow:var(--shadow-hover);transform:translateY(-2px)}
+  .search-icon{width:22px;height:22px;color:var(--text-sub);flex-shrink:0}
+  #searchInput{
+    flex:1;border:none;outline:none;background:transparent;
+    font-size:18px;padding:20px 16px;font-family:inherit;color:var(--text);
+  }
+  #searchInput::placeholder{color:#aaa}
+  .search-btn{
+    background:linear-gradient(135deg,var(--persimmon),var(--persimmon-dark));
+    color:#fff;border:none;border-radius:999px;
+    padding:14px 30px;font-size:15px;font-weight:600;cursor:pointer;
+    display:flex;align-items:center;gap:8px;
+    transition:transform .15s,box-shadow .2s;
+    box-shadow:0 6px 18px rgba(242,115,26,.35);
+  }
+  .search-btn:hover{transform:translateY(-1px);box-shadow:0 10px 24px rgba(242,115,26,.5)}
+  .search-btn:active{transform:translateY(0)}
+  .toggle-shell{
+    margin-top:32px;background:var(--surface);border-radius:999px;
+    padding:6px;display:flex;position:relative;
+    box-shadow:0 6px 20px rgba(0,0,0,.06);
+    border:1px solid var(--border);
+  }
+  .toggle-shell::before{
+    content:"";position:absolute;top:6px;bottom:6px;left:6px;
+    width:calc(50% - 6px);border-radius:999px;
+    background:linear-gradient(135deg,var(--persimmon),var(--persimmon-dark));
+    transition:transform .35s cubic-bezier(.4,.0,.2,1);
+    box-shadow:0 4px 14px rgba(242,115,26,.4);
+  }
+  .toggle-shell[data-mode="proxy"]::before{transform:translateX(100%)}
+  .toggle-shell button{
+    position:relative;z-index:1;border:none;background:transparent;
+    padding:12px 28px;font-size:14px;font-weight:600;cursor:pointer;
+    color:var(--text-sub);transition:color .3s;font-family:inherit;
+    display:flex;align-items:center;gap:8px;
+  }
+  .toggle-shell[data-mode="youtube"] button[data-value="youtube"],
+  .toggle-shell[data-mode="proxy"] button[data-value="proxy"]{color:#fff}
+  .hint{margin-top:24px;color:var(--text-sub);font-size:13px;text-align:center;max-width:520px;line-height:1.7}
+  .hint kbd{background:#f2f2f2;border-radius:4px;padding:2px 6px;font-size:11px;font-family:inherit;border:1px solid #ddd}
+  footer{margin-top:60px;color:#bbb;font-size:12px;letter-spacing:.5px}
+  @media (max-width:520px){
+    .brand{font-size:44px}
+    .logo img{width:80px;height:80px}
+    #searchInput{font-size:16px;padding:16px 10px}
+    .search-btn{padding:12px 20px;font-size:14px}
+  }
+</style>
+</head>
+<body>
+  <div class="stage">
+    <div class="logo">
+      <img src="/img/kaki.png" alt="柿" onerror="this.style.display='none'"/>
+      <div class="brand">Persimmon</div>
+    </div>
+    <div class="tagline">柿Tube · YouTubeフロントエンド &amp; WebUnblocker</div>
+
+    <form class="search-wrap" id="searchForm" onsubmit="return submitSearch(event)">
+      <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>
+      </svg>
+      <input id="searchInput" type="text" autocomplete="off" spellcheck="false" placeholder="動画を検索、またはURLを入力…" />
+      <button class="search-btn" type="submit">
+        <span>検索</span>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 5l7 7-7 7"/></svg>
+      </button>
+    </form>
+
+    <div class="toggle-shell" data-mode="youtube" id="toggle">
+      <button data-value="youtube" type="button">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M23 7.5a3 3 0 0 0-2.1-2.1C19 5 12 5 12 5s-7 0-8.9.4A3 3 0 0 0 1 7.5C.6 9.4.6 12 .6 12s0 2.6.4 4.5A3 3 0 0 0 3.1 18.6C5 19 12 19 12 19s7 0 8.9-.4a3 3 0 0 0 2.1-2.1c.4-1.9.4-4.5.4-4.5s0-2.6-.4-4.5zM9.8 15.5V8.5l6 3.5z"/></svg>
+        柿Tube
+      </button>
+      <button data-value="proxy" type="button">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20M12 2a15 15 0 0 0 0 20"/></svg>
+        Proxy
+      </button>
+    </div>
+
+    <div class="hint">
+      <span id="hintText">YouTubeモード：キーワードで柿Tubeを検索、または動画URLを直接貼り付け</span>
+    </div>
+  </div>
+  <footer>© Persimmon · Powered by Orby API</footer>
+
+<script>
+  const toggle = document.getElementById('toggle');
+  const hint = document.getElementById('hintText');
+  const input = document.getElementById('searchInput');
+
+  const HINTS = {
+    youtube:'YouTubeモード：キーワードで柿Tubeを検索、または動画URLを直接貼り付け',
+    proxy:'Proxyモード：URLを入れると匿名アクセス、キーワードはStartpageで検索'
+  };
+
+  toggle.querySelectorAll('button').forEach(b=>{
+    b.addEventListener('click',()=>{
+      const v = b.dataset.value;
+      toggle.dataset.mode = v;
+      hint.textContent = HINTS[v];
+      input.placeholder = v==='youtube' ? '動画を検索、またはURLを入力…' : 'URLを入力、またはキーワードで検索…';
+      localStorage.setItem('persimmon.mode', v);
+    });
+  });
+  const saved = localStorage.getItem('persimmon.mode');
+  if(saved==='proxy') toggle.querySelector('[data-value="proxy"]').click();
+
+  function extractVideoId(str){
+    try{
+      const u = new URL(str);
+      if(u.hostname.includes('youtu.be')) return u.pathname.slice(1);
+      if(u.hostname.includes('youtube.com')){
+        if(u.pathname==='/watch') return u.searchParams.get('v');
+        const m = u.pathname.match(/^\/(shorts|embed)\/([\w-]{11})/);
+        if(m) return m[2];
+      }
+    }catch(e){}
+    if(/^[\w-]{11}$/.test(str)) return str;
+    return null;
+  }
+
+  function submitSearch(e){
+    e.preventDefault();
+    const q = input.value.trim();
+    if(!q) return false;
+    const mode = toggle.dataset.mode;
+    if(mode==='youtube'){
+      const vid = extractVideoId(q);
+      if(vid){ location.href = '/watch?v=' + encodeURIComponent(vid); return false; }
+      location.href = '/search?q=' + encodeURIComponent(q);
+    } else {
+      const isUrl = /^https?:\/\//i.test(q) || /^[\w.-]+\.[a-z]{2,}(\/|$)/i.test(q);
+      if(isUrl){
+        const url = /^https?:\/\//i.test(q) ? q : 'https://'+q;
+        location.href = '/embed.html#'+url;
+      } else {
+        location.href = 'https://www.startpage.com/sp/search?query='+encodeURIComponent(q);
+      }
+    }
+    return false;
+  }
+</script>
+</body>
+</html>
