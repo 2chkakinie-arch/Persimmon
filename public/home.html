@@ -2,332 +2,120 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Persimmon — 柿Tube & WebUnblocker</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Persimmon</title>
 <link rel="icon" href="/img/kaki.png">
 <style>
-:root{
-  --bg-0:#0a0a0d;
-  --bg-1:#111116;
-  --bg-2:#1a1a22;
-  --fg-0:#f5f5f7;
-  --fg-1:#a8a8b3;
-  --fg-2:#6b6b78;
-  --accent:#ff7a3d;
-  --accent-2:#ff9a5a;
-  --accent-glow:rgba(255,122,61,.35);
-  --line:rgba(255,255,255,.08);
-  --radius:18px;
-  --ease:cubic-bezier(.22,1,.36,1);
-}
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%;overflow:hidden}
-body{
-  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Helvetica Neue","Hiragino Sans","Noto Sans JP",sans-serif;
-  background:var(--bg-0);
-  color:var(--fg-0);
-  -webkit-font-smoothing:antialiased;
-  position:relative;
-}
-/* ---------- Ambient background ---------- */
-.bg-orb{
-  position:fixed;pointer-events:none;z-index:0;
-  border-radius:50%;
-  filter:blur(120px);
-  opacity:.55;
-  animation:float 18s var(--ease) infinite alternate;
-}
-.bg-orb.a{width:520px;height:520px;background:radial-gradient(circle,#ff7a3d 0%,transparent 70%);top:-160px;left:-160px}
-.bg-orb.b{width:620px;height:620px;background:radial-gradient(circle,#ff4d6d 0%,transparent 70%);bottom:-200px;right:-180px;animation-delay:-6s}
-.bg-orb.c{width:400px;height:400px;background:radial-gradient(circle,#ffb347 0%,transparent 70%);top:40%;left:50%;transform:translate(-50%,-50%);animation-delay:-12s;opacity:.35}
-@keyframes float{
-  0%{transform:translate(0,0) scale(1)}
-  50%{transform:translate(40px,-30px) scale(1.08)}
-  100%{transform:translate(-30px,40px) scale(.95)}
-}
-.bg-grid{
-  position:fixed;inset:0;z-index:0;pointer-events:none;
-  background-image:
-    linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),
-    linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px);
-  background-size:60px 60px;
-  mask-image:radial-gradient(ellipse at center,#000 30%,transparent 75%);
-}
-
-/* ---------- Layout ---------- */
-.wrap{
-  position:relative;z-index:2;
-  height:100vh;
-  display:flex;flex-direction:column;
-  align-items:center;justify-content:center;
-  padding:40px 24px;
-}
-.brand{
-  display:flex;flex-direction:column;align-items:center;
-  animation:rise .9s var(--ease) both;
-}
-.brand .logo{
-  width:132px;height:132px;
-  filter:drop-shadow(0 20px 60px var(--accent-glow));
-  animation:logoFloat 6s var(--ease) infinite alternate;
-}
-@keyframes logoFloat{
-  0%{transform:translateY(0) rotate(-3deg)}
-  100%{transform:translateY(-14px) rotate(3deg)}
-}
-.brand h1{
-  margin-top:22px;
-  font-size:64px;
-  letter-spacing:-.03em;
-  font-weight:700;
-  background:linear-gradient(135deg,#fff 0%,#ffb37a 60%,var(--accent) 100%);
-  -webkit-background-clip:text;background-clip:text;color:transparent;
-}
-.brand .tag{
-  margin-top:6px;color:var(--fg-1);font-size:14px;letter-spacing:.25em;text-transform:uppercase;
-}
-
-/* ---------- Search ---------- */
-.search{
-  margin-top:44px;
-  width:min(720px,92vw);
-  position:relative;
-  animation:rise 1s var(--ease) .1s both;
-}
-.search-inner{
-  display:flex;align-items:center;
-  background:rgba(255,255,255,.04);
-  border:1px solid var(--line);
-  border-radius:999px;
-  padding:6px 6px 6px 24px;
-  backdrop-filter:blur(20px);
-  -webkit-backdrop-filter:blur(20px);
-  transition:all .5s var(--ease);
-  box-shadow:0 20px 60px rgba(0,0,0,.4);
-}
-.search-inner:focus-within{
-  border-color:var(--accent);
-  box-shadow:0 0 0 4px var(--accent-glow),0 20px 60px rgba(0,0,0,.5);
-  transform:translateY(-2px);
-}
-.search svg.i{width:22px;height:22px;flex-shrink:0;stroke:var(--fg-1)}
-#q{
-  flex:1;background:transparent;border:0;outline:0;
-  padding:20px 16px;color:var(--fg-0);
-  font-size:17px;font-family:inherit;
-}
-#q::placeholder{color:var(--fg-2)}
-.go-btn{
-  display:flex;align-items:center;gap:8px;
-  background:linear-gradient(135deg,var(--accent) 0%,var(--accent-2) 100%);
-  color:#1a0e05;border:0;cursor:pointer;
-  padding:14px 26px;border-radius:999px;
-  font-weight:600;font-size:15px;font-family:inherit;
-  transition:all .3s var(--ease);
-  box-shadow:0 10px 24px var(--accent-glow);
-}
-.go-btn:hover{transform:translateY(-1px);box-shadow:0 14px 32px var(--accent-glow)}
-.go-btn:active{transform:translateY(0) scale(.98)}
-
-/* ---------- Toggle ---------- */
-.toggle{
-  margin-top:32px;
-  display:inline-flex;
-  padding:5px;
-  background:rgba(255,255,255,.04);
-  border:1px solid var(--line);
-  border-radius:999px;
-  backdrop-filter:blur(20px);
-  position:relative;
-  animation:rise 1.05s var(--ease) .2s both;
-}
-.toggle button{
-  position:relative;z-index:2;
-  background:transparent;border:0;cursor:pointer;
-  padding:12px 30px;
-  color:var(--fg-1);font-weight:600;font-size:14px;font-family:inherit;
-  display:flex;align-items:center;gap:8px;
-  transition:color .35s var(--ease);
-  border-radius:999px;
-}
-.toggle button.active{color:#1a0e05}
-.toggle .pill{
-  position:absolute;top:5px;left:5px;
-  height:calc(100% - 10px);
-  background:linear-gradient(135deg,var(--accent) 0%,var(--accent-2) 100%);
-  border-radius:999px;
-  transition:all .45s var(--ease);
-  box-shadow:0 6px 18px var(--accent-glow);
-  z-index:1;
-}
-.toggle button svg{width:16px;height:16px}
-
-/* ---------- Suggestions ---------- */
-.suggest{
-  position:absolute;
-  top:calc(100% + 12px);left:0;right:0;
-  background:rgba(20,20,26,.9);
-  border:1px solid var(--line);
-  border-radius:20px;
-  backdrop-filter:blur(30px);
-  overflow:hidden;
-  opacity:0;pointer-events:none;transform:translateY(-6px);
-  transition:all .3s var(--ease);
-  max-height:60vh;overflow-y:auto;
-  box-shadow:0 30px 80px rgba(0,0,0,.6);
-  z-index:10;
-}
-.suggest.show{opacity:1;pointer-events:auto;transform:translateY(0)}
-.suggest a{
-  display:flex;align-items:center;gap:12px;
-  padding:14px 22px;
-  color:var(--fg-0);text-decoration:none;
-  transition:background .25s var(--ease);
-  font-size:14px;
-}
-.suggest a:hover{background:rgba(255,122,61,.1)}
-.suggest svg{width:16px;height:16px;stroke:var(--fg-2);flex-shrink:0}
-
-/* ---------- Footer ---------- */
-.foot{
-  position:fixed;bottom:24px;left:0;right:0;text-align:center;
-  color:var(--fg-2);font-size:12px;z-index:2;
-  letter-spacing:.08em;
-  animation:rise 1.2s var(--ease) .4s both;
-}
-.foot a{color:var(--fg-1);text-decoration:none;margin:0 8px;transition:color .25s}
-.foot a:hover{color:var(--accent)}
-
-@keyframes rise{
-  from{opacity:0;transform:translateY(20px)}
-  to{opacity:1;transform:translateY(0)}
-}
-
-@media (max-width:520px){
-  .brand .logo{width:100px;height:100px}
-  .brand h1{font-size:46px}
-  #q{font-size:15px;padding:16px 12px}
-  .go-btn{padding:12px 18px}
-  .go-btn span{display:none}
-}
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  :root{
+    --bg:#0a0a0a;--bg2:#111;--card:#161616;--border:#252525;
+    --text:#f5f5f5;--sub:#909090;--accent:#ff7a2f;--accent2:#ff5722;
+    --shadow:0 20px 60px rgba(255,122,47,.15);
+  }
+  html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-system,"Segoe UI","Hiragino Sans","Noto Sans JP",sans-serif;overflow-x:hidden}
+  body{
+    background:
+      radial-gradient(1200px 600px at 50% -100px,rgba(255,122,47,.12),transparent 60%),
+      radial-gradient(800px 500px at 90% 100%,rgba(255,87,34,.08),transparent 60%),
+      var(--bg);
+    min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px;
+  }
+  .container{width:100%;max-width:720px;display:flex;flex-direction:column;align-items:center;gap:32px;animation:fadeIn .8s ease}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
+  .logo{display:flex;flex-direction:column;align-items:center;gap:16px}
+  .logo img{width:120px;height:120px;object-fit:contain;filter:drop-shadow(0 10px 30px rgba(255,122,47,.35));animation:float 4s ease-in-out infinite}
+  @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
+  .logo h1{font-size:56px;font-weight:800;letter-spacing:-1.5px;background:linear-gradient(135deg,#fff 30%,var(--accent));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .search{width:100%;position:relative}
+  .search input{
+    width:100%;padding:22px 64px 22px 28px;background:var(--card);
+    border:1px solid var(--border);border-radius:100px;color:var(--text);
+    font-size:17px;outline:none;transition:all .25s;
+    box-shadow:0 8px 30px rgba(0,0,0,.4);
+  }
+  .search input:focus{border-color:var(--accent);box-shadow:var(--shadow)}
+  .search button{
+    position:absolute;right:8px;top:50%;transform:translateY(-50%);
+    width:52px;height:52px;border-radius:50%;border:none;cursor:pointer;
+    background:linear-gradient(135deg,var(--accent),var(--accent2));
+    display:flex;align-items:center;justify-content:center;color:#fff;
+    transition:transform .2s;
+  }
+  .search button:hover{transform:translateY(-50%) scale(1.08)}
+  .search button svg{width:22px;height:22px}
+  .toggle{
+    background:var(--card);border:1px solid var(--border);border-radius:100px;
+    padding:6px;display:flex;position:relative;
+  }
+  .toggle button{
+    background:transparent;border:none;color:var(--sub);
+    padding:12px 28px;font-size:14px;font-weight:600;cursor:pointer;
+    border-radius:100px;position:relative;z-index:2;transition:color .3s;letter-spacing:.5px;
+  }
+  .toggle button.active{color:#fff}
+  .toggle .slider{
+    position:absolute;top:6px;left:6px;height:calc(100% - 12px);
+    background:linear-gradient(135deg,var(--accent),var(--accent2));
+    border-radius:100px;transition:all .35s cubic-bezier(.4,0,.2,1);
+    box-shadow:0 4px 16px rgba(255,122,47,.4);
+  }
+  .footer{position:fixed;bottom:20px;color:var(--sub);font-size:12px;letter-spacing:1px}
 </style>
 </head>
 <body>
-<div class="bg-orb a"></div>
-<div class="bg-orb b"></div>
-<div class="bg-orb c"></div>
-<div class="bg-grid"></div>
-
-<div class="wrap">
-  <div class="brand">
-    <img src="/img/kaki.png" alt="柿" class="logo" onerror="this.style.display='none'">
-    <h1>Persimmon</h1>
-    <div class="tag">柿Tube &nbsp;·&nbsp; Web Unblocker</div>
-  </div>
-
-  <form class="search" id="searchForm" autocomplete="off">
-    <div class="search-inner">
-      <svg class="i" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.35-4.35"/></svg>
-      <input id="q" placeholder="動画を検索、またはURL / キーワードを入力…" autofocus>
-      <button class="go-btn" type="submit">
-        <span>検索</span>
-        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
-      </button>
+  <div class="container">
+    <div class="logo">
+      <img src="/img/kaki.png" alt="Persimmon" onerror="this.style.display='none'">
+      <h1>Persimmon</h1>
     </div>
-    <div class="suggest" id="suggest"></div>
-  </form>
-
-  <div class="toggle" id="toggle">
-    <div class="pill" id="pill"></div>
-    <button data-mode="yt" class="active" type="button">
-      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M21.6 7.2s-.2-1.4-.8-2c-.7-.8-1.6-.8-2-.9C15.9 4 12 4 12 4s-3.9 0-6.8.3c-.4.1-1.3.1-2 .9-.6.6-.8 2-.8 2S2.2 8.8 2.2 10.4v1.5c0 1.6.2 3.2.2 3.2s.2 1.4.8 2c.7.8 1.7.8 2.2.9 1.6.2 6.8.3 6.8.3s3.9 0 6.8-.3c.4-.1 1.3-.1 2-.9.6-.6.8-2 .8-2s.2-1.6.2-3.2v-1.5c0-1.6-.2-3.2-.2-3.2M9.9 13.7V8l5.2 2.9-5.2 2.8"/></svg>
-      柿Tube
-    </button>
-    <button data-mode="proxy" type="button">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10"/></svg>
-      Proxy
-    </button>
+    <form class="search" id="searchForm">
+      <input id="q" type="text" placeholder="検索..." autocomplete="off" autofocus>
+      <button type="submit" aria-label="検索">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+    </form>
+    <div class="toggle" id="toggle">
+      <div class="slider" id="slider"></div>
+      <button data-mode="yt" class="active">柿Tube</button>
+      <button data-mode="proxy">Proxy</button>
+    </div>
   </div>
-</div>
-
-<div class="foot">
-  <span>© 2026 Persimmon</span> · <a href="/">Home</a> · <span id="modeLabel">柿Tube Mode</span>
-</div>
+  <div class="footer">Persimmon © 2026</div>
 
 <script>
-const modes = document.querySelectorAll('#toggle button');
-const pill = document.getElementById('pill');
-const modeLabel = document.getElementById('modeLabel');
-const q = document.getElementById('q');
-const suggest = document.getElementById('suggest');
-let mode = localStorage.getItem('persimmon-mode') || 'yt';
+  const toggle=document.getElementById('toggle');
+  const slider=document.getElementById('slider');
+  const btns=toggle.querySelectorAll('button');
+  let mode=localStorage.getItem('persimmon_mode')||'yt';
 
-function movePill(){
-  const active = document.querySelector('#toggle button.active');
-  if(!active) return;
-  const r = active.getBoundingClientRect();
-  const pr = active.parentElement.getBoundingClientRect();
-  pill.style.width = r.width + 'px';
-  pill.style.height = r.height + 'px';
-  pill.style.transform = `translateX(${r.left - pr.left - 5}px)`;
-}
-function setMode(m){
-  mode = m;
-  localStorage.setItem('persimmon-mode', m);
-  modes.forEach(b=>b.classList.toggle('active', b.dataset.mode===m));
-  modeLabel.textContent = m==='yt' ? '柿Tube Mode' : 'Proxy Mode';
-  q.placeholder = m==='yt'
-    ? '動画・チャンネルを検索…'
-    : 'URLまたは検索ワードを入力…';
-  movePill();
-}
-modes.forEach(b=>b.addEventListener('click', ()=>setMode(b.dataset.mode)));
-setMode(mode);
-window.addEventListener('resize', movePill);
-setTimeout(movePill, 30);
-
-/* ---------- Search suggestions (YT only) ---------- */
-let sugTimer;
-q.addEventListener('input', ()=>{
-  clearTimeout(sugTimer);
-  const val = q.value.trim();
-  if(mode !== 'yt' || val.length < 2){ suggest.classList.remove('show'); return; }
-  sugTimer = setTimeout(async ()=>{
-    try{
-      const r = await fetch('/api/suggest?q=' + encodeURIComponent(val));
-      const list = await r.json();
-      if(!list.length){ suggest.classList.remove('show'); return; }
-      suggest.innerHTML = list.slice(0,8).map(s=>`
-        <a href="/search?q=${encodeURIComponent(s)}">
-          <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.35-4.35"/></svg>
-          ${escapeHtml(s)}
-        </a>`).join('');
-      suggest.classList.add('show');
-    }catch(e){ suggest.classList.remove('show'); }
-  }, 180);
-});
-document.addEventListener('click',e=>{ if(!e.target.closest('.search')) suggest.classList.remove('show'); });
-function escapeHtml(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c])}
-
-/* ---------- Submit ---------- */
-document.getElementById('searchForm').addEventListener('submit', e=>{
-  e.preventDefault();
-  const val = q.value.trim();
-  if(!val) return;
-  if(mode === 'yt'){
-    // URL of a YT video? go direct
-    const m = val.match(/(?:youtu\.be\/|v=|shorts\/)([A-Za-z0-9_-]{11})/);
-    if(m){ location.href = '/watch?v=' + m[1]; return; }
-    location.href = '/search?q=' + encodeURIComponent(val);
-  } else {
-    if(/^https?:\/\//i.test(val) || /^[\w-]+(\.[\w-]+)+/.test(val)){
-      const url = /^https?:\/\//i.test(val) ? val : 'https://' + val;
-      location.href = '/embed.html#' + url;
-    } else {
-      location.href = 'https://www.startpage.com/sp/search?query=' + encodeURIComponent(val);
-    }
+  function setMode(m){
+    mode=m;localStorage.setItem('persimmon_mode',m);
+    btns.forEach(b=>b.classList.toggle('active',b.dataset.mode===m));
+    const active=toggle.querySelector('button.active');
+    slider.style.width=active.offsetWidth+'px';
+    slider.style.left=active.offsetLeft+'px';
+    document.getElementById('q').placeholder=m==='yt'?'柿Tubeで検索...':'URLまたは検索ワード...';
   }
-});
+  requestAnimationFrame(()=>setMode(mode));
+  window.addEventListener('resize',()=>setMode(mode));
+  btns.forEach(b=>b.addEventListener('click',()=>setMode(b.dataset.mode)));
+
+  document.getElementById('searchForm').addEventListener('submit',e=>{
+    e.preventDefault();
+    const q=document.getElementById('q').value.trim();
+    if(!q)return;
+    if(mode==='yt'){
+      location.href='/search?q='+encodeURIComponent(q);
+    }else{
+      const isUrl=/^(https?:\/\/|[\w-]+\.[\w.-]+)/i.test(q);
+      if(isUrl){
+        const url=q.startsWith('http')?q:'https://'+q;
+        location.href='/embed.html#'+url;
+      }else{
+        location.href='https://www.startpage.com/sp/search?query='+encodeURIComponent(q);
+      }
+    }
+  });
 </script>
 </body>
 </html>
