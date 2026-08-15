@@ -1,15 +1,23 @@
 {
-  "name": "persimmon",
+  "name": "llytpr-wl-v01nh",
   "version": "1.0.0",
-  "description": "Persimmon - 柿Tube: The finest YouTube frontend fused with WebUnblocker",
+  "description": "llytpr-wl.v01nh — ultra-fast YouTube frontend (InnerTube + smart proxy rotation). Made by Kakinie with llytpr-wl.v01nh TEAM. V1",
   "main": "index.js",
+  "type": "commonjs",
+  "author": "Kakinie with llytpr-wl.v01nh TEAM",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.17"
+  },
   "scripts": {
     "start": "node index.js",
-    "dev": "node index.js"
+    "dev": "node index.js",
+    "test:api": "node scripts/smoke.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "youtube-search-api": "^1.2.1",
-    "node-fetch": "^2.7.0"
+    "express": "^4.21.2",
+    "hls.js": "^1.7.0",
+    "undici": "^6.21.1",
+    "youtube-search-api": "^2.0.1"
   }
 }
