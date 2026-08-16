@@ -6,9 +6,11 @@
 const express = require('express');
 const { request: undiciRequest } = require('undici');
 const { proxyManager } = require('./proxies');
+const { piped } = require('./piped');
 const it = require('./innertube');
 
 const router = express.Router();
+router.use(express.json({ limit: '64kb' }));
 
 const wrap = (fn) => (req, res) => {
   Promise.resolve(fn(req, res)).catch((e) => {
@@ -24,10 +26,15 @@ const wrap = (fn) => (req, res) => {
 
 /* ------------------------------------------------------------- media proxy */
 
+const PIPED_HOSTS = new Set(piped.instances);
+
 function isGoogleVideo(u) {
   try {
     const h = new URL(u).hostname;
-    return /(^|\.)googlevideo\.com$/.test(h) || /(^|\.)youtube\.com$/.test(h) || /(^|\.)ytimg\.com$/.test(h) || /(^|\.)googleapis\.com$/.test(h) || h === 'suggestqueries.google.com';
+    if (/(^|\.)googlevideo\.com$/.test(h) || /(^|\.)youtube\.com$/.test(h) || /(^|\.)ytimg\.com$/.test(h) || /(^|\.)googleapis\.com$/.test(h) || h === 'suggestqueries.google.com') return true;
+    // piped proxy hosts (only the hardcoded provider list — no open relay)
+    const bare = h.replace(/^pipedproxy\./, '').replace(/^proxy\./, '');
+    return PIPED_HOSTS.has(h) || PIPED_HOSTS.has(bare) || /(^|\.)piped\./.test(h);
   } catch (_) { return false; }
 }
 
@@ -181,6 +188,26 @@ router.post('/api/proxies/refresh', wrap(async (req, res) => {
 
 router.get('/api/home', wrap(async (req, res) => {
   res.json(await it.home(String(req.query.chip || 'all')));
+}));
+
+/** personalized home — profile comes from client-local history/likes */
+router.post('/api/home/personal', wrap(async (req, res) => {
+  const p = req.body && typeof req.body === 'object' ? req.body : {};
+  res.json(await it.personal(p));
+}));
+
+/** dedicated shorts feed (vertical videos only) */
+router.get('/api/shorts', wrap(async (req, res) => {
+  res.json(await it.shortsFeed());
+}));
+
+/** rescue: drop every cached stream/watch entry for a video and rebuild */
+router.post('/api/player/refresh', wrap(async (req, res) => {
+  const v = String((req.body?.v ?? req.query.v) || '');
+  if (!/^[\w-]{11}$/.test(v)) { res.status(400).json({ error: 'bad id' }); return; }
+  it.invalidateVideo(v);
+  const full = await it.getVideoFull(v);
+  res.json({ ok: true, playable: full.playable, playability: full.playability, source: full.streams?.source || null });
 }));
 
 router.get('/api/search', wrap(async (req, res) => {
