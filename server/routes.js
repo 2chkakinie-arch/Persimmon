@@ -68,7 +68,8 @@ router.get('/api/stream', wrap(async (req, res) => {
         // only accept proxies that are currently in our verified pool
         proxyUrl = p && proxyManager.pool.some(x => x.url === p) ? p : (hlsPins.get(v)?.proxyUrl || null);
       } else {
-        ({ url, proxyUrl } = await it.getStreamUrl(v, itag));
+        // attempt 2 以降は egress 実測＆ピン修復つき（発行 egress が 403 の動画を救う）
+        ({ url, proxyUrl } = await it.getStreamUrl(v, itag, { verify: attempt > 1 }));
       }
       if (!url || !isGoogleVideo(url)) throw new Error('no stream');
       const headers = {
@@ -156,7 +157,7 @@ async function pipeUpstream(url, headers, req, res, { dispatcher } = {}) {
     signal: ac.signal,
     dispatcher,
     maxRedirections: 2,
-    headersTimeout: 15000,
+    headersTimeout: 20000,
   });
   if ([403, 410].includes(upstream.statusCode)) {
     upstream.body.dump().catch(() => {});
