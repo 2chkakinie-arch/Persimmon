@@ -7,10 +7,19 @@ const express = require('express');
 const { request: undiciRequest } = require('undici');
 const { proxyManager } = require('./proxies');
 const { piped } = require('./piped');
+const { hotChunks } = require('./media');
 const it = require('./innertube');
 
 const router = express.Router();
 router.use(express.json({ limit: '64kb' }));
+
+/** fetch the pinned itag-18 URL and pre-buffer its first bytes in RAM. */
+async function warmDefault(v) {
+  try {
+    const { url, proxyUrl } = await it.getStreamUrl(v, 18);
+    if (url) hotChunks.warm(v, 18, url, proxyUrl);
+  } catch (_) { /* warm is best-effort */ }
+}
 
 const wrap = (fn) => (req, res) => {
   Promise.resolve(fn(req, res)).catch((e) => {
@@ -43,6 +52,9 @@ router.get('/api/stream', wrap(async (req, res) => {
   const itag = String(req.query.itag || '18');
   const rawRaw = req.query.raw ? String(req.query.raw) : null;
   if (!rawRaw && !/^[\w-]{11}$/.test(v)) { res.status(400).json({ error: 'bad id' }); return; }
+
+  // HOT PATH: pre-buffered first bytes -> answer straight from RAM
+  if (!rawRaw && hotChunks.serveIfHot(v, itag, req, res)) return;
 
   let attempt = 0;
   let lastErr = null;
@@ -225,8 +237,23 @@ router.get('/api/search/next', wrap(async (req, res) => {
 router.get('/api/watch/:id', wrap(async (req, res) => {
   const id = String(req.params.id || '');
   if (!/^[\w-]{11}$/.test(id)) { res.status(400).json({ error: 'bad id' }); return; }
-  res.json(await it.getVideoFull(id));
+  const list = String(req.query.list || '');
+  const data = await it.getVideoFull(id, list && /^[\w-]{1,64}$/.test(list) ? { playlistId: list } : {});
+  res.json(data);
+  // speculative warm: by the time the user presses play, the first bytes
+  // of the default 360p stream are already in RAM.
+  if (data.playable) warmDefault(id);
 }));
+
+/** explicit warmer: fired by card-hover on the client */
+router.get('/api/warm/:id', wrap(async (req, res) => {
+  const id = String(req.params.id || '');
+  if (!/^[\w-]{11}$/.test(id)) { res.status(400).json({ error: 'bad id' }); return; }
+  warmDefault(id);
+  res.json({ ok: true });
+}));
+
+router.get('/api/hotstat', (req, res) => res.json(hotChunks.status()));
 
 router.get('/api/comments/:id', wrap(async (req, res) => {
   const id = String(req.params.id || '');
@@ -256,6 +283,13 @@ router.get('/api/playlist/next', wrap(async (req, res) => {
   const c = String(req.query.c || '');
   if (!c) { res.status(400).json({ error: 'c required' }); return; }
   res.json(await it.playlistNext(c));
+}));
+
+/** mix/panel continuation (`next` endpoint family) */
+router.get('/api/playlist/panel-next', wrap(async (req, res) => {
+  const c = String(req.query.c || '');
+  if (!c) { res.status(400).json({ error: 'c required' }); return; }
+  res.json(await it.panelNext(c));
 }));
 
 router.get('/api/suggest', wrap(async (req, res) => {
