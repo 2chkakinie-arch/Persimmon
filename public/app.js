@@ -264,7 +264,7 @@ function playlistCard(it) {
   return `
   <div class="vcard" data-href="#${(it.url || '/playlist?list=' + it.id).replace(/^#?/, '')}">
     <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt="">
-      <span class="dur">${esc(it.count || '再生リスト')}</span>
+      <span class="pl-strip"><svg viewBox="0 0 24 24" class="ic"><path d="M3 6h12v2H3zm0 4h12v2H3zm0 4h8v2H3zm13-8v9l7-4.5z"/></svg>${esc(it.count || '再生リスト')}</span>
     </div>
     <div class="vmeta">
       <div class="vinfo">
@@ -272,6 +272,24 @@ function playlistCard(it) {
         <div class="vsub">${esc(it.channel || '')}</div>
         <div class="vsub">再生リストをすべて見る</div>
       </div>
+    </div>
+  </div>`;
+}
+
+/** search-result-style playlist row (fixes the "giant thumbnail" bug) */
+function playlistRow(it) {
+  const href = (it.url || '/playlist?list=' + it.id).replace(/^#?/, '');
+  const count = it.count || '';
+  return `
+  <div class="result-card" data-href="#${esc(href)}">
+    <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt="">
+      <span class="pl-strip"><svg viewBox="0 0 24 24" class="ic"><path d="M3 6h12v2H3zm0 4h12v2H3zm0 4h8v2H3zm13-8v9l7-4.5z"/></svg>${esc(count || '再生リスト')}</span>
+    </div>
+    <div class="vinfo result-info">
+      <div class="vtitle">${esc(it.title)}</div>
+      <div class="pl-kind">再生リスト</div>
+      ${it.channel ? `<div class="result-ch" style="margin-top:2px"><span>${esc(it.channel)}</span></div>` : ''}
+      <div class="result-sub" style="margin-top:10px">再生リストをすべて見る</div>
     </div>
   </div>`;
 }
@@ -472,6 +490,13 @@ function renderResults(params) {
   let sentinel = null;
   let filtered = 'すべて';
 
+  function listCard(it) {
+    if (it.kind === 'video') return resultCard(it);
+    if (it.kind === 'playlist') return playlistRow(it);
+    if (it.kind === 'short') return shortCard(it);
+    return videoCard(it); // channels via channelRow inside
+  }
+
   function draw(list) {
     const body = $('#res-body');
     if (!body) return;
@@ -488,11 +513,11 @@ function renderResults(params) {
       const others = list.filter(it => it.kind !== 'short');
       const head = others.slice(0, 3), tail = others.slice(3);
       content = `<div class="results-list">`
-        + head.map(it => it.kind === 'video' ? resultCard(it) : videoCard(it)).join('')
+        + head.map(listCard).join('')
         + `</div>`
         + (shorts.length ? shortsShelf(shorts) : '')
         + `<div class="results-list">`
-        + tail.map(it => it.kind === 'video' ? resultCard(it) : videoCard(it)).join('')
+        + tail.map(listCard).join('')
         + `</div>`;
       if (!others.length && !shorts.length) content = emptyResult();
     } else if (filtered === 'ショート') {
@@ -503,7 +528,7 @@ function renderResults(params) {
     } else {
       const show = list.filter(it => it.kind === KEY[filtered]);
       content = show.length
-        ? `<div class="results-list">${show.map(it => it.kind === 'video' ? resultCard(it) : videoCard(it)).join('')}</div>`
+        ? `<div class="results-list">${show.map(listCard).join('')}</div>`
         : emptyResult();
     }
     body.innerHTML = chipsHtml + content;
@@ -581,8 +606,8 @@ class DashLite {
     this.pumpRunning = false;
     this.startAt = 0;
     this.retry403 = 0;
-    this._onTime = () => this.pump();
-    this._onSeek = () => this._handleSeek();
+    this._onTime = () => this.pump().catch(() => {});
+    this._onSeek = () => this._handleSeek().catch(() => {});
   }
 
   async _range(itag, start, end) {
@@ -699,10 +724,12 @@ class DashLite {
 
   async pump() {
     if (!this.pumpRunning || this._pumping || this.dead) return;
+    if (this.video.error) return; // メディア要素がエラー状態なら append は常に失敗する
     this._pumping = true;
     try {
       for (;;) {
         if (this.dead) return;
+        if (this.video.error) return;
         const t = this.video.currentTime;
         const endV = this._bufferedEnd('v'), endA = this._bufferedEnd('a');
         if (endV - t > 24 && endA - t > 24) return;
@@ -733,13 +760,13 @@ class DashLite {
     const t = this.video.currentTime;
     const inV = t >= 0 && t < this._bufferedEnd('v');
     const inA = t >= 0 && t < this._bufferedEnd('a');
-    if (inV && inA) { this.pump(); return; }
+    if (inV && inA) { this.pump().catch(() => {}); return; }
     // re-sync both pipelines at t
     try {
       await this._clear(this.vbuf); await this._clear(this.abuf);
       this.posV = this._segIndex(this.vSegs, t);
       this.posA = this._segIndex(this.aSegs, t);
-      this.pump();
+      this.pump().catch(() => {});
     } catch (_) { /* leave it; progressive fallback handled by caller on fatal */ }
   }
 
@@ -883,19 +910,22 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
   const id = shortId || params.get('v') || '';
   if (!/^[\w-]{11}$/.test(id)) { errBox('動画IDが不正です', () => render()); return; }
   setActiveNav(vertical ? 'shorts' : 'home');
+  const listId = params.get('list') || '';
   let destroyed = false;
   let dash = null;
   let hlsInst = null;
-  let mode = 'auto'; // 'auto' | 'direct' | '360p' | itag string
+  let pair = null;              // {audio, iv} — HD video + separate audio sync
+  let mode = 'auto'; // 'auto' | 'hdauto' | 'direct' | '360p' | itag string
   let ui = null;
   let rescues = 0;
   let suppressErrorHook = false;
+  let instantAttached = false;
 
   app.innerHTML = `
   <div class="watch">
     <div class="player-col">
       <div class="player-wrap ${vertical ? 'vertical' : ''}" id="pwrap">
-        <video id="pvideo" playsinline autoplay ${vertical ? 'loop' : ''}></video>
+        <video id="pvideo" playsinline autoplay preload="auto" ${vertical ? 'loop' : ''}></video>
         <div class="spin" data-spin></div>
       </div>
       <div class="wtitle"><div class="sk sk-line" style="width:70%"></div></div>
@@ -909,10 +939,38 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
   const video = $('#pvideo');
   const wrapEl = $('#pwrap');
 
+  // ---- INSTANT START: don't wait for the API round-trip. Attach the default
+  // 360p relay immediately; the server resolves the (IP-pinned) URL and the
+  // RAM hot-cache answers the first bytes. UI/meta fill in alongside.
+  try {
+    suppressErrorHook = true; // verdict arrives with /api/watch
+    video.src = `/api/stream?v=${id}&itag=18`;
+    instantAttached = true;
+    const early = video.play();
+    if (early?.catch) early.catch(() => { /* autoplay policy — safePlay later */ });
+  } catch (_) { /* continue without instant attach */ }
+
+  function killPair() {
+    if (!pair) return;
+    try { clearInterval(pair.iv); } catch (_) {}
+    try { video.removeEventListener('play', pair.onPlay); } catch (_) {}
+    try { video.removeEventListener('pause', pair.onPause); } catch (_) {}
+    try { video.removeEventListener('seeked', pair.onSeeked); } catch (_) {}
+    try { video.removeEventListener('waiting', pair.onWaiting); } catch (_) {}
+    try { video.removeEventListener('playing', pair.onPlaying); } catch (_) {}
+    try { video.removeEventListener('ratechange', pair.onRate); } catch (_) {}
+    try { video.removeEventListener('volumechange', pair.onVol); } catch (_) {}
+    try { pair.audio.pause(); pair.audio.removeAttribute('src'); pair.audio.load(); } catch (_) {}
+    pair.audioEl?.remove?.();
+    pair = null;
+    video.muted = false;
+  }
+
   function cleanup() {
     destroyed = true;
     try { dash?.destroy(); } catch (_) {}
     try { hlsInst?.destroy(); } catch (_) {}
+    killPair();
     try { video.pause(); video.removeAttribute('src'); video.load(); } catch (_) {}
   }
 
@@ -927,6 +985,7 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
         fillMeta(d);
         loadComments(d);
         fillRail(d);
+        if (listId) setupPlaylistPanel(listId, id, d.panel);
         if (!d.playable) {
           // last-ditch: ask the server to rebuild (LOGIN_REQUIRED recovery path)
           if (rescues < 1) { await fatalRescue(true); return; }
@@ -985,11 +1044,13 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
     const direct = streams.direct || null;
 
     const autoTrack = pickAuto(adapt);
-    const canDash = audTrack && autoTrack && DashLite.isSupported(autoTrack, audTrack);
+    const canDash = !!(audTrack && autoTrack && DashLite.isSupported(autoTrack, audTrack));
+    let activeTrack = null;
 
     const qualities = [
-      { key: 'auto', label: canDash ? '自動 (' + autoTrack.qualityLabel + ')' : '自動' },
-      ...(direct ? [{ key: 'direct', label: 'ダイレクト (' + (direct.height || 360) + 'p・最速)' }] : []),
+      { key: 'auto', label: '自動 (360p・最速)' },
+      ...(direct ? [{ key: 'direct', label: 'ダイレクト 360p（実験）' }] : []),
+      ...((canDash || (autoTrack && audTrack)) ? [{ key: 'hdauto', label: '自動HD (' + (autoTrack?.qualityLabel || '720p') + ')' }] : []),
       ...qList,
     ];
     let speed = 1;
@@ -1004,7 +1065,7 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
 
     // a relayed stream can still die mid-playback (403): rebuild once
     video.addEventListener('error', () => {
-      if (destroyed || suppressErrorHook || dash) return;
+      if (destroyed || suppressErrorHook || dash || pair) return;
       if (rescues < 2) fatalRescue(false);
       else unplayableBox('ストリームに接続できませんでした', '経路の再取得に失敗しました');
     });
@@ -1028,28 +1089,111 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
 
     async function startMode(k, resumeAt = 0) {
       if (destroyed) return;
-      try { dash?.destroy(); dash = null; } catch (_) {}
-      try { hlsInst?.destroy(); hlsInst = null; } catch (_) {}
-      video.removeAttribute('src');
-      video.load();
+      const detach = () => {
+        try { dash?.destroy(); dash = null; } catch (_) {}
+        try { hlsInst?.destroy(); hlsInst = null; } catch (_) {}
+        killPair();
+        video.removeAttribute('src');
+        video.load();
+      };
       ui?.el.spin?.classList.remove('hidden');
       if (k === 'auto') {
-        // direct raw URL first when it stands a chance (shortens startup)…
-        if (direct && await tryDirect(direct, resumeAt)) return;
-        if (canDash) { if (!await tryDash(autoTrack, resumeAt)) startProg(bestProg, resumeAt); }
-        else startProg(bestProg, resumeAt);
-      } else if (k === 'direct') {
+        // 既定は最速 360p プログレッシブ。ページ表示瞬間に装着済み → 知覚ゼロ。
+        if (Store.get('directOk', false) && direct && !Store.get('directBlocked', false)) {
+          detach();
+          if (await tryDirect(direct, resumeAt)) return;
+        }
+        if (instantAttached && bestProg && !video.error) { suppressErrorHook = false; safePlay(); return; }
+        detach();
+        startProg(bestProg, resumeAt);
+        return;
+      }
+      detach();
+      if (k === 'direct') {
         if (direct && await tryDirect(direct, resumeAt, true)) return;
         toast('ダイレクト再生できませんでした（URL が IP 制限されています）。リレーに切り替えます');
         mode = 'auto';
-        if (canDash) { if (!await tryDash(autoTrack, resumeAt)) startProg(bestProg, resumeAt); }
-        else startProg(bestProg, resumeAt);
+        startProg(bestProg, resumeAt);
+      } else if (k === 'hdauto') {
+        if (canDash && await tryDash(autoTrack, resumeAt)) return;
+        if (await tryPair(autoTrack, resumeAt)) return;
+        startProg(bestProg, resumeAt);
       } else if (k === '360p') {
         startProg(bestProg, resumeAt);
       } else {
         const t = qList.find(q => q.key === k)?.track;
-        if (!t || !await tryDash(t, resumeAt)) startProg(bestProg, resumeAt);
+        if (t && await tryDash(t, resumeAt)) return;
+        if (await tryPair(t, resumeAt)) return;
+        startProg(bestProg, resumeAt);
       }
+    }
+
+    /**
+     * Dual-element HD: <video> が映像専用 adaptive、不可視の <audio> が音声を
+     * 受け持ち、ドリフト補正でリップシンクを保つ。MSE が使えない/音声バッファが
+     * 不安定な環境でも「360p以外で音が出ない」を確実に潰すための同期経路。
+     */
+    function tryPair(track, resumeAt) {
+      return new Promise((resolve) => {
+        if (!track || !audTrack) return resolve(false);
+        killPair();
+        const audio = new Audio();
+        audio.preload = 'auto';
+        let settled = false;
+        const timer = setTimeout(fail, 7000);
+        const fail = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          try { audio.pause(); audio.removeAttribute('src'); audio.load(); } catch (_) {}
+          resolve(false);
+        };
+        const ok = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          suppressErrorHook = false;
+          activeTrack = track;
+          const onPlay = () => audio.play().catch(() => {});
+          const onPause = () => audio.pause();
+          const onSeeked = () => { audio.currentTime = video.currentTime + 0.04; };
+          const onWaiting = () => audio.pause();
+          const onPlaying = () => {
+            if (Math.abs(audio.currentTime - video.currentTime) > 0.35) audio.currentTime = video.currentTime + 0.04;
+            audio.play().catch(() => {});
+          };
+          const onRate = () => { audio.playbackRate = video.playbackRate; };
+          const onVol = () => { audio.volume = video.volume; audio.muted = video.muted; };
+          video.addEventListener('play', onPlay);
+          video.addEventListener('pause', onPause);
+          video.addEventListener('seeked', onSeeked);
+          video.addEventListener('waiting', onWaiting);
+          video.addEventListener('playing', onPlaying);
+          video.addEventListener('ratechange', onRate);
+          video.addEventListener('volumechange', onVol);
+          audio.volume = video.volume; audio.muted = video.muted;
+          const iv = setInterval(() => {
+            if (destroyed || !pair) return;
+            if (video.paused || video.seeking) return;
+            if (Math.abs(audio.currentTime - video.currentTime) > 0.38) {
+              audio.currentTime = video.currentTime + 0.04;
+            }
+          }, 500);
+          pair = { audio, iv, onPlay, onPause, onSeeked, onWaiting, onPlaying, onRate, onVol, audioEl: audio };
+          audio.currentTime = resumeAt || 0;
+          safePlay();
+          resolve(true);
+        };
+        let vReady = false, aReady = false;
+        const maybe = () => { if (vReady && aReady) ok(); };
+        video.addEventListener('error', fail, { once: true });
+        audio.addEventListener('error', fail, { once: true });
+        video.addEventListener('canplay', () => { vReady = true; maybe(); }, { once: true });
+        audio.addEventListener('canplay', () => { aReady = true; maybe(); }, { once: true });
+        video.src = `/api/stream?v=${id}&itag=${track.itag}`;
+        audio.src = `/api/stream?v=${id}&itag=${audTrack.itag}`;
+        video.currentTime = resumeAt || 0;
+      });
     }
 
     /**
@@ -1080,10 +1224,11 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
           suppressErrorHook = false;
           if (ok) {
             Store.set('directBlocked', false);
+            Store.set('directOk', true);   // learned: this network can play raw urls
             mode = 'direct';
             resolve(true);
           } else {
-            if (d.bound) Store.set('directBlocked', true); // learned: urls here are IP-bound
+            if (d.bound) { Store.set('directBlocked', true); Store.set('directOk', false); }
             try { video.pause(); video.removeAttribute('src'); video.load(); } catch (_) {}
             resolve(false);
           }
@@ -1101,11 +1246,25 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
 
     async function tryDash(track, resumeAt) {
       try {
+        activeTrack = track;
         dash = new DashLite(video, id, track, audTrack);
         await dash.init(resumeAt);
         if (destroyed) return false;
+        suppressErrorHook = false;
         video.currentTime = resumeAt || 0;
         wireEndGuard();
+        // 音声パイプライン・ウォッチドッグ: 映像が進むのに音声バッファが
+        // 空のままなら、同期デュアルストリームに組み替える（無音HDの根治）。
+        setTimeout(() => {
+          if (destroyed || !dash || dash.dead) return;
+          const aEnd = dash._bufferedEnd('a');
+          if (aEnd < video.currentTime - 0.8) {
+            const t = video.currentTime;
+            try { dash?.destroy(); dash = null; } catch (_) {}
+            toast('高画質モードの音声を再構成しています');
+            tryPair(track, t).then(ok => { if (!ok) startProg(bestProg, t); });
+          }
+        }, 2600);
         safePlay();
         return true;
       } catch (e) {
@@ -1123,6 +1282,8 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
         return;
       }
       dash?.destroy(); dash = null;
+      killPair();
+      suppressErrorHook = false;
       video.src = `/api/stream?v=${id}&itag=${p.itag}`;
       video.currentTime = resumeAt || 0;
       safePlay();
@@ -1282,6 +1443,113 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
     </div>`;
   }
 
+  /* ---------------- YouTube-style playlist panel + auto-advance ---------------- */
+  const ICON_LIST = '<svg viewBox="0 0 24 24" class="ic"><path d="M3 6h12v2H3zm0 4h12v2H3zm0 4h8v2H3zm14-8v7.5a3 3 0 1 0 2 2.8V8h3V6z"/></svg>';
+  const ICON_LOOP = '<svg viewBox="0 0 24 24" class="ic"><path d="M7 7h10v3l4-4-4-4v3H5v6h2zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2z"/></svg>';
+  const ICON_SHUFFLE = '<svg viewBox="0 0 24 24" class="ic"><path d="M10.6 9.2 8.9 7.5 4 7.5v2h4l1.7 1.7zm6.1 5.2-1.6 1.6-5.5-5.5 1.4-1.4 5.7 5.3zM14 4l4 4-4 4v-3c-4.95 0-7 3.5-8 8-.3-6 1.5-10 8-10z" opacity="0"/><path d="M14.1 7.4 10.6 3.9 14.1.4v2H18c3.3 0 6 2.7 6 6 0 1.6-.6 3-1.6 4.1l-1.4-1.4c.7-.8 1-1.7 1-2.7 0-2.2-1.8-4-4-4h-3.9zm-4.2 9.2 3.5 3.5-3.5 3.5v-2H6c-3.3 0-6-2.7-6-6 0-1.6.6-3 1.6-4.1l1.4 1.4c-.7.8-1 1.7-1 2.7 0 2.2 1.8 4 4 4h3.9z" transform="translate(-3 3)"/></svg>';
+  const plState = { items: [], idx: -1, loop: false, shuffle: false, title: '', owner: '' };
+
+  async function setupPlaylistPanel(lid, currentVid, panelData) {
+    try {
+      let cont = null, usePanelNext = false;
+      if (panelData?.items?.length) {
+        // パネルが watch 応答に同梱されている → そのまま使う (最速)
+        plState.title = panelData.title || '再生リスト';
+        plState.owner = '';
+        plState.items = panelData.items;
+        cont = panelData.continuation;
+        usePanelNext = true;
+      } else {
+        const d = await api('/api/playlist/' + encodeURIComponent(lid), { ttl: 10 * 60e3 });
+        plState.title = d.title || '再生リスト';
+        plState.owner = d.channelName || '';
+        plState.items = d.items || [];
+        cont = d.continuation;
+        usePanelNext = !!d.panelNext;
+      }
+      if (destroyed || !document.body.contains(wrapEl)) return;
+      plState.idx = plState.items.findIndex(x => x.id === currentVid);
+      const nextUrl = () => (usePanelNext ? '/api/playlist/panel-next?c=' : '/api/playlist/next?c=') + encodeURIComponent(cont);
+      // walk continuation pages until the current video shows up (max 3 more)
+      let guard = 0;
+      while (plState.idx < 0 && cont && guard < 3) {
+        guard++;
+        const n = await api(nextUrl(), { ttl: 10 * 60e3 }).catch(() => null);
+        if (!n) break;
+        cont = n.continuation;
+        plState.items = plState.items.concat(n.items || []);
+        plState.idx = plState.items.findIndex(x => x.id === currentVid);
+      }
+      // index unknown (huge list): treat as first
+      if (plState.idx < 0) plState.items.unshift({ id: currentVid, title: document.title, thumb: '', channel: plState.owner, duration: '' }), plState.idx = 0;
+      drawPanel();
+      // auto-advance
+      video.addEventListener('ended', () => advance(1));
+    } catch (_) { /* playlist panel is additive — never fatal */ }
+  }
+
+  function drawPanel() {
+    const rail = $('#rail');
+    if (!rail) return;
+    rail.querySelector('.plp')?.remove();
+    const rows = plState.items.map((v, i) => `
+      <div class="plp-item ${i === plState.idx ? 'active' : ''}" data-plgo="${i}">
+        <span class="plp-idx">${i === plState.idx ? '<svg viewBox="0 0 24 24" class="ic" style="width:14px;height:14px"><path d="M8 5v14l11-7z"/></svg>' : (i + 1)}</span>
+        <div class="vthumb"><img loading="lazy" src="${esc(v.thumb || ('https://i.ytimg.com/vi/' + v.id + '/hqdefault.jpg'))}" alt="">${v.duration ? `<span class="dur">${esc(v.duration)}</span>` : ''}</div>
+        <div class="vinfo"><div class="plp-tt">${esc(v.title || '')}</div><div class="vsub" style="font-size:12px">${esc(v.channel || '')}</div></div>
+      </div>`).join('');
+    rail.insertAdjacentHTML('afterbegin', `
+      <div class="plp">
+        <div class="plp-head">
+          <div class="plp-t1">
+            <span class="plp-ic">${ICON_LIST}</span>
+            <span class="plp-name">${esc(plState.title)}</span>
+            <div class="plp-spacer"></div>
+            <button class="icon-btn plp-btn ${plState.shuffle ? 'on' : ''}" data-plact="shuffle" title="シャッフル">${ICON_SHUFFLE}</button>
+            <button class="icon-btn plp-btn ${plState.loop ? 'on' : ''}" data-plact="loop" title="ループ再生">${ICON_LOOP}</button>
+            <button class="icon-btn plp-btn" data-plact="fold" title="折りたたむ"><svg viewBox="0 0 24 24" class="ic"><path d="M7.4 8.6 12 13.2l4.6-4.6L18 10l-6 6-6-6z"/></svg></button>
+          </div>
+          <div class="plp-sub">${esc(plState.owner || '再生リスト')} ・ ${plState.idx + 1} / ${plState.items.length}</div>
+        </div>
+        <div class="plp-items">${rows}</div>
+      </div>`);
+    const panel = rail.querySelector('.plp');
+    panel.querySelectorAll('[data-plgo]').forEach(r => r.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const i = +r.dataset.plgo;
+      const v = plState.items[i];
+      if (v) location.hash = '#/watch?v=' + v.id + '&list=' + encodeURIComponent(listId);
+    }));
+    panel.querySelectorAll('[data-plact]').forEach(b => b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const act = b.dataset.plact;
+      if (act === 'loop') { plState.loop = !plState.loop; b.classList.toggle('on', plState.loop); }
+      if (act === 'shuffle') { plState.shuffle = !plState.shuffle; b.classList.toggle('on', plState.shuffle); }
+      if (act === 'fold') { panel.classList.toggle('folded'); b.querySelector('svg').style.transform = panel.classList.contains('folded') ? 'rotate(180deg)' : ''; }
+    }));
+    panel.querySelector('.plp-item.active')?.scrollIntoView({ block: 'center' });
+  }
+
+  function advance(step) {
+    if (destroyed || !plState.items.length) return;
+    let next;
+    if (plState.shuffle) {
+      do { next = Math.floor(Math.random() * plState.items.length); } while (plState.items.length > 1 && next === plState.idx);
+    } else {
+      next = plState.idx + step;
+      if (next >= plState.items.length) {
+        if (!plState.loop) return;
+        next = 0;
+      }
+    }
+    const v = plState.items[next];
+    if (!v) return;
+    toast('次の動画を再生: ' + (v.title || v.id).slice(0, 30), 1800);
+    location.hash = '#/watch?v=' + v.id + '&list=' + encodeURIComponent(listId);
+  }
+
+  return { destroy() { cleanup(); } };
+
   function fillRail(d) {
     const rail = $('#rail');
     if (!rail) return;
@@ -1292,8 +1560,6 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
       (shorts.length ? shortsShelf(shorts, { compact: true }) : '') +
       vids.slice(6).map(railCard).join('');
   }
-
-  return { destroy() { cleanup(); } };
 }
 
 /* ================================================================= CHANNEL */
