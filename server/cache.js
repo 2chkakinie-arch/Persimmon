@@ -43,6 +43,10 @@ class TTLCache {
   delete(key) {
     this.map.delete(key);
   }
+  /** wc-prefix deletion (e.g. flush every 'vf:VIDEOID:*' variant at once) */
+  deletePrefix(prefix) {
+    for (const k of this.map.keys()) if (k.startsWith(prefix)) this.map.delete(k);
+  }
   clear() {
     this.map.clear();
   }
