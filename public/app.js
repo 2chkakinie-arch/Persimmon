@@ -340,12 +340,34 @@ document.addEventListener('click', (e) => {
   const card = e.target.closest('[data-href]');
   if (card) { location.hash = card.dataset.href.startsWith('#') ? card.dataset.href.slice(1) : card.dataset.href; }
 });
+// ---- 先読みプリフェッチ（メタ情報限界高速化）------------------------------
+// カードに 120ms ホバーした時点で /api/watch（メタ+直結判定＋先頭チャンクwarm）を
+// 裏取得し、クリック時にはメモリキャッシュから即座に反映されるようにする。
+// data-vid 属性も data-href の URL も両方を解析する（検索行カード等も網羅）。
+const _prefetched = new Map(); // vid -> ts
 document.addEventListener('mouseover', debounce((e) => {
-  const card = e.target.closest?.('[data-vid]');
-  if (card && /^[\w-]{11}$/.test(card.dataset.vid)) {
-    api('/api/watch/' + card.dataset.vid).catch(() => {});
+  const card = e.target.closest?.('[data-vid],[data-href]');
+  if (!card) return;
+  let vid = card.dataset.vid || '';
+  if (!/^[\w-]{11}$/.test(vid)) {
+    const m = String(card.dataset.href || '').match(/[?&/]v[=/]([\w-]{11})|\/shorts\/([\w-]{11})/);
+    vid = m ? (m[1] || m[2] || '') : '';
   }
+  if (!/^[\w-]{11}$/.test(vid)) return;
+  const last = _prefetched.get(vid) || 0;
+  if (Date.now() - last < 300000) return;
+  _prefetched.set(vid, Date.now());
+  api('/api/watch/' + vid).catch(() => {});            // メタ＋直結判定（SWRキャッシュ入り）
+  fetch('/api/warm/' + vid).catch(() => {});           // 先頭 768KB をサーバーRAMへ保温
 }, 120), { passive: true });
+document.addEventListener('touchstart', (e) => { // モバイルはホバーが無いのでタッチ即先読み
+  const card = e.target.closest?.('[data-vid],[data-href]');
+  if (!card) return;
+  const vid = card.dataset.vid || '';
+  if (!/^[\w-]{11}$/.test(vid)) return;
+  api('/api/watch/' + vid).catch(() => {});
+  fetch('/api/warm/' + vid).catch(() => {});
+}, { passive: true });
 
 /* skeleton screens */
 function skGrid(n = 12, rail = false) {
