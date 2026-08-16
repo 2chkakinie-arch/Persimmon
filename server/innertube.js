@@ -429,6 +429,21 @@ function parsePlaylistVideo(v) {
   };
 }
 
+/** watch-page/mix playlist panel item */
+function parsePanelVideo(v) {
+  if (!v?.videoId) return null;
+  return {
+    kind: 'video',
+    id: v.videoId,
+    url: '/watch?v=' + v.videoId,
+    title: textOf(v.title),
+    thumb: bestThumb(v.thumbnail?.thumbnails) || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
+    duration: textOf(v.lengthText) || '',
+    channel: textOf(v.shortBylineText) || textOf(v.longBylineText) || '',
+    selected: !!v.selected,
+  };
+}
+
 function parseChannelRenderer(c) {
   if (!c?.channelId) return null;
   const canon = c.navigationEndpoint?.browseEndpoint?.canonicalBaseUrl
@@ -486,6 +501,7 @@ function extractItems(root) {
     if (node.compactVideoRenderer) { push('video', parseCompactVideo(node.compactVideoRenderer)); return; }
     if (node.videoRenderer) { push('video', parseVideoRenderer(node.videoRenderer)); return; }
     if (node.playlistVideoRenderer) { push('video', parsePlaylistVideo(node.playlistVideoRenderer)); return; }
+    if (node.playlistPanelVideoRenderer) { push('video', parsePanelVideo(node.playlistPanelVideoRenderer)); return; }
     if (node.channelRenderer) { push('channel', parseChannelRenderer(node.channelRenderer)); return; }
     if (node.playlistRenderer) { push('playlist', parsePlaylistRenderer(node.playlistRenderer)); return; }
     if (node.continuationItemRenderer) {
@@ -601,10 +617,13 @@ function parsePrimaryInfo(c) {
   };
 }
 
-async function watchNext(videoId, { hl = 'ja', gl = 'JP' } = {}) {
-  return caches.api.wrap('w:' + videoId + hl + gl, 10 * CACHE_MIN, async () => {
+async function watchNext(videoId, { hl = 'ja', gl = 'JP', playlistId } = {}) {
+  const cacheKey = 'w:' + videoId + hl + gl + (playlistId ? ':' + playlistId : '');
+  return caches.api.wrap(cacheKey, 10 * CACHE_MIN, async () => {
     const visitorId = await getVisitorId();
-    const res = await callApi('next', { videoId, contentCheckOk: true, racyCheckOk: true }, CLIENTS.WEB, { visitorId });
+    const payload = { videoId, contentCheckOk: true, racyCheckOk: true };
+    if (playlistId) payload.playlistId = playlistId;
+    const res = await callApi('next', payload, CLIENTS.WEB, { visitorId });
     const watch = res?.contents?.twoColumnWatchNextResults || {};
     const results = watch?.results?.results?.contents || [];
     const meta = parsePrimaryInfo(results);
@@ -625,6 +644,26 @@ async function watchNext(videoId, { hl = 'ja', gl = 'JP' } = {}) {
     const { items: related, continuation: relatedContinuation } = extractItems(sec);
     // autoplay target
     const autoplay = deepFind(watch?.autoplay?.autoplay, 'watchEndpoint', 1)?.[0]?.videoId || null;
+    // 本家同等のプレイリストパネル (mix含む)
+    // - 通常プレイリスト: playlistPanelRenderer ラッパあり
+    // - ミックス (RD…): contents.twoColumnWatchNextResults.playlist.playlist に素の contents が直置き (2026〜)
+    const panelR = deepFind(watch?.playlist || res, 'playlistPanelRenderer', 1)?.[0]
+      || (Array.isArray(watch?.playlist?.playlist?.contents) ? watch.playlist.playlist : null);
+    let panel = null;
+    if (panelR) {
+      const pr = extractItems(panelR.contents || []);
+      const panelVideos = pr.items.filter(i => i.kind === 'video' && i.id);
+      panel = {
+        title: textOf(panelR.titleText) || textOf(panelR.title) || '',
+        owner: textOf(panelR.ownerName) || textOf(panelR.shortBylineText) || textOf(panelR.longBylineText) || '',
+        totalText: textOf(panelR.totalVideosText) || '',
+        items: panelVideos,
+        continuation: pr.continuation,
+        currentIndex: Number.isInteger(panelR.currentIndex) ? panelR.currentIndex : panelVideos.findIndex(i => i.selected),
+        isInfinite: !!panelR.isInfinite,
+      };
+      if (panel.currentIndex < 0) panel.currentIndex = 0;
+    }
     return {
       videoId,
       ...meta,
@@ -633,7 +672,25 @@ async function watchNext(videoId, { hl = 'ja', gl = 'JP' } = {}) {
       commentsToken,
       commentsCount,
       autoplay,
+      panel,
     };
+  });
+}
+
+/** continuation of the watch playlist panel (goes through the `next` endpoint) */
+async function panelNext(continuation) {
+  return caches.api.wrap('pn:' + continuation.slice(-24), 10 * CACHE_MIN, async () => {
+    const visitorId = await getVisitorId();
+    const res = await callApi('next', { continuation }, CLIENTS.WEB, { visitorId });
+    const eps = res?.onResponseReceivedEndpoints || res?.onResponseReceivedCommands || [];
+    let items = [], cont = null;
+    for (const ep of eps) {
+      const bag = ep.appendContinuationItemsAction?.continuationItems || ep.reloadContinuationItemsCommand?.continuationItems || [];
+      const r = extractItems(bag);
+      items = items.concat(r.items.filter(i => i.kind === 'video' && i.id));
+      if (r.continuation) cont = r.continuation;
+    }
+    return { items, continuation: cont };
   });
 }
 
@@ -919,6 +976,7 @@ async function getVideoFull(videoId, opts = {}) {
     commentsToken: n?.commentsToken || null,
     commentsCount: n?.commentsCount || '',
     autoplay: n?.autoplay || null,
+    panel: n?.panel || null,
     streams: p ? {
       progressive: p.progressive,
       videos: p.videos,
@@ -1210,13 +1268,44 @@ async function resolveChannelId(idOrHandle) {
 /* ----------------------------------------------------------------- playlist */
 
 async function playlist(listId) {
-  const id = String(listId).startsWith('VL') ? String(listId) : 'VL' + listId;
+  const raw = String(listId);
+  const id = raw.startsWith('VL') ? raw : 'VL' + raw;
   const visitorId = await getVisitorId();
   const res = await callApi('browse', { browseId: id }, CLIENTS.WEB, { visitorId });
   const title = textOf(deepFind(res, 'playlistSidebarRenderer', 1)?.[0]?.title) || textOf(deepFind(res, 'pageTitle', 1)?.[0]);
   const sub = deepFind(res, 'playlistSidebarRenderer', 1)?.[0] || {};
   const { items, continuation } = extractItems(res?.contents?.twoColumnBrowseResultsRenderer || res);
   const ownerCh = deepFind(sub, 'playlistOwnerEndpoint', 1)?.[0];
+  const videos = items.filter(i => i.kind === 'video' || i.kind === 'short');
+  if (!videos.length && !raw.startsWith('VL')) {
+    // ミックスリスト (RD…) / generated lists: browse は空 → `next` のパネルで構成
+    // 応答にラッパが無い構造 change に備えて、transports を替えつつ最大3回試す
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const nx = await callApi('next', { playlistId: raw, contentCheckOk: true, racyCheckOk: true }, CLIENTS.WEB, { visitorId, timeout: 12000, transportCount: 2 });
+        const panelR = deepFind(nx, 'playlistPanelRenderer', 1)?.[0]
+          || (Array.isArray(nx?.contents?.singleColumnWatchNextResults?.playlist?.playlist?.contents) ? nx.contents.singleColumnWatchNextResults.playlist.playlist : null)
+          || (Array.isArray(nx?.contents?.twoColumnWatchNextResults?.playlist?.playlist?.contents) ? nx.contents.twoColumnWatchNextResults.playlist.playlist : null);
+        const pr = extractItems(panelR?.contents || []);
+        const panelItems = pr.items.filter(i => i.kind === 'video' && i.id);
+        if (panelItems.length) {
+          return {
+            id: raw,
+            title: textOf(panelR?.titleText) || textOf(panelR?.title) || 'ミックスリスト',
+            description: '',
+            views: '',
+            channelId: '',
+            channelName: textOf(panelR?.ownerName) || 'YouTube',
+            items: panelItems,
+            continuation: pr.continuation,
+            panelNext: true,
+            isInfinite: !!panelR?.isInfinite,
+          };
+        }
+      } catch (_) { /* rotate & retry */ }
+      await new Promise(r => setTimeout(r, 350));
+    }
+  }
   return {
     id: listId,
     title,
@@ -1224,7 +1313,7 @@ async function playlist(listId) {
     views: textOf(sub.viewCountText),
     channelId: ownerCh?.browseEndpoint?.browseId || '',
     channelName: textOf(deepFind(sub, 'playlistOwnerText', 1)?.[0]),
-    items: items.filter(i => i.kind === 'video' || i.kind === 'short'),
+    items: videos,
     continuation,
   };
 }
@@ -1405,7 +1494,7 @@ async function suggest(q) {
 
 module.exports = {
   search, searchNext, watchNext, getVideoFull, player, getStreamUrl, refreshStreamMap,
-  comments, commentsNext, channel, playlist, playlistNext, home, personal, shortsFeed, suggest,
+  comments, commentsNext, channel, playlist, playlistNext, panelNext, home, personal, shortsFeed, suggest,
   resolveChannelId, getVisitorId, getHls, fetchText, invalidateVideo, YTError, caches,
   // test hooks (not used by the app runtime)
   __test: { CLIENTS, PLAYER_CHAIN, transportsForUrls, resetCombos: () => { goodCombo = null; } },
