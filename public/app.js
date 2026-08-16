@@ -1047,9 +1047,14 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
     const canDash = !!(audTrack && autoTrack && DashLite.isSupported(autoTrack, audTrack));
     let activeTrack = null;
 
+    // llytpr++ 直結: サーバーが Range 実測で「生URLが通る」と判定した動画は
+    // 既定の自動画質からプロキシを一切介さず googlevideo 直再生にする。
+    // ※ directBlocked はセッション中に変化するため、判定は必ず都度評価する
+    const directReady0 = !!(streams.playDirect && direct?.url && !Store.get('directBlocked', false));
+    const canDirect = () => !!((streams.playDirect || Store.get('directOk', false)) && direct?.url && !Store.get('directBlocked', false));
+    const canHdRaw = () => !!(canDirect() && streams.hdDirect && streams.directUrls);
     const qualities = [
-      { key: 'auto', label: '自動 (360p・最速)' },
-      ...(direct ? [{ key: 'direct', label: 'ダイレクト 360p（実験）' }] : []),
+      { key: 'auto', label: directReady0 ? ('自動 (' + (direct?.height || 360) + 'p・直結最速)') : '自動 (360p・最速)' },
       ...((canDash || (autoTrack && audTrack)) ? [{ key: 'hdauto', label: '自動HD (' + (autoTrack?.qualityLabel || '720p') + ')' }] : []),
       ...qList,
     ];
@@ -1098,23 +1103,19 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
       };
       ui?.el.spin?.classList.remove('hidden');
       if (k === 'auto') {
-        // 既定は最速 360p プログレッシブ。ページ表示瞬間に装着済み → 知覚ゼロ。
-        if (Store.get('directOk', false) && direct && !Store.get('directBlocked', false)) {
-          detach();
+        // 既定は最速プログレッシブ。直結可能と実測済みなら（ほとんどの動画が該当）
+        // 影武者プローブで生 URL を試し、進行確認できた時だけ無停止で載せ替える。
+        if (canDirect()) {
           if (await tryDirect(direct, resumeAt)) return;
         }
-        if (instantAttached && bestProg && !video.error) { suppressErrorHook = false; safePlay(); return; }
+        if (instantAttached && bestProg && !video.error) { suppressErrorHook = false; safePlay(); armProgressWatchdog('relay-instant', resumeAt); return; }
         detach();
         startProg(bestProg, resumeAt);
         return;
       }
       detach();
-      if (k === 'direct') {
-        if (direct && await tryDirect(direct, resumeAt, true)) return;
-        toast('ダイレクト再生できませんでした（URL が IP 制限されています）。リレーに切り替えます');
-        mode = 'auto';
-        startProg(bestProg, resumeAt);
-      } else if (k === 'hdauto') {
+      if (k === 'hdauto') {
+        if (canHdRaw() && await tryPair(autoTrack, resumeAt, true)) return;
         if (canDash && await tryDash(autoTrack, resumeAt)) return;
         if (await tryPair(autoTrack, resumeAt)) return;
         startProg(bestProg, resumeAt);
@@ -1122,8 +1123,9 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
         startProg(bestProg, resumeAt);
       } else {
         const t = qList.find(q => q.key === k)?.track;
+        if (canHdRaw() && t && await tryPair(t, resumeAt, true)) return;
         if (t && await tryDash(t, resumeAt)) return;
-        if (await tryPair(t, resumeAt)) return;
+        if (t && await tryPair(t, resumeAt)) return;
         startProg(bestProg, resumeAt);
       }
     }
@@ -1133,21 +1135,30 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
      * 受け持ち、ドリフト補正でリップシンクを保つ。MSE が使えない/音声バッファが
      * 不安定な環境でも「360p以外で音が出ない」を確実に潰すための同期経路。
      */
-    function tryPair(track, resumeAt) {
+    function tryPair(track, resumeAt, raw = false) {
       return new Promise((resolve) => {
-        if (!track || !audTrack) return resolve(false);
-        killPair();
-        const audio = new Audio();
-        audio.preload = 'auto';
+        let audio = null;
+        let timer = null;
         let settled = false;
-        const timer = setTimeout(fail, 7000);
-        const fail = () => {
+        const finish = (val) => {
           if (settled) return;
           settled = true;
-          clearTimeout(timer);
-          try { audio.pause(); audio.removeAttribute('src'); audio.load(); } catch (_) {}
-          resolve(false);
+          try { clearTimeout(timer); } catch (_) {}
+          if (!val && audio) { try { audio.pause(); audio.removeAttribute('src'); audio.load(); } catch (_) {} }
+          resolve(val);
         };
+        try {
+        if (!track || !audTrack) return finish(false);
+        // raw モード(llytpr++ 直結HD): <video>/<audio> のメディア要素は CORS 不要の
+        // ため、生 googlevideo URL をそのまま装着できる（MSE と違い fetch を通らない）。
+        const vSrc = raw ? streams.directUrls?.[track.itag] : `/api/stream?v=${id}&itag=${track.itag}`;
+        const aSrc = raw ? streams.directUrls?.[audTrack.itag] : `/api/stream?v=${id}&itag=${audTrack.itag}`;
+        if (!vSrc || !aSrc) return finish(false);
+        killPair();
+        audio = new Audio();
+        audio.preload = 'auto';
+        timer = setTimeout(() => finish(false), 9000);
+        const fail = () => finish(false);
         const ok = () => {
           if (settled) return;
           settled = true;
@@ -1182,6 +1193,24 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
           pair = { audio, iv, onPlay, onPause, onSeeked, onWaiting, onPlaying, onRate, onVol, audioEl: audio };
           audio.currentTime = resumeAt || 0;
           safePlay();
+          // raw HD の stall 監視: 開始後に映像が進まなければ MSE→リレーへ降格
+          if (raw) {
+            const t0p = video.currentTime;
+            setTimeout(() => {
+              if (destroyed || !pair || Store.get('directBlocked', false)) return;
+              if (video.paused || video.seeking) return;
+              if (video.currentTime - t0p < 0.15 && video.readyState < 3) {
+                Store.set('directBlocked', true);
+                toast('直結HDが不安定なため切り替えます');
+                killPair();
+                (async () => {
+                  if (canDash && await tryDash(track, video.currentTime)) return;
+                  if (await tryPair(track, video.currentTime, false)) return;
+                  startProg(bestProg, video.currentTime);
+                })();
+              }
+            }, 6000);
+          }
           resolve(true);
         };
         let vReady = false, aReady = false;
@@ -1190,24 +1219,68 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
         audio.addEventListener('error', fail, { once: true });
         video.addEventListener('canplay', () => { vReady = true; maybe(); }, { once: true });
         audio.addEventListener('canplay', () => { aReady = true; maybe(); }, { once: true });
-        video.src = `/api/stream?v=${id}&itag=${track.itag}`;
-        audio.src = `/api/stream?v=${id}&itag=${audTrack.itag}`;
+        video.src = vSrc;
+        audio.src = aSrc;
         video.currentTime = resumeAt || 0;
+        } catch (_) { finish(false); }
       });
     }
 
     /**
-     * Try playing the RAW googlevideo/Piped URL straight from the browser.
-     * Success is remembered; an IP-binding 403 flips the session flag off so
-     * future videos go straight to the relay (no wasted startup time).
+     * llytpr++ 直結スワップ: 生 googlevideo/Piped URL を不可視の「影武者」<video> で
+     * 先行試聴し、実際に再生時間が進むことを確認できた時だけ本体に載せ替える。
+     * 失敗しても本体（リレー再生中）は一切妨げられない = 直結判定を常に楽観試行できる。
      */
-    function tryDirect(d, resumeAt, manual = false) {
+    function tryDirect(d, resumeAt) {
       if (!d?.url) return Promise.resolve(false);
-      if (d.bound && Store.get('directBlocked', false) && !manual) return Promise.resolve(false);
+      if (Store.get('directBlocked', false)) return Promise.resolve(false);
+      const shadowOk = instantAttached && !video.error;
+      if (shadowOk) return new Promise((resolve) => {
+        const probe = document.createElement('video');
+        probe.muted = true;
+        probe.playsInline = true;
+        probe.preload = 'auto';
+        let settled = false;
+        const cleanup = () => { try { probe.pause(); probe.removeAttribute('src'); probe.load(); } catch (_) {} probe.remove(); };
+        const timer = setTimeout(() => done(false), 5000);
+        probe.addEventListener('error', () => done(false), { once: true });
+        let mark = -1;
+        probe.addEventListener('playing', () => {
+          mark = probe.currentTime;
+          setTimeout(() => {
+            if (settled) return;
+            if (probe.currentTime - mark > 0.25) done(true); // 実進行を確認
+          }, 900);
+        }, { once: true });
+        probe.src = d.url;
+        probe.currentTime = resumeAt || 0;
+        probe.play().catch(() => {});
+        function done(ok) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (ok) {
+            Store.set('directBlocked', false);
+            Store.set('directOk', true);
+            mode = 'auto'; // 「自動」のまま = 直結が既定動作
+            const carry = Math.max(probe.currentTime, video.currentTime || 0, resumeAt || 0);
+            cleanup();
+            video.src = d.url;
+            video.currentTime = carry;
+            safePlay();
+            armProgressWatchdog('direct', carry);
+            resolve(true);
+          } else {
+            cleanup(); // 本体は無傷（リレー再生継続）
+            resolve(false);
+          }
+        }
+      });
+      // 本体がまだ空のときは従来どおり直下試行（2.6s watchdog→リレー）
       return new Promise((resolve) => {
         let settled = false;
         suppressErrorHook = true;
-        const timer = setTimeout(() => done(false), manual ? 5000 : 2600);
+        const timer = setTimeout(() => done(false), 2600);
         const onErr = () => done(false);
         const onPlay = () => done(true);
         video.addEventListener('error', onErr, { once: true });
@@ -1225,10 +1298,25 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
           if (ok) {
             Store.set('directBlocked', false);
             Store.set('directOk', true);   // learned: this network can play raw urls
-            mode = 'direct';
+            mode = 'auto';                 // 「自動」画質のまま = 直結が既定動作
+            // post-success stall watchdog: 「playing は出たが秒数が進まない」
+            // （発信元 IP レピュテーション等で途中 stall）を検知してリレーへ強制復帰
+            const t0 = video.currentTime;
+            setTimeout(() => {
+              if (destroyed || dash || pair || Store.get('directBlocked', false)) return;
+              if (mode !== 'auto') return;
+              if (video.paused || video.seeking || video.ended) return;
+              if (video.currentTime - t0 < 0.15 && video.readyState < 3) {
+                Store.set('directBlocked', true);
+                toast('直結が不安定なためリレーに切り替えます');
+                startProg(bestProg, video.currentTime || resumeAt || 0);
+              }
+            }, 5000);
+            armProgressWatchdog('direct', resumeAt);
             resolve(true);
           } else {
-            if (d.bound) { Store.set('directBlocked', true); Store.set('directOk', false); }
+            // 直結不可（ユーザ網が googlevideo を遮断等）: このセッションはリレー固定
+            Store.set('directBlocked', true); Store.set('directOk', false);
             try { video.pause(); video.removeAttribute('src'); video.load(); } catch (_) {}
             resolve(false);
           }
@@ -1274,6 +1362,24 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
       }
     }
 
+    /** 進行watchdog: src 装着後に再生が一向に進まない（経路 stall）場合の
+     *  最終安全網。直結/リレーを問わず、URL 再生成→再挑戦する。 */
+    function armProgressWatchdog(tag, resumeAt) {
+      const t0 = video.currentTime;
+      setTimeout(() => {
+        if (destroyed || dash || pair) return;
+        if (video.paused || video.seeking || video.ended) return;
+        if (video.currentTime - t0 >= 0.15 || video.readyState >= 3) return; // 健康
+        if (rescues < 3) {
+          console.warn('[llytpr++] stall detected (' + tag + ') — rescuing');
+          Store.set('directBlocked', true);
+          fatalRescue(true);
+        } else {
+          unplayableBox('ストリームに接続できませんでした', 'ネットワークが googlevideo への接続を制限している可能性があります');
+        }
+      }, 7000);
+    }
+
     function startProg(p, resumeAt) {
       if (!p) {
         if (streams.hls) { startHls(); return; }
@@ -1287,6 +1393,7 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
       video.src = `/api/stream?v=${id}&itag=${p.itag}`;
       video.currentTime = resumeAt || 0;
       safePlay();
+      armProgressWatchdog('relay', resumeAt);
     }
 
     async function startHls() {
@@ -1400,11 +1507,7 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
         box.innerHTML = `
           <h3><span id="cm-count">${c.count ? esc(c.count) + ' 件のコメント' : 'コメント'}</span>
           <span class="cm-sort"><svg viewBox="0 0 24 24" class="ic" style="width:20px;height:20px"><path d="M3 6h14v2H3zm0 5h10v2H3zm0 5h6v2H3z"/></svg>並べ替え</span></h3>
-          <div class="cm-input-row">
-            <div class="vava"></div><div class="cm-fake" id="cm-fake">コメントを追加...</div>
-          </div>
           <div id="cm-list">${(c.comments || []).map(commentHtml).join('')}</div>`;
-        $('#cm-fake')?.addEventListener('click', () => toast('ログインが必要です'));
         if (cont) {
           const sent = lazySentinel(box, () => {
             if (loading || !cont) return;
@@ -1434,9 +1537,9 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
         <div class="cm-head"><span class="cm-author" data-href="${authorHref}">${esc(handle)}</span><span class="cm-time">${esc(cm.published || '')}</span></div>
         <div class="cm-text">${linkify(cm.text || '')}</div>
         <div class="cm-acts">
-          <button class="icon-btn" onclick="toast('ログインが必要です')"><svg viewBox="0 0 24 24" class="ic"><path d="M2 21h4V9H2zM22 10c0-1.1-.9-2-2-2h-6.3l.9-4.6c0-.9-.8-1.5-.8-1.5L12.7 1 6.2 8.6C5.8 8.9 5 9.5 5 10v10c0 1.1.9 2 2 2h9c.8 0 1.5-.5 1.8-1.2l3-7.1c.1-.2.2-.5.2-.7z"/></svg></button>
+          <span class="icon-btn cm-ico"><svg viewBox="0 0 24 24" class="ic"><path d="M2 21h4V9H2zM22 10c0-1.1-.9-2-2-2h-6.3l.9-4.6c0-.9-.8-1.5-.8-1.5L12.7 1 6.2 8.6C5.8 8.9 5 9.5 5 10v10c0 1.1.9 2 2 2h9c.8 0 1.5-.5 1.8-1.2l3-7.1c.1-.2.2-.5.2-.7z"/></svg></span>
           <span class="cm-likes">${esc(cm.likes || '')}</span>
-          <button class="icon-btn" onclick="toast('ログインが必要です')"><svg viewBox="0 0 24 24" class="ic"><path d="M18 3h4v12h-4zM2 14c0 1.1.9 2 2 2h6.3l-.9 4.6c0 .9.8 1.5.8 1.5l1.1 1 6.5-6.5c.4-.4.6-.9.6-1.4V4.1c0-1.1-.9-2-2-2H7c-.8 0-1.5.5-1.8 1.2l-3 7.1c-.1.2-.2.5-.2.7z"/></svg></button>
+          <span class="icon-btn cm-ico"><svg viewBox="0 0 24 24" class="ic"><path d="M18 3h4v12h-4zM2 14c0 1.1.9 2 2 2h6.3l-.9 4.6c0 .9.8 1.5.8 1.5l1.1 1 6.5-6.5c.4-.4.6-.9.6-1.4V4.1c0-1.1-.9-2-2-2H7c-.8 0-1.5.5-1.8 1.2l-3 7.1c-.1.2-.2.5-.2.7z"/></svg></span>
           ${cm.replyCount ? `<span class="cm-reply">返信 ${esc(String(cm.replyCount))} 件</span>` : ''}
         </div>
       </div>
