@@ -11,6 +11,7 @@
  */
 const { proxyManager } = require('./proxies');
 const { sigSolver } = require('./solver');
+const { piped } = require('./piped');
 const { TTLCache } = require('./cache');
 
 const API_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
@@ -41,7 +42,47 @@ const CLIENTS = {
     clientNameHeader: '3',
     ua: 'com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip',
   },
+  ANDROID_OLD: {
+    key: API_KEY,
+    ctx: {
+      clientName: 'ANDROID', clientVersion: '20.10.38', androidSdkVersion: 30,
+      osName: 'Android', osVersion: '11',
+    },
+    clientNameHeader: '3',
+    ua: 'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip',
+  },
+  ANDROID_VR: {
+    key: API_KEY,
+    ctx: {
+      clientName: 'ANDROID_VR', clientVersion: '1.65.10', androidSdkVersion: 33,
+      osName: 'Android', osVersion: '14', deviceMake: 'Oculus', deviceModel: 'Quest 3',
+    },
+    clientNameHeader: '28',
+    ua: 'com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 14; Quest 3) gzip',
+  },
+  IOS: {
+    key: 'AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc',
+    ctx: {
+      clientName: 'IOS', clientVersion: '21.26.3', deviceMake: 'Apple',
+      deviceModel: 'iPhone17,5', osName: 'iOS', osVersion: '26.0.0.23A344',
+    },
+    clientNameHeader: '5',
+    ua: 'com.google.ios.youtube/21.26.3 (iPhone17,5; U; CPU iOS 26_0 like Mac OS X; ja_JP)',
+  },
 };
+
+/**
+ * Verified-alive player client chain (probe-tested 2026-08). `params:'2AMB'`
+ * makes YouTube return direct pre-signed URLs instead of SABR-only streams.
+ * Order matters: richest & most reliable first.
+ */
+const PLAYER_CHAIN = [
+  { client: 'ANDROID', params: '2AMB' },
+  { client: 'ANDROID_OLD', params: '2AMB' },
+  { client: 'ANDROID_VR', params: '2AMB' },
+  { client: 'IOS', params: '2AMB' },
+  { client: 'ANDROID', params: null },   // final: often SABR-only, solver may repair
+];
 
 const caches = {
   api: new TTLCache({ max: 800, ttl: 10 * CACHE_MIN }),
@@ -64,7 +105,7 @@ async function rawFetch(url, { method = 'GET', headers = {}, body, dispatcher, t
   }
 }
 
-function transports(preferProxy) {
+function transports(preferProxy, count = 2) {
   const list = [];
   const seen = new Set();
   const addProxy = () => {
@@ -73,10 +114,15 @@ function transports(preferProxy) {
   };
   const direct = { kind: 'direct', dispatcher: undefined };
   if (preferProxy === 'direct') return [direct];
-  if (preferProxy === 'proxy') { addProxy(); addProxy(); addProxy(); list.push(direct); return list; }
+  if (preferProxy === 'proxy') { for (let i = 0; i < count + 1; i++) addProxy(); list.push(direct); return list; }
   // auto: proxies first (block-safe), direct as the safety net
-  addProxy(); addProxy(); list.push(direct);
+  for (let i = 0; i < count; i++) addProxy();
+  list.push(direct);
   return list;
+}
+
+function transportsForUrls(urls) {
+  return (urls || []).map(u => u ? ({ kind: 'proxy', url: u, dispatcher: proxyManager.dispatcherFor(u) }) : ({ kind: 'direct', dispatcher: undefined }));
 }
 
 /**
@@ -84,7 +130,7 @@ function transports(preferProxy) {
  * HTTP 4xx from YouTube is a *content* error (bad argument / login required),
  * not a transport error, so it is returned as-is (callers decide).
  */
-async function callApi(endpoint, payload, client = CLIENTS.WEB, { hl = 'ja', gl = 'JP', visitorId, preferProxy, timeout = 9000, ret } = {}) {
+async function callApi(endpoint, payload, client = CLIENTS.WEB, { hl = 'ja', gl = 'JP', visitorId, preferProxy, timeout = 9000, ret, transport, transportCount } = {}) {
   const body = JSON.stringify({
     ...payload,
     context: {
@@ -103,7 +149,8 @@ async function callApi(endpoint, payload, client = CLIENTS.WEB, { hl = 'ja', gl 
   };
   let lastErr = null;
   let lastJson = null;
-  for (const t of transports(preferProxy)) {
+  const chain = transport ? [transport] : transports(preferProxy, transportCount);
+  for (const t of chain) {
     try {
       const start = Date.now();
       const res = await rawFetch(url, { method: 'POST', headers, body, dispatcher: t.dispatcher, timeout });
@@ -346,6 +393,28 @@ function parseReelItem(rr) {
   };
 }
 
+/** 2025+ shorts shelf item: shortsLockupViewModel */
+function parseShortsLockup(sl) {
+  if (!sl || typeof sl !== 'object') return null;
+  const cmd = sl.onTap?.innertubeCommand;
+  const id = cmd?.reelWatchEndpoint?.videoId
+    || String(sl.entityId || '').match(/shorts-shelf-item-([\w-]{11})/)?.[1];
+  if (!id) return null;
+  const thumb = bestThumb(sl.thumbnailViewModel?.image?.sources)
+    || bestThumb(cmd?.reelWatchEndpoint?.thumbnail?.thumbnails)
+    || `https://i.ytimg.com/vi/${id}/oar2.jpg`;
+  let title = textOf(sl.overlayMetadata?.primaryText)
+    || textOf(sl.overlayMetadata?.primaryText?.content)
+    || '';
+  let views = textOf(sl.overlayMetadata?.secondaryText) || '';
+  if (!title && sl.accessibilityText) {
+    title = String(sl.accessibilityText).replace(/,?\s*[\d,.万億]*\s*回視聴\s*-\s*ショート動画を再生\s*$/, '').trim();
+    const vm = String(sl.accessibilityText).match(/([\d,.万億]+\s*回視聴)/);
+    if (!views && vm) views = vm[1];
+  }
+  return { kind: 'short', id, url: '/shorts/' + id, title, thumb, views };
+}
+
 function parsePlaylistVideo(v) {
   if (!v?.videoId) return null;
   return {
@@ -410,6 +479,7 @@ function extractItems(root) {
     if (Array.isArray(node)) { for (const v of node) walk(v); return; }
     const keys = Object.keys(node);
     if (node.lockupViewModel) { push('lockup', parseLockup(node.lockupViewModel)); return; }
+    if (node.shortsLockupViewModel) { push('short', parseShortsLockup(node.shortsLockupViewModel)); return; }
     if (node.richItemRenderer?.content) { walk(node.richItemRenderer.content); return; }
     if (node.reelItemRenderer) { push('short', parseReelItem(node.reelItemRenderer)); return; }
     if (node.gridVideoRenderer) { push('video', parseVideoRenderer(node.gridVideoRenderer)); return; }
@@ -637,49 +707,104 @@ async function solveCiphers(formats) {
   return formats;
 }
 
+/**
+ * player() — hardened multi-client × multi-transport rotation.
+ *
+ * Strategy ("絶対に読み込める"):
+ *  1. Remember the last combo (client+transport) that worked and try it first
+ *     — after the first success of the session everything is one request away.
+ *  2. Walk PLAYER_CHAIN (4 verified-alive client configs); for the first two
+ *     clients fan out across direct + up to 4 rotating proxies, later clients
+ *     use fewer transports (they rarely differ per-IP).
+ *  3. Accept the FIRST response that is playabilityStatus OK and carries at
+ *     least one directly playable URL (or an HLS manifest). OK-but-SABR-only
+ *     responses are kept as a fallback but never stop the rotation.
+ *  4. Nothing worked → Piped public instances as the last resort (their
+ *     proxied URLs are not IP-bound, so the browser can even play them
+ *     directly).
+ */
+let goodCombo = null; // {clientKey, params, transportKind, transportUrl}
+
 async function player(videoId, { hl = 'ja', gl = 'JP' } = {}) {
-  const variants = [
-    // direct first: when the egress isn't bot-flagged it's by far the fastest.
-    // proxy variants rescue us whenever the server IP is blocked (LOGIN_REQUIRED).
-    { extra: { params: '2AMB' }, preferProxy: 'direct' },
-    { extra: { params: '2AMB' }, preferProxy: undefined },
-    { extra: {}, preferProxy: 'direct' },
-    { extra: {}, preferProxy: 'proxy' },
-  ];
+  const deadline = Date.now() + 45000; // global budget; success usually in <2s
+  const used = new Set();              // "client|params|url" dedupe
   let lastErr = null;
   let lastStatus = null;
-  let best = null; // richest OK response so far (max formats with direct urls)
-  for (const v of variants) {
-    let res;
+  let sabrFallback = null;             // OK response without usable urls
+
+  const tryOnce = async (clientKey, params, transport) => {
+    const client = CLIENTS[clientKey];
+    const dedupeKey = `${clientKey}|${params || '-'}|${transport?.url || 'direct'}`;
+    if (used.has(dedupeKey)) return null;
+    used.add(dedupeKey);
+    const payload = { videoId, contentCheckOk: true, racyCheckOk: true };
+    if (params) payload.params = params;
     const ret = {};
+    let res;
     try {
-      res = await callApi('player', {
-        videoId, contentCheckOk: true, racyCheckOk: true, ...v.extra,
-      }, CLIENTS.ANDROID, { preferProxy: v.preferProxy, timeout: 12000, ret });
+      res = await callApi('player', payload, client, { transport, timeout: 8000, ret });
     } catch (e) {
       lastErr = e;
-      continue;
+      return null;
     }
     const ps = res?.playabilityStatus || {};
     lastStatus = ps;
     if (ps.status !== 'OK') {
+      // definitive blocks that rotation will never fix: stop everything
+      if (['UNPLAYABLE', 'AGE_CHECK_REQUIRED', 'CONTENT_NOT_AVAILABLE_IN_THIS_APP'].includes(ps.status)
+        && !/ログイン|sign in/i.test(ps.reason || '')) {
+        throw new YTError(ps.reason || ps.status, 451, ps.status);
+      }
       lastErr = new YTError(ps.reason || ps.status || '再生できません', 451, ps.status || 'UNPLAYABLE');
-      if (ps.status === 'LOGIN_REQUIRED') continue; // rotate transport
-      break;
+      return null; // LOGIN_REQUIRED / ERROR -> keep rotating
     }
     const sd = res.streamingData || {};
     const fmt = sd.formats || [];
     const af = sd.adaptiveFormats || [];
-    if (!fmt.length && !af.length && !sd.hlsManifestUrl) { lastErr = new YTError('no formats', 502); continue; }
-    try { await solveCiphers([...fmt, ...af]); } catch (_) { /* solver unavailable: keep url'd ones */ }
+    if (!fmt.length && !af.length && !sd.hlsManifestUrl) { lastErr = new YTError('no formats', 502); return null; }
+    try { await solveCiphers([...fmt, ...af]); } catch (_) { /* keep url'd ones */ }
     const usable = [...fmt, ...af];
     const urlCount = usable.filter(f => f.url).length;
-    if (!urlCount && !sd.hlsManifestUrl) { lastErr = new YTError('no usable formats', 502); continue; }
-    if (!best || urlCount > best.urlCount) best = { res, ret, urlCount, sd, usable };
-    if (urlCount >= 5) break; // rich enough — stop burning variants
+    if (!urlCount && !sd.hlsManifestUrl) {
+      sabrFallback = sabrFallback || { res, transport, usable };
+      lastErr = new YTError('no usable formats (SABR-only)', 502);
+      return null;
+    }
+    return { res, transport: ret.transport || transport, usable, clientKey, params };
+  };
+
+  // ---- assemble attempts: good combo first, then the full chain
+  const directT = { kind: 'direct', dispatcher: undefined };
+  const proxyUrls = (n) => { const out = []; const seen = new Set(); for (let i = 0; i < n * 2 && out.length < n; i++) { const u = proxyManager.pick(out); if (u && !seen.has(u)) { seen.add(u); out.push(u); } else break; } return out; };
+
+  const plan = [];
+  if (goodCombo) plan.push({ clientKey: goodCombo.clientKey, params: goodCombo.params, transports: [goodCombo.transportKind === 'direct' ? directT : { kind: 'proxy', url: goodCombo.transportUrl, dispatcher: proxyManager.dispatcherFor(goodCombo.transportUrl) }] });
+  PLAYER_CHAIN.forEach((step, idx) => {
+    const n = idx === 0 ? 4 : idx === 1 ? 3 : 2; // proxy fan-out per client
+    plan.push({ clientKey: step.client, params: step.params, transports: [directT, ...transportsForUrls(proxyUrls(n))] });
+  });
+
+  let win = null;
+  outer:
+  for (const step of plan) {
+    for (const t of step.transports) {
+      if (Date.now() > deadline) break outer;
+      try {
+        const r = await tryOnce(step.clientKey, step.params, t);
+        if (r) { win = r; break outer; }
+      } catch (e) { lastErr = e; break outer; } // definitive unplayable
+    }
   }
-  if (best) {
-    const { res, ret, usable } = best;
+
+  if (!win && sabrFallback) win = { ...sabrFallback, clientKey: 'ANDROID', params: null };
+
+  if (win) {
+    const { res, transport, usable, clientKey, params } = win;
+    goodCombo = {
+      clientKey, params,
+      transportKind: transport?.kind || 'direct',
+      transportUrl: transport?.kind === 'proxy' ? transport.url : null,
+    };
     const sd = res.streamingData || {};
     const fmt = sd.formats || [];
     const maps = buildStreamMaps(videoId, usable, res);
@@ -687,7 +812,9 @@ async function player(videoId, { hl = 'ja', gl = 'JP' } = {}) {
     const mf = res.microformat?.playerMicroformatRenderer || {};
     return {
       videoId,
-      __transport: ret.transport || null,
+      __transport: transport || null,
+      __client: clientKey,
+      source: 'innertube',
       title: vd.title || '',
       author: vd.author || '',
       channelId: vd.channelId || '',
@@ -707,6 +834,36 @@ async function player(videoId, { hl = 'ja', gl = 'JP' } = {}) {
       __urlMap: maps.map,
     };
   }
+
+  goodCombo = null;
+
+  // ---- LAST RESORT: public Piped instances (proxied, NOT IP-bound)
+  try {
+    const p = await piped.getStreams(videoId);
+    if (p && (p.progressive.length || p.videos.length)) {
+      return {
+        videoId,
+        __transport: null,
+        __client: 'piped:' + p.host,
+        source: 'piped',
+        title: p.title,
+        author: p.author,
+        channelId: p.channelId,
+        viewCount: p.viewCount,
+        lengthSeconds: p.lengthSeconds,
+        isLive: false, isShort: false,
+        publishDate: '', uploadDate: '', category: '', keywords: [],
+        progressive: p.progressive.map(stripUrl),
+        videos: p.videos.map(stripUrl),
+        audios: p.audios.map(stripUrl),
+        hls: null,
+        expiresInSeconds: 21540,
+        __urlMap: Object.fromEntries([...p.progressive, ...p.videos, ...p.audios].map(f => [f.itag, f.url])),
+        __piped: true,
+      };
+    }
+  } catch (_) { /* fall through to error */ }
+
   const err = lastErr || new YTError('player failed', 502);
   err.statusHint = lastStatus?.status;
   err.reason = lastStatus?.reason;
@@ -716,6 +873,28 @@ async function player(videoId, { hl = 'ja', gl = 'JP' } = {}) {
 function stripUrl(f) {
   const { url, ...rest } = f;
   return rest;
+}
+
+/**
+ * pickDirect — raw googlevideo (or Piped-proxy) URL the browser may try to
+ * play WITHOUT our relay. When the URL is IP-bound (pin != null) a browser
+ * hit will 403 and the client falls back to the relay instantly; Piped-proxy
+ * URLs are not bound and play directly from anywhere.
+ */
+function pickDirect(p) {
+  if (!p || !p.__urlMap) return null;
+  const prog = p.progressive?.[0];
+  const itag = prog?.itag ?? (p.__urlMap[18] ? 18 : Number(Object.keys(p.__urlMap)[0]));
+  const url = p.__urlMap[itag];
+  if (!url) return null;
+  const pin = p.__piped ? null : (p.__transport?.kind === 'proxy' ? p.__transport.url : null);
+  return {
+    itag, url,
+    pin,                                   // null -> not IP-bound (or server-direct)
+    bound: p.__piped ? false : true,       // innertube URLs are IP-bound to the pin
+    source: p.__piped ? 'piped' : 'innertube',
+    height: prog?.height || 360,
+  };
 }
 
 async function getVideoFull(videoId, opts = {}) {
@@ -745,6 +924,8 @@ async function getVideoFull(videoId, opts = {}) {
       videos: p.videos,
       audios: p.audios,
       hls: p.hls,
+      direct: pickDirect(p),
+      source: p.source || 'innertube',
     } : null,
     playable: !!p && (p.progressive.length > 0 || p.videos.length > 0 || !!p.hls),
     playability: p ? null : { status: pl.reason?.statusHint || 'ERROR', reason: pl.reason?.reason || pl.reason?.message || 'この動画は再生できません' },
@@ -752,7 +933,8 @@ async function getVideoFull(videoId, opts = {}) {
   if (p?.__urlMap) {
     caches.streams.set('map:' + videoId, {
       map: p.__urlMap,
-      proxyUrl: p.__transport?.kind === 'proxy' ? p.__transport.url : null,
+      source: p.source || 'innertube',
+      proxyUrl: p.__piped ? null : (p.__transport?.kind === 'proxy' ? p.__transport.url : null),
     }, Math.min(5 * 3600 * 1000, (p.expiresInSeconds - 300) * 1000));
   }
   if (n && !out.title) out.title = n.videoId;
@@ -765,11 +947,12 @@ async function getStreamUrl(videoId, itag) {
     const p = await player(videoId);
     entry = {
       map: p.__urlMap,
-      proxyUrl: p.__transport?.kind === 'proxy' ? p.__transport.url : null,
+      source: p.source || 'innertube',
+      proxyUrl: p.__piped ? null : (p.__transport?.kind === 'proxy' ? p.__transport.url : null),
     };
     caches.streams.set('map:' + videoId, entry, 5 * 3600 * 1000);
   }
-  return { url: entry.map?.[itag] || entry.map?.[18] || Object.values(entry.map || {})[0] || null, proxyUrl: entry.proxyUrl };
+  return { url: entry.map?.[itag] || entry.map?.[18] || Object.values(entry.map || {})[0] || null, proxyUrl: entry.proxyUrl, source: entry.source };
 }
 
 async function refreshStreamMap(videoId) {
@@ -777,10 +960,18 @@ async function refreshStreamMap(videoId) {
   const p = await player(videoId);
   const entry = {
     map: p.__urlMap,
-    proxyUrl: p.__transport?.kind === 'proxy' ? p.__transport.url : null,
+    source: p.source || 'innertube',
+    proxyUrl: p.__piped ? null : (p.__transport?.kind === 'proxy' ? p.__transport.url : null),
   };
   caches.streams.set('map:' + videoId, entry, Math.min(5 * 3600 * 1000, (p.expiresInSeconds - 300) * 1000));
   return entry;
+}
+
+/** Hard invalidation for the client-side "rescue" flow. */
+function invalidateVideo(videoId) {
+  caches.streams.delete('map:' + videoId);
+  caches.api.delete('w:' + videoId + 'jaJP');
+  caches.streams.delete('hls:' + videoId);
 }
 
 /* ----------------------------------------------------------------- comments */
@@ -1092,6 +1283,104 @@ async function home(chip = 'all') {
   });
 }
 
+/* ------------------------------------------------ recommendation engine */
+
+/** Curated shorts-only queries for the dedicated Shorts surfaces. */
+const SHORTS_QUERIES = ['ショート おもしろ', 'shorts バズ', 'コント ショート', 'shorts かわいい 動物'];
+
+/**
+ * shortsFeed — dedicated vertical-video collection, separate from horizontal
+ * content (ユーザーの「ショートは専用欄にまとめて」要件). Cached for 15min.
+ */
+async function shortsFeed() {
+  return caches.api.wrap('shortz:feed', 15 * CACHE_MIN, async () => {
+    const pages = await Promise.allSettled(SHORTS_QUERIES.map(q => search(q)));
+    const shorts = [];
+    const seen = new Set();
+    for (const pg of pages) {
+      if (pg.status !== 'fulfilled') continue;
+      for (const it of pg.value.items) {
+        if (it.kind !== 'short' || !it.id || seen.has(it.id)) continue;
+        seen.add(it.id);
+        shorts.push(it);
+      }
+    }
+    return { items: shorts };
+  });
+}
+
+/**
+ * personal — builds a recommendation home from the user's local profile.
+ * profile = { queries: string[], relatedOf: videoId[] }
+ * Signals come from watch history / likes / recent searches that the client
+ * keeps in localStorage; nothing personal is persisted server-side.
+ */
+async function personal(profile = {}) {
+  const queries = (Array.isArray(profile.queries) ? profile.queries : [])
+    .map(s => String(s).slice(0, 80)).filter(Boolean).slice(0, 4);
+  const relatedOf = (Array.isArray(profile.relatedOf) ? profile.relatedOf : [])
+    .filter(s => /^[\w-]{11}$/.test(s)).slice(0, 3);
+
+  const budget = Date.now() + 7000; // never let the home hang
+  const jobs = [];
+  for (const q of queries) jobs.push(search(q).then(r => ({ from: 'q:' + q, items: r.items })).catch(() => null));
+  for (const id of relatedOf) jobs.push(
+    (async () => {
+      let w = caches.api.get('w:' + id + 'jaJP');
+      if (!w) {
+        try {
+          w = await Promise.race([
+            watchNext(id),
+            (async () => { while (Date.now() < budget) { await sleep(120); const hit = caches.api.get('w:' + id + 'jaJP'); if (hit) return hit; } return null; })(),
+          ]);
+        } catch (_) { w = null; }
+      }
+      return w?.related?.length ? { from: 'r:' + id, items: w.related } : null;
+    })()
+  );
+  const pages = (await Promise.all(jobs)).filter(Boolean);
+
+  // round-robin interleave so every preference signal is represented
+  const videos = [];
+  const shorts = [];
+  const seen = new Set();
+  const queues = pages.map(p => [...p.items]);
+  for (let guard = 0; guard < 400; guard++) {
+    let added = false;
+    for (const q of queues) {
+      const it = q.shift();
+      if (!it) continue;
+      if ((it.kind === 'video' || it.kind === 'short') && it.id) {
+        if (seen.has(it.id)) continue;
+        seen.add(it.id);
+        (it.kind === 'short' ? shorts : videos).push(it);
+        added = true;
+      } else if (it.kind === 'playlist') {
+        const k = 'pl:' + it.id;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        videos.push(it);
+        added = true;
+      }
+    }
+    if (!added) break;
+  }
+
+  // top the shorts shelf up so it always feels alive
+  if (shorts.length < 8) {
+    try {
+      const feed = await shortsFeed();
+      for (const it of feed.items) {
+        if (shorts.length >= 14) break;
+        if (seen.has(it.id)) continue;
+        seen.add(it.id);
+        shorts.push(it);
+      }
+    } catch (_) { /* optional */ }
+  }
+  return { items: videos.slice(0, 48), shorts: shorts.slice(0, 16), personalized: true };
+}
+
 /* ------------------------------------------------------------------ suggest */
 
 async function suggest(q) {
@@ -1116,6 +1405,8 @@ async function suggest(q) {
 
 module.exports = {
   search, searchNext, watchNext, getVideoFull, player, getStreamUrl, refreshStreamMap,
-  comments, commentsNext, channel, playlist, playlistNext, home, suggest,
-  resolveChannelId, getVisitorId, getHls, fetchText, YTError, caches,
+  comments, commentsNext, channel, playlist, playlistNext, home, personal, shortsFeed, suggest,
+  resolveChannelId, getVisitorId, getHls, fetchText, invalidateVideo, YTError, caches,
+  // test hooks (not used by the app runtime)
+  __test: { CLIENTS, PLAYER_CHAIN, transportsForUrls, resetCombos: () => { goodCombo = null; } },
 };
