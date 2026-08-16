@@ -124,6 +124,73 @@ const caches = {
   streams: new TTLCache({ max: 600, ttl: 5 * 60 * CACHE_MIN }), // googlevideo URLs expire ~6h
 };
 
+/* ---------------- runtime persistence (cold-boot acceleration) ----------------
+ * goodCombo / stream maps / 直結判定(pd) をディスクに退避し、プロセス再起動や
+ * Vercel コールドブートでも「初回だけ遅い」を消す。期限切れは読み出し時に捨てる。 */
+const fs = require('node:fs');
+const nodePath = require('node:path');
+const RT_DIR = process.env.VERCEL ? '/tmp/llytpr-data' : nodePath.join(__dirname, '..', 'data');
+const RT_FILE = nodePath.join(RT_DIR, 'runtime-cache.json');
+const rt = { goodCombo: null, streams: {} }; // streams['m:'+id]={e,exp} / ['p:'+id]={e,exp}
+try { fs.mkdirSync(RT_DIR, { recursive: true }); } catch (_) { /* noop */ }
+try {
+  const raw = JSON.parse(fs.readFileSync(RT_FILE, 'utf8'));
+  if (raw && typeof raw === 'object') {
+    if (raw.goodCombo) rt.goodCombo = raw.goodCombo;
+    if (raw.streams && typeof raw.streams === 'object') {
+      const now = Date.now();
+      for (const [k, v] of Object.entries(raw.streams)) {
+        if (v && typeof v.exp === 'number' && v.exp > now) rt.streams[k] = v;
+      }
+    }
+  }
+} catch (_) { /* first boot */ }
+let _rtTimer = null;
+function rtSave() {
+  clearTimeout(_rtTimer);
+  _rtTimer = setTimeout(() => {
+    try {
+      const keys = Object.keys(rt.streams);
+      if (keys.length > 500) { // 古い順に間引く
+        keys.sort((a, b) => (rt.streams[a].exp - rt.streams[b].exp));
+        for (const k of keys.slice(0, keys.length - 500)) delete rt.streams[k];
+      }
+      fs.writeFileSync(RT_FILE, JSON.stringify({ savedAt: Date.now(), goodCombo: rt.goodCombo, streams: rt.streams }));
+    } catch (_) { /* read-only */ }
+  }, 700);
+}
+function streamMapGet(id) {
+  const m = caches.streams.get('map:' + id);
+  if (m) return m;
+  const d = rt.streams['m:' + id];
+  if (d && d.exp > Date.now()) { caches.streams.set('map:' + id, d.e, d.exp - Date.now()); return d.e; }
+  return null;
+}
+function streamMapSet(id, entry) {
+  caches.streams.set('map:' + id, entry, entry.ttlMs);
+  rt.streams['m:' + id] = { e: entry, exp: Date.now() + entry.ttlMs };
+  rtSave();
+}
+function pdGet(id) {
+  const m = caches.streams.get('pd:' + id);
+  if (m) return m;
+  const d = rt.streams['p:' + id];
+  if (d && d.exp > Date.now()) { caches.streams.set('pd:' + id, d.e, d.exp - Date.now()); return d.e; }
+  return null;
+}
+function pdSet(id, pd, ttlMs) {
+  caches.streams.set('pd:' + id, pd, ttlMs);
+  rt.streams['p:' + id] = { e: pd, exp: Date.now() + ttlMs };
+  rtSave();
+}
+function streamInvalidate(id) {
+  caches.streams.delete('map:' + id);
+  caches.streams.delete('pd:' + id);
+  delete rt.streams['m:' + id];
+  delete rt.streams['p:' + id];
+  rtSave();
+}
+
 /* ---------------------------------------------------------------- transport */
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -814,7 +881,7 @@ async function solveCiphers(formats) {
  *     proxied URLs are not IP-bound, so the browser can even play them
  *     directly).
  */
-let goodCombo = null; // {clientKey, params, transportKind, transportUrl}
+let goodCombo = rt.goodCombo || null; // {clientKey, params, transportKind, transportUrl} — ディスク永続化で冷起動も一発
 
 async function player(videoId, { hl = 'ja', gl = 'JP' } = {}) {
   const deadline = Date.now() + 45000; // global budget; success usually in <2s
@@ -838,8 +905,26 @@ async function player(videoId, { hl = 'ja', gl = 'JP' } = {}) {
       lastErr = e;
       return null;
     }
+    // 地域制限は gl を切り替えると通る場合がある（Invidious 式リージョンバイパス）。
+    // 表示先 gl=JP で弾かれた動画を gl=US で一度だけ再発行する。
+    {
+      const st0 = res?.playabilityStatus || {};
+      if (st0.status !== 'OK' && /国|地域|region|country|お住まい/i.test(String(st0.reason || ''))) {
+        try {
+          const res2 = await callApi('player', {
+            videoId, contentCheckOk: true, racyCheckOk: true, ...(params ? { params } : {}),
+          }, client, { transport, timeout: 8000, ret, hl: 'ja', gl: 'US' });
+          if (res2?.playabilityStatus?.status === 'OK') res = res2;
+        } catch (_) { /* keep original */ }
+      }
+    }
     const ps = res?.playabilityStatus || {};
     lastStatus = ps;
+    // プロキシ経由で LOGIN_REQUIRED = その proxy IP が発行用途では使い物にならない
+    // →  issuer-grade から即降格（中継/トンネル用途には存続。YouTubeのBAN判定に追随）
+    if (ps.status === 'LOGIN_REQUIRED' && (transport?.kind === 'proxy' || ret.transport?.kind === 'proxy')) {
+      proxyManager.markIssuerBad((ret.transport || transport)?.url);
+    }
     if (ps.status !== 'OK') {
       // definitive blocks that rotation will never fix: stop everything
       if (['UNPLAYABLE', 'AGE_CHECK_REQUIRED', 'CONTENT_NOT_AVAILABLE_IN_THIS_APP'].includes(ps.status)
@@ -866,7 +951,9 @@ async function player(videoId, { hl = 'ja', gl = 'JP' } = {}) {
 
   // ---- assemble attempts: good combo first, then the full chain
   const directT = { kind: 'direct', dispatcher: undefined };
-  const proxyUrls = (n) => { const out = []; const seen = new Set(); for (let i = 0; i < n * 2 && out.length < n; i++) { const u = proxyManager.pick(out); if (u && !seen.has(u)) { seen.add(u); out.push(u); } else break; } return out; };
+  // 発行は issuer-grade（YouTube非BAN実測済み）プロキシを最優先で選ぶ。
+  // 無ければ従来プール（pickIssuer 内部で自動フォールバック）。
+  const proxyUrls = (n) => { const out = []; const seen = new Set(); for (let i = 0; i < n * 2 && out.length < n; i++) { const u = proxyManager.pickIssuer(out); if (u && !seen.has(u)) { seen.add(u); out.push(u); } else break; } return out; };
 
   const plan = [];
   if (goodCombo) plan.push({ clientKey: goodCombo.clientKey, params: goodCombo.params, transports: [goodCombo.transportKind === 'direct' ? directT : { kind: 'proxy', url: goodCombo.transportUrl, dispatcher: proxyManager.dispatcherFor(goodCombo.transportUrl) }] });
@@ -896,6 +983,8 @@ async function player(videoId, { hl = 'ja', gl = 'JP' } = {}) {
       transportKind: transport?.kind || 'direct',
       transportUrl: transport?.kind === 'proxy' ? transport.url : null,
     };
+    rt.goodCombo = goodCombo;
+    rtSave();
     const sd = res.streamingData || {};
     const fmt = sd.formats || [];
     const maps = buildStreamMaps(videoId, usable, res);
@@ -927,6 +1016,7 @@ async function player(videoId, { hl = 'ja', gl = 'JP' } = {}) {
   }
 
   goodCombo = null;
+  if (rt.goodCombo) { rt.goodCombo = null; rtSave(); }
 
   // ---- LAST RESORT: public Piped instances (proxied, NOT IP-bound)
   try {
@@ -997,10 +1087,10 @@ async function getVideoFull(videoId, opts = {}) {
   // ---- map エントリを先に確定（直結判定とリレー修復の両方がこれを使う）
   let mapEntry = null;
   if (p?.__urlMap) {
-    mapEntry = caches.streams.get('map:' + videoId);
+    mapEntry = streamMapGet(videoId);
     if (!mapEntry || mapEntry.map !== p.__urlMap) {
       mapEntry = buildMapEntry(p);
-      caches.streams.set('map:' + videoId, mapEntry, mapEntry.ttlMs);
+      streamMapSet(videoId, mapEntry);
     }
   }
 
@@ -1010,7 +1100,7 @@ async function getVideoFull(videoId, opts = {}) {
   // 通れば ip 強制なし = ユーザのブラウザからも直結できると判定する。
   // 同時にリレー用ピンも実働 egress へ自動修復する（結果は 55 分メモ化）。
   // 判定（pd）とリレー修復（pin）は並行実行して初回ウォッチの遅延を最小化する。
-  let pd = caches.streams.get('pd:' + videoId);
+  let pd = pdGet(videoId);
   const pinJob = (async () => {
     if (p?.__urlMap && !mapEntry?.pinnedVerified) {
       try { return await ensureWorkingPin(videoId); } catch (_) { /* best effort */ }
@@ -1043,7 +1133,7 @@ async function getVideoFull(videoId, opts = {}) {
     } else {
       pd = { playDirect: false, hdDirect: false };
     }
-    caches.streams.set('pd:' + videoId, pd, 55 * CACHE_MIN);
+    pdSet(videoId, pd, 55 * CACHE_MIN);
   }
   mapEntry = await pinJob;
   const direct = pickDirect(p);
@@ -1090,10 +1180,18 @@ async function getVideoFull(videoId, opts = {}) {
   return out;
 }
 
-/** CONNECT で googlevideo へトンネルできるプロキシを並列スキャン（10分キャッシュ） */
+/** googlevideo へトンネルできるプロキシ。grow 認定済み(pool.gvOkTs)を優先、
+ *  冷機時のみ従来の並列スキャンで補う（10分キャッシュ）。 */
 let tunnelCache = { ts: 0, urls: [] };
 async function getTunnelProxies(k = 2) {
-  if (Date.now() - tunnelCache.ts < 10 * CACHE_MIN) return tunnelCache.urls.slice(0, k);
+  const certified = (proxyManager.pool || [])
+    .filter(p => p.gvOkTs && Date.now() - p.gvOkTs < 2 * 3600 * 1000)
+    .sort((a, b) => a.latency - b.latency)
+    .map(p => p.url);
+  if (certified.length >= k) return certified.slice(0, k);
+  if (Date.now() - tunnelCache.ts < 10 * CACHE_MIN && tunnelCache.urls.length) {
+    return [...new Set([...certified, ...tunnelCache.urls])].slice(0, k);
+  }
   const cand = (proxyManager.pool || []).slice(0, 8);
   const results = await Promise.all(cand.map(async (p) => {
     const ac = new AbortController();
@@ -1106,7 +1204,7 @@ async function getTunnelProxies(k = 2) {
     finally { clearTimeout(t); }
   }));
   tunnelCache = { ts: Date.now(), urls: results.filter(Boolean) };
-  return tunnelCache.urls.slice(0, k);
+  return [...new Set([...certified, ...tunnelCache.urls])].slice(0, k);
 }
 
 function buildMapEntry(p) {
@@ -1126,11 +1224,11 @@ function buildMapEntry(p) {
  * 実際に 206 が返る egress を map エントリにピン留めする。
  */
 async function ensureWorkingPin(videoId) {
-  let entry = caches.streams.get('map:' + videoId);
+  let entry = streamMapGet(videoId);
   if (!entry) {
     const p = await player(videoId);
     entry = buildMapEntry(p);
-    caches.streams.set('map:' + videoId, entry, entry.ttlMs);
+    streamMapSet(videoId, entry);
   }
   if (entry.pinnedVerified) return entry;
   const url = entry.map?.[18] || Object.values(entry.map || {})[0];
@@ -1148,17 +1246,17 @@ async function ensureWorkingPin(videoId) {
   if (idx >= 0) {
     entry.proxyUrl = cands[idx];
     entry.pinnedVerified = true;
-    caches.streams.set('map:' + videoId, entry, entry.ttlMs);
+    streamMapSet(videoId, entry);
   }
   return entry;
 }
 
 async function getStreamUrl(videoId, itag, { verify = false } = {}) {
-  let entry = caches.streams.get('map:' + videoId);
+  let entry = streamMapGet(videoId);
   if (!entry || (itag && !entry.map?.[itag])) {
     const p = await player(videoId);
     entry = buildMapEntry(p);
-    caches.streams.set('map:' + videoId, entry, entry.ttlMs);
+    streamMapSet(videoId, entry);
   }
   // verify=true のときだけ egress 実測＆ピン修復（ホットパス初手は軽量を優先。
   // 実測自体は watch 応答時に並行済みのことが多く、その場合はここでも即時ヒット）
@@ -1169,20 +1267,20 @@ async function getStreamUrl(videoId, itag, { verify = false } = {}) {
 }
 
 async function refreshStreamMap(videoId) {
-  caches.streams.delete('map:' + videoId);
-  caches.streams.delete('pd:' + videoId);
+  streamInvalidate(videoId);
+  caches.api.deletePrefix('vf:' + videoId); // 古い URL を抱えたフル応答も破棄
   const p = await player(videoId);
   const entry = buildMapEntry(p);
-  caches.streams.set('map:' + videoId, entry, entry.ttlMs);
+  streamMapSet(videoId, entry);
   return entry;
 }
 
 /** Hard invalidation for the client-side "rescue" flow. */
 function invalidateVideo(videoId) {
-  caches.streams.delete('map:' + videoId);
+  streamInvalidate(videoId);
   caches.api.delete('w:' + videoId + 'jaJP');
+  caches.api.deletePrefix('vf:' + videoId);
   caches.streams.delete('hls:' + videoId);
-  caches.streams.delete('pd:' + videoId);
 }
 
 /* ----------------------------------------------------------------- comments */
@@ -1650,5 +1748,5 @@ module.exports = {
   comments, commentsNext, channel, playlist, playlistNext, panelNext, home, personal, shortsFeed, suggest,
   resolveChannelId, getVisitorId, getHls, fetchText, invalidateVideo, YTError, caches,
   // test hooks (not used by the app runtime)
-  __test: { CLIENTS, PLAYER_CHAIN, transportsForUrls, resetCombos: () => { goodCombo = null; }, probePlayable },
+  __test: { CLIENTS, PLAYER_CHAIN, transportsForUrls, resetCombos: () => { goodCombo = null; rt.goodCombo = null; }, probePlayable },
 };
