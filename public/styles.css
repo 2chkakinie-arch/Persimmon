@@ -92,15 +92,6 @@ input { font-family: inherit; }
 .suggest .sg:hover, .suggest .sg.active { background: var(--hover); }
 .suggest .sg svg { width: 18px; height: 18px; fill: var(--text-2); flex: none; }
 
-/* login */
-.login-btn {
-  display: flex; align-items: center; gap: 6px; height: 36px; padding: 0 15px;
-  border: 1px solid var(--border); border-radius: 18px; color: var(--blue);
-  font-size: 14px; font-weight: 500; flex: none;
-}
-.login-btn .ic { width: 22px; height: 22px; }
-.login-btn:hover { background: rgba(6, 95, 212, .08); border-color: transparent; }
-
 /* options menu */
 .menu {
   position: absolute; top: 44px; right: 0; width: 260px; z-index: 400;
@@ -431,8 +422,6 @@ input { font-family: inherit; }
 }
 @media (max-width: 760px) {
   #mini-guide { display: none; }
-  .login-btn span { display: none; }
-  .login-btn { width: 38px; padding: 0; justify-content: center; }
   #opts-btn { display: none; }
   .mh-center { padding: 0 8px; }
   .search-btn { width: 48px; }
