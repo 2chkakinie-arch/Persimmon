@@ -310,6 +310,40 @@ input { font-family: inherit; }
 .ch-tab.active::after { content: ""; position: absolute; inset: auto 0 0 0; height: 3px; background: var(--text); border-radius: 2px 2px 0 0; }
 .verified { width: 14px; height: 14px; fill: var(--text-2); flex: none; }
 
+/* playlist overlay badge (search rows / grid cards) */
+.pl-strip {
+  position: absolute; right: 4px; bottom: 4px; display: flex; align-items: center; gap: 5px;
+  background: rgba(0,0,0,.8); color: #fff; font-size: 12px; font-weight: 500;
+  padding: 2px 6px; border-radius: 4px; letter-spacing: .2px;
+}
+.pl-strip .ic { width: 14px; height: 14px; fill: #fff; }
+.pl-kind { font-size: 12px; color: var(--text-2); margin: 2px 0 4px; }
+
+/* ============ YouTube-style playlist panel on watch page ============ */
+.plp { background: var(--chip-bg); border-radius: 14px; margin-bottom: 12px; overflow: hidden; }
+.plp-head { padding: 10px 14px 8px; }
+.plp-t1 { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px; }
+.plp-ic .ic { width: 20px; height: 20px; fill: var(--text); }
+.plp-ic { display: flex; }
+.plp-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.plp-spacer { flex: none; }
+.plp-btn { width: 34px; height: 34px; }
+.plp-btn .ic { width: 20px; height: 20px; fill: var(--text); }
+.plp-btn.on { color: var(--blue); }
+.plp-btn.on .ic { fill: var(--blue); }
+.plp-sub { font-size: 12px; color: var(--text-2); margin-top: 2px; }
+.plp-items { max-height: 480px; overflow-y: auto; scrollbar-width: thin; padding: 0 6px 6px; }
+.plp.folded .plp-items { display: none; }
+.plp-item { display: flex; gap: 8px; padding: 6px; border-radius: 10px; cursor: pointer; align-items: center; }
+.plp-item:hover { background: var(--hover); }
+.plp-item.active { background: var(--hover); }
+.plp-item.active { }
+.plp-item .plp-idx { width: 20px; flex: none; text-align: center; font-size: 12px; color: var(--text-2); }
+.plp-item.active .plp-idx { color: var(--text); }
+.plp-item .vthumb { width: 96px; flex: none; border-radius: 8px; }
+.plp-item .plp-tt { font-size: 13px; font-weight: 500; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
+.plp-item.active .plp-tt { color: var(--text); }
+
 /* playlist page */
 .pl-page { display: grid; grid-template-columns: 360px minmax(0,1fr); gap: 24px; padding: 24px; max-width: 1400px; }
 .pl-side { background: linear-gradient(160deg, #3b6ea5, #1d3a5f); border-radius: 20px; padding: 24px; color: #fff; position: sticky; top: 80px; align-self: start; }
