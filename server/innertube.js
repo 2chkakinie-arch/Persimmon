@@ -26,6 +26,40 @@ class YTError extends Error {
   }
 }
 
+/**
+ * probePlayable — llytpr++ 直結エンジンの心臓。
+ * 2026-08 実測: ANDROID/IOS 系プリ署名 googlevideo URL は `ip=` パラメータを含むが
+ * サーバー側で強制されず、任意 egress・任意 UA で 206 が返る（= ブラウザが直接再生可能）。
+ * これは Invidious の「署名を自前で解いた生 URL をクライアントへ渡す」方式や
+ * zernio(getlate) のダウンローダが生 URL を返すのと同じ仕組みであり、
+ * 本サーバーは動画ごとに Range 実測してから「直結可能」判定をフロントへ返す。
+ */
+async function probePlayable(url, { timeout = 4500, dispatcher } = {}) {
+  if (!url) return false;
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeout);
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Range: 'bytes=0-63',
+        Accept: '*/*',
+        'User-Agent': 'com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip',
+      },
+      dispatcher, // ★ egress を必ず指定どおりに（省略=自 egress）
+      signal: ac.signal,
+      redirect: 'follow',
+    });
+    const ok = res.status === 200 || res.status === 206;
+    try { res.body?.cancel?.(); } catch (_) { /* noop */ }
+    return ok;
+  } catch (_) {
+    return false;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 const CLIENTS = {
   WEB: {
     key: API_KEY,
@@ -959,6 +993,65 @@ async function getVideoFull(videoId, opts = {}) {
   if (pl.status === 'rejected' && nx.status === 'rejected') throw pl.reason;
   const p = pl.status === 'fulfilled' ? pl.value : null;
   const n = nx.status === 'fulfilled' ? nx.value : null;
+
+  // ---- map エントリを先に確定（直結判定とリレー修復の両方がこれを使う）
+  let mapEntry = null;
+  if (p?.__urlMap) {
+    mapEntry = caches.streams.get('map:' + videoId);
+    if (!mapEntry || mapEntry.map !== p.__urlMap) {
+      mapEntry = buildMapEntry(p);
+      caches.streams.set('map:' + videoId, mapEntry, mapEntry.ttlMs);
+    }
+  }
+
+  // ---- llytpr++ 直結判定: 生 URL を Range 実測し、ブラウザ直再生の可否を検証。
+  // 「発信元 egress では 403 / 別 egress では 206」（ノード別 IP レピュテーション）が
+  // 実在するため、自 egress とトンネル可能プロキシを並列で試し、どこか一箇所でも
+  // 通れば ip 強制なし = ユーザのブラウザからも直結できると判定する。
+  // 同時にリレー用ピンも実働 egress へ自動修復する（結果は 55 分メモ化）。
+  // 判定（pd）とリレー修復（pin）は並行実行して初回ウォッチの遅延を最小化する。
+  let pd = caches.streams.get('pd:' + videoId);
+  const pinJob = (async () => {
+    if (p?.__urlMap && !mapEntry?.pinnedVerified) {
+      try { return await ensureWorkingPin(videoId); } catch (_) { /* best effort */ }
+    }
+    return mapEntry;
+  })();
+  if (p && !pd) {
+    if (p.__piped) {
+      pd = { playDirect: true, hdDirect: true }; // Piped プロキシURLは IP 非バインド（実測済み）
+    } else if (p.__urlMap) {
+      const dualProbe = async (url) => {
+        if (!url) return false;
+        const tps = await getTunnelProxies(2);
+        const jobs = [
+          probePlayable(url, { timeout: 6000 }),                                            // 自 egress
+          ...tps.map(px => probePlayable(url, { dispatcher: proxyManager.dispatcherFor(px), timeout: 9000 })),
+        ];
+        const rs = await Promise.all(jobs);
+        return rs.some(Boolean);
+      };
+      const progItag = p.progressive?.[0]?.itag ?? (p.__urlMap[18] ? 18 : Number(Object.keys(p.__urlMap)[0]));
+      const vidTrack = p.videos.find(v => (v.height || 0) <= 720 && (v.fps || 30) <= 60) || p.videos[0];
+      const audTrack = p.audios[0];
+      const [progOk, vOk, aOk] = await Promise.all([
+        dualProbe(p.__urlMap[progItag]),
+        dualProbe(p.__urlMap[vidTrack?.itag]),
+        dualProbe(p.__urlMap[audTrack?.itag]),
+      ]);
+      pd = { playDirect: progOk, hdDirect: !!(vOk && aOk) };
+    } else {
+      pd = { playDirect: false, hdDirect: false };
+    }
+    caches.streams.set('pd:' + videoId, pd, 55 * CACHE_MIN);
+  }
+  mapEntry = await pinJob;
+  const direct = pickDirect(p);
+  if (direct) {
+    direct.verified = !!pd?.playDirect;
+    // リレー時は修復済みピンを使う（発行 egress が 403 の動画を救う）
+    if (!p.__piped && mapEntry?.pinnedVerified) direct.pin = mapEntry.proxyUrl;
+  }
   const out = {
     videoId,
     title: n?.title || p?.title || '',
@@ -982,46 +1075,105 @@ async function getVideoFull(videoId, opts = {}) {
       videos: p.videos,
       audios: p.audios,
       hls: p.hls,
-      direct: pickDirect(p),
+      direct,
       source: p.source || 'innertube',
+      // llytpr++ 直結エンジン: 実測で 206 が返った生 URL 一式（プロキシ不要で
+      // ブラウザがそのまま再生できる）。MSE は CORS の都合で従来どおりリレー。
+      playDirect: !!pd?.playDirect,
+      hdDirect: !!pd?.hdDirect,
+      directUrls: (pd?.playDirect || pd?.hdDirect) ? p.__urlMap : undefined,
     } : null,
     playable: !!p && (p.progressive.length > 0 || p.videos.length > 0 || !!p.hls),
     playability: p ? null : { status: pl.reason?.statusHint || 'ERROR', reason: pl.reason?.reason || pl.reason?.message || 'この動画は再生できません' },
   };
-  if (p?.__urlMap) {
-    caches.streams.set('map:' + videoId, {
-      map: p.__urlMap,
-      source: p.source || 'innertube',
-      proxyUrl: p.__piped ? null : (p.__transport?.kind === 'proxy' ? p.__transport.url : null),
-    }, Math.min(5 * 3600 * 1000, (p.expiresInSeconds - 300) * 1000));
-  }
   if (n && !out.title) out.title = n.videoId;
   return out;
 }
 
-async function getStreamUrl(videoId, itag) {
+/** CONNECT で googlevideo へトンネルできるプロキシを並列スキャン（10分キャッシュ） */
+let tunnelCache = { ts: 0, urls: [] };
+async function getTunnelProxies(k = 2) {
+  if (Date.now() - tunnelCache.ts < 10 * CACHE_MIN) return tunnelCache.urls.slice(0, k);
+  const cand = (proxyManager.pool || []).slice(0, 8);
+  const results = await Promise.all(cand.map(async (p) => {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), 6000);
+    try {
+      const res = await fetch('https://rr5---sn-nx57ynsl.googlevideo.com/generate_204', { dispatcher: proxyManager.dispatcherFor(p.url), signal: ac.signal });
+      try { res.body?.cancel?.(); } catch (_) { /* noop */ }
+      return res.status < 500 ? p.url : null;
+    } catch (_) { return null; }
+    finally { clearTimeout(t); }
+  }));
+  tunnelCache = { ts: Date.now(), urls: results.filter(Boolean) };
+  return tunnelCache.urls.slice(0, k);
+}
+
+function buildMapEntry(p) {
+  return {
+    map: p.__urlMap,
+    source: p.source || 'innertube',
+    proxyUrl: p.__piped ? null : (p.__transport?.kind === 'proxy' ? p.__transport.url : null),
+    ttlMs: Math.min(5 * 3600 * 1000, Math.max(300 * 1000, ((p.expiresInSeconds || 21600) - 300) * 1000)),
+    pinnedVerified: false,
+  };
+}
+
+/**
+ * ensureWorkingPin — 2026-08 実測で判明した「URL 発行 egress ≠ 再生可能 egress」
+ * 問題（googlevideo ノードの発信元 IP レピュテーション制御）を自動修復する。
+ * 発行 egress / 自 egress / トンネル可能プロキシの順に Range 実測し、
+ * 実際に 206 が返る egress を map エントリにピン留めする。
+ */
+async function ensureWorkingPin(videoId) {
   let entry = caches.streams.get('map:' + videoId);
-  if (!entry || (itag && !entry.map[itag])) {
+  if (!entry) {
     const p = await player(videoId);
-    entry = {
-      map: p.__urlMap,
-      source: p.source || 'innertube',
-      proxyUrl: p.__piped ? null : (p.__transport?.kind === 'proxy' ? p.__transport.url : null),
-    };
-    caches.streams.set('map:' + videoId, entry, 5 * 3600 * 1000);
+    entry = buildMapEntry(p);
+    caches.streams.set('map:' + videoId, entry, entry.ttlMs);
+  }
+  if (entry.pinnedVerified) return entry;
+  const url = entry.map?.[18] || Object.values(entry.map || {})[0];
+  if (!url) return entry;
+  const cands = [];
+  const addCand = (px) => { const key = px || null; if (!cands.includes(key)) cands.push(key); };
+  addCand(null);               // 自 egress（最速リレー）を優先
+  addCand(entry.proxyUrl);     // 発行 egress
+  for (const t of await getTunnelProxies(2)) addCand(t);
+  const results = await Promise.all(cands.map(px =>
+    // 無料プロキシ経由は RTT が大きいため広めのタイムアウトを与える
+    probePlayable(url, { dispatcher: px ? proxyManager.dispatcherFor(px) : undefined, timeout: px ? 9000 : 6000 })
+  ));
+  const idx = results.findIndex(Boolean);
+  if (idx >= 0) {
+    entry.proxyUrl = cands[idx];
+    entry.pinnedVerified = true;
+    caches.streams.set('map:' + videoId, entry, entry.ttlMs);
+  }
+  return entry;
+}
+
+async function getStreamUrl(videoId, itag, { verify = false } = {}) {
+  let entry = caches.streams.get('map:' + videoId);
+  if (!entry || (itag && !entry.map?.[itag])) {
+    const p = await player(videoId);
+    entry = buildMapEntry(p);
+    caches.streams.set('map:' + videoId, entry, entry.ttlMs);
+  }
+  // verify=true のときだけ egress 実測＆ピン修復（ホットパス初手は軽量を優先。
+  // 実測自体は watch 応答時に並行済みのことが多く、その場合はここでも即時ヒット）
+  if (verify) {
+    try { entry = await ensureWorkingPin(videoId); } catch (_) { /* keep heuristic pin */ }
   }
   return { url: entry.map?.[itag] || entry.map?.[18] || Object.values(entry.map || {})[0] || null, proxyUrl: entry.proxyUrl, source: entry.source };
 }
 
 async function refreshStreamMap(videoId) {
   caches.streams.delete('map:' + videoId);
+  caches.streams.delete('pd:' + videoId);
   const p = await player(videoId);
-  const entry = {
-    map: p.__urlMap,
-    source: p.source || 'innertube',
-    proxyUrl: p.__piped ? null : (p.__transport?.kind === 'proxy' ? p.__transport.url : null),
-  };
-  caches.streams.set('map:' + videoId, entry, Math.min(5 * 3600 * 1000, (p.expiresInSeconds - 300) * 1000));
+  const entry = buildMapEntry(p);
+  caches.streams.set('map:' + videoId, entry, entry.ttlMs);
   return entry;
 }
 
@@ -1030,6 +1182,7 @@ function invalidateVideo(videoId) {
   caches.streams.delete('map:' + videoId);
   caches.api.delete('w:' + videoId + 'jaJP');
   caches.streams.delete('hls:' + videoId);
+  caches.streams.delete('pd:' + videoId);
 }
 
 /* ----------------------------------------------------------------- comments */
@@ -1493,9 +1646,9 @@ async function suggest(q) {
 }
 
 module.exports = {
-  search, searchNext, watchNext, getVideoFull, player, getStreamUrl, refreshStreamMap,
+  search, searchNext, watchNext, getVideoFull, player, getStreamUrl, refreshStreamMap, ensureWorkingPin,
   comments, commentsNext, channel, playlist, playlistNext, panelNext, home, personal, shortsFeed, suggest,
   resolveChannelId, getVisitorId, getHls, fetchText, invalidateVideo, YTError, caches,
   // test hooks (not used by the app runtime)
-  __test: { CLIENTS, PLAYER_CHAIN, transportsForUrls, resetCombos: () => { goodCombo = null; } },
+  __test: { CLIENTS, PLAYER_CHAIN, transportsForUrls, resetCombos: () => { goodCombo = null; }, probePlayable },
 };
