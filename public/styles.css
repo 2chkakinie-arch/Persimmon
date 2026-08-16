@@ -347,6 +347,47 @@ input { font-family: inherit; }
 .mini-spin { display: grid; place-items: center; padding: 32px; }
 .mini-spin::after { content: ""; width: 28px; height: 28px; border-radius: 50%; border: 3px solid var(--border); border-top-color: var(--text-2); animation: rot .8s linear infinite; }
 
+/* ============ nudge (logged-out home) ============ */
+.nudge { display: flex; justify-content: center; padding: 40px 16px; }
+.nudge-card {
+  max-width: 860px; width: 100%; background: var(--bg-elev); border-radius: 16px;
+  box-shadow: var(--shadow); padding: 48px 24px; text-align: center;
+}
+.nudge-icon {
+  width: 96px; height: 96px; margin: 0 auto 20px; border-radius: 50%;
+  background: var(--chip-bg); display: grid; place-items: center;
+}
+.nudge-icon svg { width: 44px; height: 44px; fill: var(--text-2); }
+.nudge-card h1 { font-size: 22px; font-weight: 700; margin-bottom: 12px; }
+.nudge-card p { color: var(--text-2); font-size: 14px; line-height: 1.7; }
+
+/* section titles */
+.sec-title { font-size: 18px; font-weight: 600; padding: 20px 24px 8px; }
+
+/* ============ dedicated shorts grid ============ */
+.shorts-grid {
+  display: grid; gap: 16px 12px; padding: 8px 24px 24px;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+}
+.shorts-grid .scard { width: auto; }
+.shorts-row.compact { padding: 12px 0 16px; }
+.shorts-row.compact .scard { width: 130px; }
+
+/* ============ my page / subscriptions ============ */
+.mypage { padding: 24px; max-width: 1400px; }
+.mp-title { font-size: 28px; font-weight: 700; margin-bottom: 8px; }
+.mp-sec-h { font-size: 18px; font-weight: 600; padding: 24px 0 12px; display: flex; align-items: center; gap: 16px; }
+.mp-clear { font-size: 13px; font-weight: 500; color: var(--blue); padding: 6px 12px; border-radius: 14px; }
+.mp-clear:hover { background: rgba(6,95,212,.1); }
+.mp-empty { color: var(--text-2); font-size: 14px; padding: 0 0 8px; }
+.subs-avatars { display: flex; gap: 20px; overflow-x: auto; padding: 8px 0 4px; scrollbar-width: none; }
+.subs-avatars::-webkit-scrollbar { display: none; }
+.subs-av { display: flex; flex-direction: column; align-items: center; gap: 8px; width: 76px; flex: none; }
+.subs-av img { width: 64px; height: 64px; border-radius: 50%; object-fit: cover; }
+.subs-av span { font-size: 12px; color: var(--text-2); max-width: 76px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stored-del { width: 32px; height: 32px; align-self: flex-start; }
+.stored-del .ic { width: 18px; height: 18px; }
+
 /* responsive */
 @media (max-width: 1100px) {
   .watch { grid-template-columns: 1fr; }
@@ -380,4 +421,7 @@ input { font-family: inherit; }
   .ch-head { flex-direction: column; align-items: flex-start; }
   .ch-head .big-ava { width: 96px; height: 96px; }
   .ch-banner { height: 100px; margin: 8px 12px 0; }
+  .mypage { padding: 12px; }
+  .shorts-grid { padding: 8px 12px 24px; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); }
+  .nudge-card { padding: 32px 16px; }
 }
