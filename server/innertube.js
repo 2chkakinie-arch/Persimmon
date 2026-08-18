@@ -186,6 +186,7 @@ function pdSet(id, pd, ttlMs) {
 function streamInvalidate(id) {
   caches.streams.delete('map:' + id);
   caches.streams.delete('pd:' + id);
+  caches.api.delete('plyr:' + id); // player メモ化も破棄（refresh 経路で必ず新規発行）
   delete rt.streams['m:' + id];
   delete rt.streams['p:' + id];
   rtSave();
@@ -780,7 +781,8 @@ async function watchNext(videoId, { hl = 'ja', gl = 'JP', playlistId } = {}) {
 
 /** continuation of the watch playlist panel (goes through the `next` endpoint) */
 async function panelNext(continuation) {
-  return caches.api.wrap('pn:' + continuation.slice(-24), 10 * CACHE_MIN, async () => {
+  // トークン全文をキーにする（末尾24桁だと長大リストで衝突し得る）
+  return caches.api.wrap('pn:' + continuation, 10 * CACHE_MIN, async () => {
     const visitorId = await getVisitorId();
     const res = await callApi('next', { continuation }, CLIENTS.WEB, { visitorId });
     const eps = res?.onResponseReceivedEndpoints || res?.onResponseReceivedCommands || [];
@@ -883,7 +885,13 @@ async function solveCiphers(formats) {
  */
 let goodCombo = rt.goodCombo || null; // {clientKey, params, transportKind, transportUrl} — ディスク永続化で冷起動も一発
 
-async function player(videoId, { hl = 'ja', gl = 'JP' } = {}) {
+async function player(videoId, opts = {}) {
+  // 4分メモ化: ホバー先読み・/api/stream・/api/warm・watch 応答がそれぞれ
+  // player() を打っていた多重発行を1回に畳む（URL寿命は ~6h あるので安全）。
+  return caches.api.wrap('plyr:' + videoId, 4 * CACHE_MIN, () => _player(videoId, opts));
+}
+
+async function _player(videoId, { hl = 'ja', gl = 'JP' } = {}) {
   const deadline = Date.now() + 45000; // global budget; success usually in <2s
   const used = new Set();              // "client|params|url" dedupe
   let lastErr = null;
@@ -1079,6 +1087,23 @@ function pickDirect(p) {
 }
 
 async function getVideoFull(videoId, opts = {}) {
+  // 5分メモ化＋inflight共有: ホバー先読み→クリック、リロード、複数タブ相当の
+  // リクエストをすべて1回の上流問い合わせに畳み込む（体感0ms化の要）。
+  const key = 'vf:' + videoId + ':' + (opts.playlistId || '');
+  const hit = caches.api.get(key);
+  if (hit) return hit;
+  let p = _vfInflight.get(key);
+  if (!p) {
+    p = _getVideoFull(videoId, opts)
+      .then((out) => { caches.api.set(key, out, 5 * CACHE_MIN); return out; })
+      .finally(() => _vfInflight.delete(key));
+    _vfInflight.set(key, p);
+  }
+  return p;
+}
+const _vfInflight = new Map();
+
+async function _getVideoFull(videoId, opts = {}) {
   const [pl, nx] = await Promise.allSettled([player(videoId, opts), watchNext(videoId, opts)]);
   if (pl.status === 'rejected' && nx.status === 'rejected') throw pl.reason;
   const p = pl.status === 'fulfilled' ? pl.value : null;
@@ -1393,7 +1418,7 @@ async function comments(videoId) {
 }
 
 async function commentsNext(continuation) {
-  return caches.api.wrap('cx:' + continuation.slice(-24), 5 * CACHE_MIN, async () => {
+  return caches.api.wrap('cx:' + continuation, 5 * CACHE_MIN, async () => {
     const visitorId = await getVisitorId();
     const res = await callApi('next', { continuation }, CLIENTS.WEB, { visitorId });
     return parseCommentPage(res);
@@ -1446,6 +1471,12 @@ function parseChannelTabs(res) {
 }
 
 async function channel(idOrHandle, { params, continuation, hl = 'ja', gl = 'JP' } = {}) {
+  // 8分キャッシュ: 登録チャンネル欄は同一チャンネルを並列取得するため効きが大きい
+  const key = 'ch:' + String(idOrHandle) + ':' + (params || '') + ':' + (continuation ? continuation.slice(-32) : '');
+  return caches.api.wrap(key, 8 * CACHE_MIN, () => _channel(idOrHandle, { params, continuation, hl, gl }));
+}
+
+async function _channel(idOrHandle, { params, continuation, hl = 'ja', gl = 'JP' } = {}) {
   const browseId = await resolveChannelId(idOrHandle);
   const visitorId = await getVisitorId();
   const payload = { browseId };
@@ -1519,13 +1550,22 @@ async function resolveChannelId(idOrHandle) {
 /* ----------------------------------------------------------------- playlist */
 
 async function playlist(listId) {
+  // 10分キャッシュ: 再生リストは頻繁に再訪されるのに毎回上流往復していた
+  return caches.api.wrap('pl:' + String(listId), 10 * CACHE_MIN, () => _playlist(listId));
+}
+
+async function _playlist(listId) {
   const raw = String(listId);
   const id = raw.startsWith('VL') ? raw : 'VL' + raw;
   const visitorId = await getVisitorId();
-  const res = await callApi('browse', { browseId: id }, CLIENTS.WEB, { visitorId });
-  const title = textOf(deepFind(res, 'playlistSidebarRenderer', 1)?.[0]?.title) || textOf(deepFind(res, 'pageTitle', 1)?.[0]);
-  const sub = deepFind(res, 'playlistSidebarRenderer', 1)?.[0] || {};
-  const { items, continuation } = extractItems(res?.contents?.twoColumnBrowseResultsRenderer || res);
+  // ミックス (RD…) には browseId が存在せず browse は 400/空を返す。
+  // 従来はここで throw してページ全体がエラーになっていた → 失敗を許容して
+  // 下の `next` パネル経路へフォールスルーさせる。
+  let res = null;
+  try { res = await callApi('browse', { browseId: id }, CLIENTS.WEB, { visitorId }); } catch (_) { /* mix等 */ }
+  const title = res ? (textOf(deepFind(res, 'playlistSidebarRenderer', 1)?.[0]?.title) || textOf(deepFind(res, 'pageTitle', 1)?.[0])) : '';
+  const sub = res ? (deepFind(res, 'playlistSidebarRenderer', 1)?.[0] || {}) : {};
+  const { items, continuation } = extractItems(res?.contents?.twoColumnBrowseResultsRenderer || res || {});
   const ownerCh = deepFind(sub, 'playlistOwnerEndpoint', 1)?.[0];
   const videos = items.filter(i => i.kind === 'video' || i.kind === 'short');
   if (!videos.length && !raw.startsWith('VL')) {
@@ -1570,6 +1610,10 @@ async function playlist(listId) {
 }
 
 async function playlistNext(continuation) {
+  return caches.api.wrap('pln:' + continuation, 10 * CACHE_MIN, () => _playlistNext(continuation));
+}
+
+async function _playlistNext(continuation) {
   const visitorId = await getVisitorId();
   const res = await callApi('browse', { continuation }, CLIENTS.WEB, { visitorId });
   const eps = res?.onResponseReceivedEndpoints || [];
