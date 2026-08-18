@@ -26,6 +26,27 @@ function toast(msg, ms = 2600) {
 }
 window.toast = toast;
 
+/* ---- トップ進捗バー（YouTube式）: 実際のAPI通信に連動 ---- */
+const Progress = (() => {
+  let pending = 0, hideT = null;
+  function bar() { return $('#nav-progress'); }
+  function start() {
+    pending++;
+    const b = bar(); if (!b) return;
+    clearTimeout(hideT);
+    b.classList.remove('done');
+    b.classList.add('on');
+  }
+  function done() {
+    pending = Math.max(0, pending - 1);
+    if (pending) return;
+    const b = bar(); if (!b) return;
+    b.classList.add('done');
+    hideT = setTimeout(() => b.classList.remove('on', 'done'), 400);
+  }
+  return { start, done };
+})();
+
 const fmtDur = (sec) => {
   sec = Math.max(0, Math.floor(sec));
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
@@ -112,6 +133,23 @@ const Searches = {
     Store.set('searches', list.slice(0, 30));
   },
 };
+/** playback resume positions: {v: {t, d, ts}} — 「続きから再生」 */
+const Positions = {
+  map() { return Store.get('pos', {}); },
+  get(v) { return Positions.map()[v] || null; },
+  set(v, t, d) {
+    if (!v || !(t > 0)) return;
+    const m = Positions.map();
+    m[v] = { t: Math.floor(t), d: Math.floor(d || 0), ts: Date.now() };
+    const keys = Object.keys(m);
+    if (keys.length > 150) { // 古い順に間引く
+      keys.sort((a, b) => m[a].ts - m[b].ts);
+      for (const k of keys.slice(0, keys.length - 150)) delete m[k];
+    }
+    Store.set('pos', m);
+  },
+  clear(v) { const m = Positions.map(); if (m[v]) { delete m[v]; Store.set('pos', m); } },
+};
 
 /** preference profile inferred from history + likes + searches */
 function buildProfile() {
@@ -143,6 +181,7 @@ async function api(path, { ttl = 5 * 60e3, method = 'GET', body } = {}) {
   }
   const inflight = api._inflight.get(key);
   if (inflight) return inflight;
+  Progress.start();
   const p = fetch(path, {
     method,
     headers: body ? { 'Content-Type': 'application/json' } : undefined,
@@ -152,8 +191,9 @@ async function api(path, { ttl = 5 * 60e3, method = 'GET', body } = {}) {
     if (!res.ok) { const e = new Error(j.error || ('HTTP ' + res.status)); e.status = res.status; e.payload = j; throw e; }
     if (method === 'GET') mem.set(key, { data: j, exp: Date.now() + ttl });
     api._inflight.delete(key);
+    Progress.done();
     return j;
-  }).catch(e => { api._inflight.delete(key); throw e; });
+  }).catch(e => { api._inflight.delete(key); Progress.done(); throw e; });
   api._inflight.set(key, p);
   return p;
 }
@@ -198,7 +238,7 @@ function videoCard(it, { rail = false } = {}) {
   return `
   <div class="vcard" data-href="#${href.replace(/^#?/, '')}" data-vid="${esc(it.id)}">
     <div class="vthumb">
-      <img loading="lazy" src="${esc(thumbUrl(it))}" alt="" onerror="this.onerror=null;this.src='https://i.ytimg.com/vi/${esc(it.id)}/hqdefault.jpg'">
+      <img loading="lazy" decoding="async" src="${esc(thumbUrl(it))}" alt="" onerror="this.onerror=null;this.src='https://i.ytimg.com/vi/${esc(it.id)}/hqdefault.jpg'">
       ${it.duration ? `<span class="dur">${esc(it.duration)}</span>` : (it.live ? '<span class="dur live-badge">LIVE</span>' : '')}
     </div>
     <div class="vmeta">
@@ -216,7 +256,7 @@ function railCard(it) {
   if (it.kind === 'short') {
     return `
     <div class="rcard" data-href="#/shorts/${esc(it.id)}" data-vid="${esc(it.id)}">
-      <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt="">
+      <div class="vthumb"><img loading="lazy" decoding="async" src="${esc(thumbUrl(it))}" alt="">
         <span class="dur" style="background:rgba(0,0,0,.8)">ショート</span>
       </div>
       <div class="vinfo">
@@ -229,7 +269,7 @@ function railCard(it) {
   const href = '#/watch?v=' + it.id;
   return `
   <div class="rcard" data-href="${href}" data-vid="${esc(it.id)}">
-    <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt="">
+    <div class="vthumb"><img loading="lazy" decoding="async" src="${esc(thumbUrl(it))}" alt="">
       ${it.duration ? `<span class="dur">${esc(it.duration)}</span>` : ''}
     </div>
     <div class="vinfo">
@@ -244,7 +284,7 @@ function shortCard(it) {
   const href = '#/shorts/' + it.id;
   return `
   <div class="scard" data-href="${href}" data-vid="${esc(it.id)}">
-    <div class="sthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt=""></div>
+    <div class="sthumb"><img loading="lazy" decoding="async" src="${esc(thumbUrl(it))}" alt=""></div>
     <div class="stitle">${esc(it.title)}</div>
     <div class="sviews">${esc(it.views || '')}</div>
   </div>`;
@@ -263,7 +303,7 @@ function shortsShelf(shorts, { compact = false } = {}) {
 function playlistCard(it) {
   return `
   <div class="vcard" data-href="#${(it.url || '/playlist?list=' + it.id).replace(/^#?/, '')}">
-    <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt="">
+    <div class="vthumb"><img loading="lazy" decoding="async" src="${esc(thumbUrl(it))}" alt="">
       <span class="pl-strip"><svg viewBox="0 0 24 24" class="ic"><path d="M3 6h12v2H3zm0 4h12v2H3zm0 4h8v2H3zm13-8v9l7-4.5z"/></svg>${esc(it.count || '再生リスト')}</span>
     </div>
     <div class="vmeta">
@@ -282,7 +322,7 @@ function playlistRow(it) {
   const count = it.count || '';
   return `
   <div class="result-card" data-href="#${esc(href)}">
-    <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt="">
+    <div class="vthumb"><img loading="lazy" decoding="async" src="${esc(thumbUrl(it))}" alt="">
       <span class="pl-strip"><svg viewBox="0 0 24 24" class="ic"><path d="M3 6h12v2H3zm0 4h12v2H3zm0 4h8v2H3zm13-8v9l7-4.5z"/></svg>${esc(count || '再生リスト')}</span>
     </div>
     <div class="vinfo result-info">
@@ -313,7 +353,7 @@ function channelRow(it) {
 function storedCard(h, { onRemove } = {}) {
   return `
   <div class="vcard" data-href="#/watch?v=${esc(h.v)}" data-vid="${esc(h.v)}">
-    <div class="vthumb"><img loading="lazy" src="https://i.ytimg.com/vi/${esc(h.v)}/hqdefault.jpg" alt="">
+    <div class="vthumb"><img loading="lazy" decoding="async" src="https://i.ytimg.com/vi/${esc(h.v)}/hqdefault.jpg" alt="">
       ${h.d ? `<span class="dur">${esc(fmtDur(h.d))}</span>` : ''}
     </div>
     <div class="vmeta">
@@ -345,29 +385,35 @@ document.addEventListener('click', (e) => {
 // 裏取得し、クリック時にはメモリキャッシュから即座に反映されるようにする。
 // data-vid 属性も data-href の URL も両方を解析する（検索行カード等も網羅）。
 const _prefetched = new Map(); // vid -> ts
-document.addEventListener('mouseover', debounce((e) => {
-  const card = e.target.closest?.('[data-vid],[data-href]');
-  if (!card) return;
+function vidFromCard(card) {
   let vid = card.dataset.vid || '';
   if (!/^[\w-]{11}$/.test(vid)) {
     const m = String(card.dataset.href || '').match(/[?&/]v[=/]([\w-]{11})|\/shorts\/([\w-]{11})/);
     vid = m ? (m[1] || m[2] || '') : '';
   }
-  if (!/^[\w-]{11}$/.test(vid)) return;
+  return /^[\w-]{11}$/.test(vid) ? vid : '';
+}
+function prefetchVideo(vid) {
+  if (!vid) return;
   const last = _prefetched.get(vid) || 0;
   if (Date.now() - last < 300000) return;
   _prefetched.set(vid, Date.now());
   api('/api/watch/' + vid).catch(() => {});            // メタ＋直結判定（SWRキャッシュ入り）
   fetch('/api/warm/' + vid).catch(() => {});           // 先頭 768KB をサーバーRAMへ保温
+}
+document.addEventListener('mouseover', debounce((e) => {
+  const card = e.target.closest?.('[data-vid],[data-href]');
+  if (card) prefetchVideo(vidFromCard(card));
 }, 120), { passive: true });
 document.addEventListener('touchstart', (e) => { // モバイルはホバーが無いのでタッチ即先読み
   const card = e.target.closest?.('[data-vid],[data-href]');
-  if (!card) return;
-  const vid = card.dataset.vid || '';
-  if (!/^[\w-]{11}$/.test(vid)) return;
-  api('/api/watch/' + vid).catch(() => {});
-  fetch('/api/warm/' + vid).catch(() => {});
+  if (card) prefetchVideo(vidFromCard(card));
 }, { passive: true });
+// クリック判定（pointerdown）の瞬間にも先読み — ナビゲーションまでの数100msも使う
+document.addEventListener('pointerdown', (e) => {
+  const card = e.target.closest?.('[data-vid],[data-href]');
+  if (card) prefetchVideo(vidFromCard(card));
+}, { passive: true, capture: true });
 
 /* skeleton screens */
 function skGrid(n = 12, rail = false) {
@@ -567,13 +613,13 @@ function renderResults(params) {
     const meta = it.metaTop?.join(' • ') || [it.views, it.published].filter(Boolean).join(' • ');
     return `
     <div class="result-card" data-href="#/watch?v=${esc(it.id)}" data-vid="${esc(it.id)}">
-      <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt="">
+      <div class="vthumb"><img loading="lazy" decoding="async" src="${esc(thumbUrl(it))}" alt="">
         ${it.duration ? `<span class="dur">${esc(it.duration)}</span>` : ''}
       </div>
       <div class="vinfo result-info">
         <div class="vtitle">${esc(it.title)}</div>
         <div class="result-sub">${esc(meta)}</div>
-        ${it.channel ? `<div class="result-ch"><div class="r-ava vava"></div><span>${esc(it.channel)}</span></div>` : ''}
+        ${it.channel ? `<div class="result-ch"><span>${esc(it.channel)}</span></div>` : ''}
       </div>
     </div>`;
   }
@@ -834,6 +880,7 @@ class PlayerUI {
           <input type="range" class="seek" data-el="volrange" min="0" max="100" value="100" style="width:72px">
           <span class="p-time" data-el="time">0:00 / 0:00</span>
           <div class="p-spacer"></div>
+          <button class="icon-btn" data-el="pip" title="ピクチャーインピクチャー"><svg viewBox="0 0 24 24" class="ic"><path d="M19 11h-8v6h8zm4-7v16H1V4zm-2 2H3v12h18z"/></svg></button>
           <button class="icon-btn" data-el="settings" title="設定"><svg viewBox="0 0 24 24" class="ic"><path d="M19.7 13.4a7.6 7.6 0 0 0 0-2.8l2-1.5a.5.5 0 0 0 .1-.7l-1.9-3.2a.5.5 0 0 0-.6-.2l-2.3.9a7.7 7.7 0 0 0-2.4-1.4L14.2 2a.5.5 0 0 0-.5-.4h-3.8a.5.5 0 0 0-.5.4L9 4.5a7.7 7.7 0 0 0-2.4 1.4l-2.3-.9a.5.5 0 0 0-.6.2L1.8 8.4a.5.5 0 0 0 .1.7l2 1.5a7.6 7.6 0 0 0 0 2.8l-2 1.5a.5.5 0 0 0-.1.7l1.9 3.2c.14.24.42.34.68.22l2.3-.9c.72.56 1.53 1.03 2.4 1.4l.35 2.5c.04.24.24.4.5.4h3.8c.24 0 .45.17.5-.4l.35-2.5a7.7 7.7 0 0 0 2.4-1.4l2.3.9c.24.1.52.02.65-.22l1.9-3.18a.5.5 0 0 0-.1-.73zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"/></svg></button>
           <button class="icon-btn" data-el="fs" title="全画面表示 (f)"><svg viewBox="0 0 24 24" class="ic"><path d="M7 14H5v5h5v-2H7zm-2-4h2V7h3V5H5zm12 7h-3v2h5v-5h-2zM14 5v2h3v3h2V5z"/></svg></button>
         </div>
@@ -864,14 +911,24 @@ class PlayerUI {
   _bind() {
     const v = this.video;
     const seek = this.el.seek;
+    // 音量・ミュートを記憶（次の動画にも引き継ぐ）
+    const sv = Store.get('vol', null);
+    if (sv != null && isFinite(sv)) { v.volume = Math.min(1, Math.max(0, sv)); this.el.volrange.value = Math.round(v.volume * 100); }
+    if (Store.get('muted', false)) v.muted = true;
+    if (!document.pictureInPictureEnabled) this.el.pip.style.display = 'none';
     const setProg = () => {
       const d = v.duration || 0;
       seek.value = d ? Math.round(v.currentTime / d * 1000) : 0;
       seek.style.setProperty('--prog', (seek.value / 10) + '%');
+      try { // バッファ済み範囲もバーに表示
+        const b = v.buffered;
+        seek.style.setProperty('--buff', (d && b.length ? Math.min(100, b.end(b.length - 1) / d * 100) : 0) + '%');
+      } catch (_) {}
       this.el.time.textContent = `${fmtDur(v.currentTime)} / ${fmtDur(d)}`;
     };
     v.addEventListener('timeupdate', setProg);
     v.addEventListener('durationchange', setProg);
+    v.addEventListener('progress', setProg);
     v.addEventListener('play', () => { this.el.play.innerHTML = ICON_PAUSE; this.flash(ICON_PLAY); });
     v.addEventListener('pause', () => { this.el.play.innerHTML = ICON_PLAY; this.flash(ICON_PAUSE); });
     v.addEventListener('waiting', () => this.el.spin.classList.remove('hidden'));
@@ -883,8 +940,14 @@ class PlayerUI {
       seek.style.setProperty('--prog', (seek.value / 10) + '%');
     });
     this.el.play.addEventListener('click', () => this.togglePlay());
-    this.el.vol.addEventListener('click', () => { v.muted = !v.muted; });
-    this.el.volrange.addEventListener('input', () => { v.volume = this.el.volrange.value / 100; v.muted = false; });
+    this.el.vol.addEventListener('click', () => { v.muted = !v.muted; Store.set('muted', v.muted); });
+    this.el.volrange.addEventListener('input', () => { v.volume = this.el.volrange.value / 100; v.muted = false; Store.set('vol', v.volume); Store.set('muted', false); });
+    this.el.pip.addEventListener('click', async () => {
+      try {
+        if (document.pictureInPictureElement) await document.exitPictureInPicture();
+        else await v.requestPictureInPicture();
+      } catch (_) { toast('ピクチャーインピクチャーを開始できませんでした'); }
+    });
     this.el.fs.addEventListener('click', () => this.toggleFs());
     this.el.settings.addEventListener('click', (e) => { e.stopPropagation(); this.toggleMenu(); });
     this.wrap.addEventListener('dblclick', (e) => { if (!e.target.closest('.qmenu')) this.toggleFs(); });
@@ -942,6 +1005,7 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
   let rescues = 0;
   let suppressErrorHook = false;
   let instantAttached = false;
+  let autoplayId = null;   // サーバーが返す「次に自動再生する動画」
 
   app.innerHTML = `
   <div class="watch">
@@ -993,17 +1057,54 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
     try { dash?.destroy(); } catch (_) {}
     try { hlsInst?.destroy(); } catch (_) {}
     killPair();
+    panelMoreObs?.disconnect();
+    try { // 離脱直前の位置も保存（続きから再生用）
+      const d = video.duration || 0;
+      if (d && video.currentTime > 10 && video.currentTime < d - 15) Positions.set(id, video.currentTime, d);
+    } catch (_) {}
     try { video.pause(); video.removeAttribute('src'); video.load(); } catch (_) {}
   }
 
   loadWatch(id, false);
 
+  // ---- 続きから再生: 前回位置があれば resume する（10s未満/終盤は無視） ----
+  let resumeAt0 = 0;
+  {
+    const pos = Positions.get(id);
+    if (pos && pos.t > 10 && (!pos.d || pos.t < pos.d - 20)) resumeAt0 = pos.t;
+  }
+  // 位置の定期保存（4秒間隔）。終盤は「見終わった」として消す。
+  let lastPosSave = 0;
+  video.addEventListener('timeupdate', () => {
+    const now = Date.now();
+    if (now - lastPosSave < 4000) return;
+    lastPosSave = now;
+    const d = video.duration || 0;
+    if (!d) return;
+    if (video.currentTime > d - 15) Positions.clear(id);
+    else if (video.currentTime > 10) Positions.set(id, video.currentTime, d);
+  });
+  video.addEventListener('ended', () => Positions.clear(id));
+
+  // 自動再生（プレイリスト無しのとき、サーバー提示の次動画へ進む）
+  video.addEventListener('ended', () => {
+    if (typeof plState !== 'undefined' && plState.items.length) return; // リスト側の advance に委譲
+    if (!Store.get('autoplay', true) || !autoplayId) return;
+    toast('次の動画を自動再生します', 1500);
+    location.hash = '#/watch?v=' + autoplayId;
+  });
+
   function loadWatch(vid, busted) {
     if (busted) api.invalidate('/api/watch/' + vid);
-    api('/api/watch/' + vid, { ttl: busted ? 0 : 3 * 60e3 })
+    // プレイリスト文脈を必ず送る（送らないとサーバーがパネルを同梱せず、
+    // ミックス/RD系ではパネルが出ない・通常リストも余分な往復が発生していた）
+    const listQ = listId ? '?list=' + encodeURIComponent(listId) : '';
+    api('/api/watch/' + vid + listQ, { ttl: busted ? 0 : 3 * 60e3 })
       .then(async (d) => {
         if (destroyed) return;
         document.title = (d.title || 'YouTube') + ' - llytpr-wl.v01nh';
+        if (d.lengthSeconds && resumeAt0 > d.lengthSeconds - 15) resumeAt0 = 0; // ほぼ見終わり
+        autoplayId = d.autoplay || null;
         fillMeta(d);
         loadComments(d);
         fillRail(d);
@@ -1026,7 +1127,10 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
 
   function unplayableBox(msg, sub) {
     wrapEl.innerHTML = `<div class="unplayable"><div>${esc(msg)}<br><span style="opacity:.6;font-size:12px">${esc(sub || '')}</span><br><button class="retry" id="un-retry" style="margin-top:14px;background:#fff;color:#000;border-radius:18px;padding:0 20px;height:36px;font-size:13px">もう一度試す</button></div></div>`;
-    $('#un-retry')?.addEventListener('click', () => { location.hash = '#/watch?refresh=1&v=' + id; renderWatch(new URLSearchParams('v=' + id), { vertical, shortId }); });
+    $('#un-retry')?.addEventListener('click', () => {
+      api.invalidate('/api/watch/' + id);
+      renderWatch(new URLSearchParams('v=' + id + (listId ? '&list=' + encodeURIComponent(listId) : '')), { vertical, shortId });
+    });
   }
 
   /** full rebuild when every playback route fails (rotates proxies server-side) */
@@ -1080,13 +1184,14 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
       ...((canDash || (autoTrack && audTrack)) ? [{ key: 'hdauto', label: '自動HD (' + (autoTrack?.qualityLabel || '720p') + ')' }] : []),
       ...qList,
     ];
-    let speed = 1;
+    let speed = Store.get('rate', 1);
+    if (speed !== 1) video.playbackRate = speed; // 前回の再生速度を復元
 
     ui = new PlayerUI(wrapEl, video, () => ({
       qualities, current: mode,
       speeds: [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2], speed,
       onPick: (k) => { mode = k; startMode(k, video.currentTime); },
-      onSpeed: (s) => { speed = s; video.playbackRate = s; },
+      onSpeed: (s) => { speed = s; Store.set('rate', s); video.playbackRate = s; },
     }));
     wrapEl.querySelector('[data-spin]')?.remove(); // skeleton spinner -> UI owns one now
 
@@ -1101,7 +1206,7 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
       startHls();
       return;
     }
-    startMode('auto', 0);
+    startMode('auto', resumeAt0);
 
     function pickAuto(tracks) {
       if (!tracks.length) return null;
@@ -1554,7 +1659,7 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
     const handle = cm.author?.startsWith('@') ? cm.author : (cm.author ? '@' + cm.author : '');
     return `
     <div class="cm">
-      <div class="vava" data-href="${authorHref}">${cm.avatar ? `<img loading="lazy" src="${esc(cm.avatar)}" alt="">` : ''}</div>
+      <div class="vava" data-href="${authorHref}">${cm.avatar ? `<img loading="lazy" decoding="async" src="${esc(cm.avatar)}" alt="">` : ''}</div>
       <div class="cm-body">
         <div class="cm-head"><span class="cm-author" data-href="${authorHref}">${esc(handle)}</span><span class="cm-time">${esc(cm.published || '')}</span></div>
         <div class="cm-text">${linkify(cm.text || '')}</div>
@@ -1572,79 +1677,133 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
   const ICON_LIST = '<svg viewBox="0 0 24 24" class="ic"><path d="M3 6h12v2H3zm0 4h12v2H3zm0 4h8v2H3zm14-8v7.5a3 3 0 1 0 2 2.8V8h3V6z"/></svg>';
   const ICON_LOOP = '<svg viewBox="0 0 24 24" class="ic"><path d="M7 7h10v3l4-4-4-4v3H5v6h2zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2z"/></svg>';
   const ICON_SHUFFLE = '<svg viewBox="0 0 24 24" class="ic"><path d="M10.6 9.2 8.9 7.5 4 7.5v2h4l1.7 1.7zm6.1 5.2-1.6 1.6-5.5-5.5 1.4-1.4 5.7 5.3zM14 4l4 4-4 4v-3c-4.95 0-7 3.5-8 8-.3-6 1.5-10 8-10z" opacity="0"/><path d="M14.1 7.4 10.6 3.9 14.1.4v2H18c3.3 0 6 2.7 6 6 0 1.6-.6 3-1.6 4.1l-1.4-1.4c.7-.8 1-1.7 1-2.7 0-2.2-1.8-4-4-4h-3.9zm-4.2 9.2 3.5 3.5-3.5 3.5v-2H6c-3.3 0-6-2.7-6-6 0-1.6.6-3 1.6-4.1l1.4 1.4c-.7.8-1 1.7-1 2.7 0 2.2 1.8 4 4 4h3.9z" transform="translate(-3 3)"/></svg>';
-  const plState = { items: [], idx: -1, loop: false, shuffle: false, title: '', owner: '' };
+  const plState = { items: [], idx: -1, loop: false, shuffle: false, title: '', owner: '', totalText: '' };
+  let plCont = null, plUsePanelNext = false, panelLoading = false, panelMoreObs = null;
 
   async function setupPlaylistPanel(lid, currentVid, panelData) {
     try {
-      let cont = null, usePanelNext = false;
       if (panelData?.items?.length) {
-        // パネルが watch 応答に同梱されている → そのまま使う (最速)
+        // パネルが watch 応答に同梱されている → そのまま使う (最速・追加往復ゼロ)
         plState.title = panelData.title || '再生リスト';
-        plState.owner = '';
+        plState.owner = panelData.owner || '';            // 以前は破棄されていた
+        plState.totalText = panelData.totalText || '';
         plState.items = panelData.items;
-        cont = panelData.continuation;
-        usePanelNext = true;
+        plCont = panelData.continuation;
+        plUsePanelNext = true;                            // next エンドポイント系
       } else {
         const d = await api('/api/playlist/' + encodeURIComponent(lid), { ttl: 10 * 60e3 });
         plState.title = d.title || '再生リスト';
         plState.owner = d.channelName || '';
+        plState.totalText = '';
         plState.items = d.items || [];
-        cont = d.continuation;
-        usePanelNext = !!d.panelNext;
+        plCont = d.continuation;
+        plUsePanelNext = !!d.panelNext;
       }
       if (destroyed || !document.body.contains(wrapEl)) return;
       plState.idx = plState.items.findIndex(x => x.id === currentVid);
-      const nextUrl = () => (usePanelNext ? '/api/playlist/panel-next?c=' : '/api/playlist/next?c=') + encodeURIComponent(cont);
+      const nextUrl = () => (plUsePanelNext ? '/api/playlist/panel-next?c=' : '/api/playlist/next?c=') + encodeURIComponent(plCont);
+      plState._nextUrl = nextUrl;
       // walk continuation pages until the current video shows up (max 3 more)
       let guard = 0;
-      while (plState.idx < 0 && cont && guard < 3) {
+      while (plState.idx < 0 && plCont && guard < 3) {
         guard++;
         const n = await api(nextUrl(), { ttl: 10 * 60e3 }).catch(() => null);
         if (!n) break;
-        cont = n.continuation;
+        plCont = n.continuation;
         plState.items = plState.items.concat(n.items || []);
         plState.idx = plState.items.findIndex(x => x.id === currentVid);
       }
       // index unknown (huge list): treat as first
       if (plState.idx < 0) plState.items.unshift({ id: currentVid, title: document.title, thumb: '', channel: plState.owner, duration: '' }), plState.idx = 0;
       drawPanel();
+      // 次の動画を事前ウォーム（自動送り・手動送りの初動を限界まで速くする）
+      const nx = plState.items[plState.idx + 1];
+      if (nx && /^[\w-]{11}$/.test(nx.id)) {
+        api('/api/watch/' + nx.id + '?list=' + encodeURIComponent(lid)).catch(() => {});
+        fetch('/api/warm/' + nx.id).catch(() => {});
+      }
       // auto-advance
       video.addEventListener('ended', () => advance(1));
     } catch (_) { /* playlist panel is additive — never fatal */ }
+  }
+
+  function panelRowHtml(v, i) {
+    return `
+      <div class="plp-item ${i === plState.idx ? 'active' : ''}" data-plgo="${i}">
+        <span class="plp-idx">${i === plState.idx ? '<svg viewBox="0 0 24 24" class="ic" style="width:14px;height:14px"><path d="M8 5v14l11-7z"/></svg>' : (i + 1)}</span>
+        <div class="vthumb"><img loading="lazy" decoding="async" src="${esc(v.thumb || ('https://i.ytimg.com/vi/' + v.id + '/hqdefault.jpg'))}" alt="">${v.duration ? `<span class="dur">${esc(v.duration)}</span>` : ''}</div>
+        <div class="vinfo"><div class="plp-tt">${esc(v.title || '')}</div><div class="vsub" style="font-size:12px">${esc(v.channel || '')}</div></div>
+      </div>`;
+  }
+
+  async function loadMorePanel() {
+    if (!plCont || panelLoading || destroyed) return;
+    panelLoading = true;
+    try {
+      const n = await api(plState._nextUrl(), { ttl: 10 * 60e3 });
+      plCont = n.continuation;
+      const base = plState.items.length;
+      plState.items = plState.items.concat(n.items || []);
+      const scroller = $('#rail .plp .plp-items');
+      if (scroller) {
+        scroller.insertAdjacentHTML('beforeend', (n.items || []).map((v, i) => panelRowHtml(v, base + i)).join(''));
+        wirePanelItemClicks(scroller);
+        wirePanelMore();
+      }
+    } catch (_) { /* optional */ }
+    panelLoading = false;
+  }
+
+  /** パネル末尾近くまでスクロールしたら続きを自動読み込み（本家同等） */
+  function wirePanelMore() {
+    panelMoreObs?.disconnect();
+    panelMoreObs = null;
+    if (!plCont) return;
+    const scroller = $('#rail .plp .plp-items');
+    if (!scroller) return;
+    const rows = scroller.querySelectorAll('.plp-item');
+    const last = rows[rows.length - 1];
+    if (!last) return;
+    panelMoreObs = new IntersectionObserver((es) => {
+      if (es.some(e => e.isIntersecting)) loadMorePanel();
+    }, { root: scroller, rootMargin: '240px' });
+    panelMoreObs.observe(last);
+  }
+
+  function wirePanelItemClicks(scope) {
+    scope.querySelectorAll('[data-plgo]').forEach(r => {
+      if (r._wired) return;
+      r._wired = true;
+      r.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const v = plState.items[+r.dataset.plgo];
+        if (v) location.hash = '#/watch?v=' + v.id + '&list=' + encodeURIComponent(listId);
+      });
+    });
   }
 
   function drawPanel() {
     const rail = $('#rail');
     if (!rail) return;
     rail.querySelector('.plp')?.remove();
-    const rows = plState.items.map((v, i) => `
-      <div class="plp-item ${i === plState.idx ? 'active' : ''}" data-plgo="${i}">
-        <span class="plp-idx">${i === plState.idx ? '<svg viewBox="0 0 24 24" class="ic" style="width:14px;height:14px"><path d="M8 5v14l11-7z"/></svg>' : (i + 1)}</span>
-        <div class="vthumb"><img loading="lazy" src="${esc(v.thumb || ('https://i.ytimg.com/vi/' + v.id + '/hqdefault.jpg'))}" alt="">${v.duration ? `<span class="dur">${esc(v.duration)}</span>` : ''}</div>
-        <div class="vinfo"><div class="plp-tt">${esc(v.title || '')}</div><div class="vsub" style="font-size:12px">${esc(v.channel || '')}</div></div>
-      </div>`).join('');
+    const rows = plState.items.map((v, i) => panelRowHtml(v, i)).join('');
     rail.insertAdjacentHTML('afterbegin', `
       <div class="plp">
         <div class="plp-head">
           <div class="plp-t1">
             <span class="plp-ic">${ICON_LIST}</span>
-            <span class="plp-name">${esc(plState.title)}</span>
+            <span class="plp-name" title="${esc(plState.title)}">${esc(plState.title)}</span>
             <div class="plp-spacer"></div>
             <button class="icon-btn plp-btn ${plState.shuffle ? 'on' : ''}" data-plact="shuffle" title="シャッフル">${ICON_SHUFFLE}</button>
             <button class="icon-btn plp-btn ${plState.loop ? 'on' : ''}" data-plact="loop" title="ループ再生">${ICON_LOOP}</button>
             <button class="icon-btn plp-btn" data-plact="fold" title="折りたたむ"><svg viewBox="0 0 24 24" class="ic"><path d="M7.4 8.6 12 13.2l4.6-4.6L18 10l-6 6-6-6z"/></svg></button>
           </div>
-          <div class="plp-sub">${esc(plState.owner || '再生リスト')} ・ ${plState.idx + 1} / ${plState.items.length}</div>
+          <div class="plp-sub">${esc(plState.owner || '再生リスト')} ・ ${plState.idx + 1} / ${esc(plState.totalText || String(plState.items.length))}</div>
         </div>
         <div class="plp-items">${rows}</div>
       </div>`);
     const panel = rail.querySelector('.plp');
-    panel.querySelectorAll('[data-plgo]').forEach(r => r.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const i = +r.dataset.plgo;
-      const v = plState.items[i];
-      if (v) location.hash = '#/watch?v=' + v.id + '&list=' + encodeURIComponent(listId);
-    }));
+    wirePanelItemClicks(panel);
     panel.querySelectorAll('[data-plact]').forEach(b => b.addEventListener('click', (e) => {
       e.stopPropagation();
       const act = b.dataset.plact;
@@ -1653,6 +1812,7 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
       if (act === 'fold') { panel.classList.toggle('folded'); b.querySelector('svg').style.transform = panel.classList.contains('folded') ? 'rotate(180deg)' : ''; }
     }));
     panel.querySelector('.plp-item.active')?.scrollIntoView({ block: 'center' });
+    wirePanelMore();
   }
 
   function advance(step) {
@@ -1680,10 +1840,19 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
     if (!rail) return;
     const vids = (d.related || []).filter(i => i.kind === 'video');
     const shorts = (d.related || []).filter(i => i.kind === 'short');
+    const autoOn = Store.get('autoplay', true);
     rail.innerHTML =
+      (listId ? '' : `<div class="rail-tools"><span>自動再生</span><button class="ap-toggle ${autoOn ? 'on' : ''}" id="ap-toggle" role="switch" aria-checked="${autoOn}" title="自動再生"><span class="ap-knob"></span></button></div>`) +
       vids.slice(0, 6).map(railCard).join('') +
       (shorts.length ? shortsShelf(shorts, { compact: true }) : '') +
       vids.slice(6).map(railCard).join('');
+    $('#ap-toggle')?.addEventListener('click', function () {
+      const on = !Store.get('autoplay', true);
+      Store.set('autoplay', on);
+      this.classList.toggle('on', on);
+      this.setAttribute('aria-checked', String(on));
+      toast(on ? '自動再生をオンにしました' : '自動再生をオフにしました');
+    });
   }
 }
 
@@ -1761,39 +1930,40 @@ function renderPlaylist(params) {
   app.innerHTML = skGrid(10);
   api('/api/playlist/' + encodeURIComponent(list), { ttl: 10 * 60e3 })
     .then(d => {
+      const items = d.items || [];
+      const first = items[0];
+      const itemHtml = (v, i) => `
+        <div class="pl-item" data-href="#/watch?v=${esc(v.id)}&list=${esc(list)}">
+          <span class="idx">${i + 1}</span>
+          <div class="vthumb"><img loading="lazy" decoding="async" src="${esc(thumbUrl(v))}" alt="">${v.duration ? `<span class="dur">${esc(v.duration)}</span>` : ''}</div>
+          <div class="vinfo"><div class="vtitle">${esc(v.title)}</div><div class="vsub">${esc(v.channel || '')}</div></div>
+        </div>`;
       app.innerHTML = `
       <div class="pl-page">
         <div class="pl-side">
-          ${d.items[0] ? `<div class="pl-thumb"><img src="${esc(thumbUrl(d.items[0]))}" alt=""></div>` : ''}
+          ${first ? `<div class="pl-thumb"><img src="${esc(thumbUrl(first))}" alt=""></div>` : ''}
           <h1>${esc(d.title || '再生リスト')}</h1>
-          <div class="pl-meta">${esc(d.channelName || '')}<br>${esc(d.views || '')}<br>${d.items.length} 本の動画</div>
+          <div class="pl-meta">${esc(d.channelName || '')}${d.views ? '<br>' + esc(d.views) : ''}<br>${items.length}${d.continuation ? '+' : ''} 本の動画</div>
+          ${first ? `<a class="pl-playall" href="#/watch?v=${esc(first.id)}&list=${esc(list)}"><svg viewBox="0 0 24 24" class="ic"><path d="M8 5v14l11-7z"/></svg>すべて再生</a>` : ''}
         </div>
         <div id="pl-items">
-          ${d.items.map((v, i) => `
-            <div class="pl-item" data-href="#/watch?v=${esc(v.id)}&list=${esc(list)}">
-              <span class="idx">${i + 1}</span>
-              <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(v))}" alt="">${v.duration ? `<span class="dur">${esc(v.duration)}</span>` : ''}</div>
-              <div class="vinfo"><div class="vtitle">${esc(v.title)}</div><div class="vsub">${esc(v.channel || '')}</div></div>
-            </div>`).join('')}
+          ${items.map((v, i) => itemHtml(v, i)).join('')}
         </div>
       </div>`;
       if (d.continuation) {
         let cont = d.continuation, loading = false;
-        lazySentinel($('#pl-items'), () => {
+        let loaded = items.length; // 番号は件数カウンタで管理（sentinel要素を数える従来方式は1ズレた）
+        const nextEp = d.panelNext ? '/api/playlist/panel-next?c=' : '/api/playlist/next?c='; // ミックスは next 系
+        const sent = lazySentinel($('#pl-items'), () => {
           if (loading || !cont) return;
           loading = true;
-          api('/api/playlist/next?c=' + encodeURIComponent(cont), { ttl: 10 * 60e3 })
+          api(nextEp + encodeURIComponent(cont), { ttl: 10 * 60e3 })
             .then(n => {
               loading = false; cont = n.continuation;
-              const box = $('#pl-items');
-              if (!box) return;
-              const base = box.children.length;
-              box.insertAdjacentHTML('beforeend', (n.items || []).map((v, i) => `
-                <div class="pl-item" data-href="#/watch?v=${esc(v.id)}&list=${esc(list)}">
-                  <span class="idx">${base + i + 1}</span>
-                  <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(v))}" alt="">${v.duration ? `<span class="dur">${esc(v.duration)}</span>` : ''}</div>
-                  <div class="vinfo"><div class="vtitle">${esc(v.title)}</div><div class="vsub">${esc(v.channel || '')}</div></div>
-                </div>`).join(''));
+              // sentinel の「直前」へ挿入（従来は末尾に追加され sentinel が中間に取り残されていた）
+              sent.el.insertAdjacentHTML('beforebegin', (n.items || []).map((v, i) => itemHtml(v, loaded + i)).join(''));
+              loaded += (n.items || []).length;
+              if (!cont) sent.done();
             })
             .catch(() => { loading = false; });
         });
@@ -1998,6 +2168,14 @@ sInput.addEventListener('keydown', (e) => {
     $$('.sg', sBox).forEach((n, i) => n.classList.toggle('active', i === sgIndex));
     if (sgItems[sgIndex]) sInput.value = sgItems[sgIndex];
   } else if (e.key === 'Escape') sBox.classList.add('hidden');
+});
+
+/* '/' で検索へフォーカス（YouTube同等ショートカット） */
+document.addEventListener('keydown', (e) => {
+  if (e.key !== '/') return;
+  if (/INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName || '')) return;
+  e.preventDefault();
+  $('#search-input')?.focus();
 });
 
 /* options menu */
