@@ -10,6 +10,7 @@
  */
 const path = require('node:path');
 const express = require('express');
+const compression = require('compression');
 
 const { router } = require('./server/routes');
 const { proxyManager } = require('./server/proxies');
@@ -17,6 +18,15 @@ const { proxyManager } = require('./server/proxies');
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', true);
+
+// gzip/brotli 圧縮（JSON・JS・CSS・HTMLの転送量を ~70% 削減）。
+// 動画本体 /api/stream は video/* なので既定フィルタで自動的に素通しされる。
+app.use(compression({
+  filter: (req, res) => {
+    if (req.path === '/api/stream') return false; // メディア中継は絶対に圧縮しない
+    return compression.filter(req, res);
+  },
+}));
 
 // API
 app.use(router);
@@ -27,7 +37,8 @@ app.use(express.static(pub, {
   index: 'index.html',
   maxAge: '1h',
   setHeaders(res, filePath) {
-    if (/\.(js|css)$/.test(filePath)) res.setHeader('Cache-Control', 'public, max-age=3600');
+    if (/vendor[\\/].*\.js$/.test(filePath)) res.setHeader('Cache-Control', 'public, max-age=604800, immutable'); // ベンダーは内容不変
+    else if (/\.(js|css)$/.test(filePath)) res.setHeader('Cache-Control', 'public, max-age=3600');
     if (/index\.html$/.test(filePath)) res.setHeader('Cache-Control', 'no-cache');
   },
 }));
