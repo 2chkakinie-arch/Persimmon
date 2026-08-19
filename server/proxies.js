@@ -295,6 +295,17 @@ class ProxyManager {
     return null;
   }
 
+  /** rescue-round helper: n 個のフレッシュな候補をまとめて取る（重複なし）。 */
+  pickMany(n = 5) {
+    const out = [];
+    for (let i = 0; i < n * 3 && out.length < n; i++) {
+      const u = this.pick(out);
+      if (!u) break;
+      out.push(u);
+    }
+    return out;
+  }
+
   /** 発行用途の優先ピック: 「YouTube非BAN実測済み」の issuer-grade を latency 順で。 */
   pickIssuer(exclude = []) {
     if (!this.enabled) return null;
