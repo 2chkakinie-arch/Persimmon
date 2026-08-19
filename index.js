@@ -19,11 +19,11 @@ const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', true);
 
-// gzip/brotli 圧縮（JSON・JS・CSS・HTMLの転送量を ~70% 削減）。
-// 動画本体 /api/stream は video/* なので既定フィルタで自動的に素通しされる。
+// gzip 圧縮（転送量 ~7割減）。動画中継・サムネ等のバイナリは除外する
+// （再圧縮できない上に CPU 消費と初バイト遅延だけが増えるため）。
 app.use(compression({
-  filter: (req, res) => {
-    if (req.path === '/api/stream') return false; // メディア中継は絶対に圧縮しない
+  filter(req, res) {
+    if (/^\/api\/(stream|thumb)\b/.test(req.path)) return false; // 動画/画像リレーは生で流す
     return compression.filter(req, res);
   },
 }));
@@ -37,8 +37,7 @@ app.use(express.static(pub, {
   index: 'index.html',
   maxAge: '1h',
   setHeaders(res, filePath) {
-    if (/vendor[\\/].*\.js$/.test(filePath)) res.setHeader('Cache-Control', 'public, max-age=604800, immutable'); // ベンダーは内容不変
-    else if (/\.(js|css)$/.test(filePath)) res.setHeader('Cache-Control', 'public, max-age=3600');
+    if (/\.(js|css)$/.test(filePath)) res.setHeader('Cache-Control', 'public, max-age=3600');
     if (/index\.html$/.test(filePath)) res.setHeader('Cache-Control', 'no-cache');
   },
 }));
