@@ -1,7 +1,7 @@
 {
   "name": "llytpr-wl-v01nh",
   "version": "1.0.0",
-  "description": "llytpr-wl.v01nh — ultra-fast YouTube frontend (InnerTube + smart proxy rotation). Made by Kakinie with llytpr-wl.v01nh TEAM. V1",
+  "description": "Vandal (llytpr-wl.v01nh) — ultra-fast YouTube frontend (InnerTube + issuer-certified proxy direct-play + ♦Ask AI). Made by Kakinie with llytpr-wl.v01nh TEAM. V1",
   "main": "index.js",
   "type": "commonjs",
   "author": "Kakinie with llytpr-wl.v01nh TEAM",
@@ -12,7 +12,9 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node index.js",
-    "test:api": "node scripts/smoke.js"
+    "test:api": "node scripts/smoke.js",
+    "test:fault": "node scripts/fault-inject.js",
+    "test:issue": "node scripts/test-issue-direct.js"
   },
   "dependencies": {
     "compression": "^1.8.1",
