@@ -26,27 +26,6 @@ function toast(msg, ms = 2600) {
 }
 window.toast = toast;
 
-/* ---- トップ進捗バー（YouTube式）: 実際のAPI通信に連動 ---- */
-const Progress = (() => {
-  let pending = 0, hideT = null;
-  function bar() { return $('#nav-progress'); }
-  function start() {
-    pending++;
-    const b = bar(); if (!b) return;
-    clearTimeout(hideT);
-    b.classList.remove('done');
-    b.classList.add('on');
-  }
-  function done() {
-    pending = Math.max(0, pending - 1);
-    if (pending) return;
-    const b = bar(); if (!b) return;
-    b.classList.add('done');
-    hideT = setTimeout(() => b.classList.remove('on', 'done'), 400);
-  }
-  return { start, done };
-})();
-
 const fmtDur = (sec) => {
   sec = Math.max(0, Math.floor(sec));
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
@@ -133,22 +112,33 @@ const Searches = {
     Store.set('searches', list.slice(0, 30));
   },
 };
-/** playback resume positions: {v: {t, d, ts}} — 「続きから再生」 */
-const Positions = {
-  map() { return Store.get('pos', {}); },
-  get(v) { return Positions.map()[v] || null; },
-  set(v, t, d) {
-    if (!v || !(t > 0)) return;
-    const m = Positions.map();
-    m[v] = { t: Math.floor(t), d: Math.floor(d || 0), ts: Date.now() };
-    const keys = Object.keys(m);
-    if (keys.length > 150) { // 古い順に間引く
-      keys.sort((a, b) => m[a].ts - m[b].ts);
-      for (const k of keys.slice(0, keys.length - 150)) delete m[k];
-    }
-    Store.set('pos', m);
+
+/** playlist context — クリック時点で文脈を sessionStorage 保存。
+ *  視聴ページはサーバー往復を待たずローカルスナップショットから瞬時に
+ *  パネルを描画し（バグの隙も無い）、裏で完全版に追従する。 */
+const PlCtx = {
+  key: (lid) => 'plctx:' + lid,
+  save(lid, data) {
+    try {
+      if (!lid || !data?.items?.length) return;
+      const slim = {
+        id: lid, title: data.title || '', owner: data.owner || '',
+        total: data.total || data.items.length || 0, ts: Date.now(),
+        items: data.items.slice(0, 120).map(v => ({
+          id: v.id, title: v.title || '', channel: v.channel || '',
+          thumb: v.thumb ? String(v.thumb).slice(0, 120) : '', duration: v.duration || '',
+        })),
+      };
+      sessionStorage.setItem(this.key(lid), JSON.stringify(slim));
+    } catch (_) { /* quota — additive only */ }
   },
-  clear(v) { const m = Positions.map(); if (m[v]) { delete m[v]; Store.set('pos', m); } },
+  load(lid) {
+    try {
+      const j = JSON.parse(sessionStorage.getItem(this.key(lid)) || 'null');
+      if (j && j.items?.length && Date.now() - j.ts < 3600e3) return j;
+    } catch (_) { /* parse — ignore */ }
+    return null;
+  },
 };
 
 /** preference profile inferred from history + likes + searches */
@@ -181,7 +171,6 @@ async function api(path, { ttl = 5 * 60e3, method = 'GET', body } = {}) {
   }
   const inflight = api._inflight.get(key);
   if (inflight) return inflight;
-  Progress.start();
   const p = fetch(path, {
     method,
     headers: body ? { 'Content-Type': 'application/json' } : undefined,
@@ -191,9 +180,8 @@ async function api(path, { ttl = 5 * 60e3, method = 'GET', body } = {}) {
     if (!res.ok) { const e = new Error(j.error || ('HTTP ' + res.status)); e.status = res.status; e.payload = j; throw e; }
     if (method === 'GET') mem.set(key, { data: j, exp: Date.now() + ttl });
     api._inflight.delete(key);
-    Progress.done();
     return j;
-  }).catch(e => { api._inflight.delete(key); Progress.done(); throw e; });
+  }).catch(e => { api._inflight.delete(key); throw e; });
   api._inflight.set(key, p);
   return p;
 }
@@ -238,7 +226,7 @@ function videoCard(it, { rail = false } = {}) {
   return `
   <div class="vcard" data-href="#${href.replace(/^#?/, '')}" data-vid="${esc(it.id)}">
     <div class="vthumb">
-      <img loading="lazy" decoding="async" src="${esc(thumbUrl(it))}" alt="" onerror="this.onerror=null;this.src='https://i.ytimg.com/vi/${esc(it.id)}/hqdefault.jpg'">
+      <img loading="lazy" src="${esc(thumbUrl(it))}" alt="" onerror="this.onerror=null;this.src='https://i.ytimg.com/vi/${esc(it.id)}/hqdefault.jpg'">
       ${it.duration ? `<span class="dur">${esc(it.duration)}</span>` : (it.live ? '<span class="dur live-badge">LIVE</span>' : '')}
     </div>
     <div class="vmeta">
@@ -256,7 +244,7 @@ function railCard(it) {
   if (it.kind === 'short') {
     return `
     <div class="rcard" data-href="#/shorts/${esc(it.id)}" data-vid="${esc(it.id)}">
-      <div class="vthumb"><img loading="lazy" decoding="async" src="${esc(thumbUrl(it))}" alt="">
+      <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt="">
         <span class="dur" style="background:rgba(0,0,0,.8)">ショート</span>
       </div>
       <div class="vinfo">
@@ -269,7 +257,7 @@ function railCard(it) {
   const href = '#/watch?v=' + it.id;
   return `
   <div class="rcard" data-href="${href}" data-vid="${esc(it.id)}">
-    <div class="vthumb"><img loading="lazy" decoding="async" src="${esc(thumbUrl(it))}" alt="">
+    <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt="">
       ${it.duration ? `<span class="dur">${esc(it.duration)}</span>` : ''}
     </div>
     <div class="vinfo">
@@ -284,7 +272,7 @@ function shortCard(it) {
   const href = '#/shorts/' + it.id;
   return `
   <div class="scard" data-href="${href}" data-vid="${esc(it.id)}">
-    <div class="sthumb"><img loading="lazy" decoding="async" src="${esc(thumbUrl(it))}" alt=""></div>
+    <div class="sthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt=""></div>
     <div class="stitle">${esc(it.title)}</div>
     <div class="sviews">${esc(it.views || '')}</div>
   </div>`;
@@ -303,7 +291,7 @@ function shortsShelf(shorts, { compact = false } = {}) {
 function playlistCard(it) {
   return `
   <div class="vcard" data-href="#${(it.url || '/playlist?list=' + it.id).replace(/^#?/, '')}">
-    <div class="vthumb"><img loading="lazy" decoding="async" src="${esc(thumbUrl(it))}" alt="">
+    <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt="">
       <span class="pl-strip"><svg viewBox="0 0 24 24" class="ic"><path d="M3 6h12v2H3zm0 4h12v2H3zm0 4h8v2H3zm13-8v9l7-4.5z"/></svg>${esc(it.count || '再生リスト')}</span>
     </div>
     <div class="vmeta">
@@ -322,7 +310,7 @@ function playlistRow(it) {
   const count = it.count || '';
   return `
   <div class="result-card" data-href="#${esc(href)}">
-    <div class="vthumb"><img loading="lazy" decoding="async" src="${esc(thumbUrl(it))}" alt="">
+    <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt="">
       <span class="pl-strip"><svg viewBox="0 0 24 24" class="ic"><path d="M3 6h12v2H3zm0 4h12v2H3zm0 4h8v2H3zm13-8v9l7-4.5z"/></svg>${esc(count || '再生リスト')}</span>
     </div>
     <div class="vinfo result-info">
@@ -349,11 +337,24 @@ function channelRow(it) {
   </div>`;
 }
 
+/** shorts playback queue — ショートカード群から文脈ごと保存（下スクロール遷移の土台） */
+const SHQ_KEY = 'llytpr:shq';
+function shqLoad() {
+  try {
+    const j = JSON.parse(sessionStorage.getItem(SHQ_KEY) || 'null');
+    if (j && j.ids?.length && Date.now() - j.ts < 3600e3) return j;
+  } catch (_) { /* ignore */ }
+  return null;
+}
+function shqSave(ids, meta = {}) {
+  try { sessionStorage.setItem(SHQ_KEY, JSON.stringify({ ids: ids.slice(0, 250), meta, ts: Date.now() })); } catch (_) { /* quota */ }
+}
+
 /** card for local-storage entries (history/likes/saves) */
 function storedCard(h, { onRemove } = {}) {
   return `
   <div class="vcard" data-href="#/watch?v=${esc(h.v)}" data-vid="${esc(h.v)}">
-    <div class="vthumb"><img loading="lazy" decoding="async" src="https://i.ytimg.com/vi/${esc(h.v)}/hqdefault.jpg" alt="">
+    <div class="vthumb"><img loading="lazy" src="https://i.ytimg.com/vi/${esc(h.v)}/hqdefault.jpg" alt="">
       ${h.d ? `<span class="dur">${esc(fmtDur(h.d))}</span>` : ''}
     </div>
     <div class="vmeta">
@@ -378,42 +379,54 @@ document.addEventListener('click', (e) => {
     return;
   }
   const card = e.target.closest('[data-href]');
-  if (card) { location.hash = card.dataset.href.startsWith('#') ? card.dataset.href.slice(1) : card.dataset.href; }
+  if (!card) return;
+  // ショートカード: 同一シェルフ/グリッドの並びをそのまま再生キューに保存
+  const sc = e.target.closest('.scard');
+  if (sc) {
+    const box = sc.closest('.shorts-scroll, .shorts-grid');
+    if (box) {
+      const cards = [...box.querySelectorAll('.scard')];
+      const ids = cards.map(c => c.dataset.vid).filter(v => /^[\w-]{11}$/.test(v || ''));
+      const meta = {};
+      cards.forEach(c => {
+        if (c.dataset.vid) meta[c.dataset.vid] = {
+          title: c.querySelector('.stitle')?.textContent || '',
+          views: c.querySelector('.sviews')?.textContent || '',
+        };
+      });
+      if (ids.length) shqSave(ids, meta);
+    }
+  }
+  location.hash = card.dataset.href.startsWith('#') ? card.dataset.href.slice(1) : card.dataset.href;
 });
 // ---- 先読みプリフェッチ（メタ情報限界高速化）------------------------------
 // カードに 120ms ホバーした時点で /api/watch（メタ+直結判定＋先頭チャンクwarm）を
 // 裏取得し、クリック時にはメモリキャッシュから即座に反映されるようにする。
 // data-vid 属性も data-href の URL も両方を解析する（検索行カード等も網羅）。
 const _prefetched = new Map(); // vid -> ts
-function vidFromCard(card) {
+document.addEventListener('mouseover', debounce((e) => {
+  const card = e.target.closest?.('[data-vid],[data-href]');
+  if (!card) return;
   let vid = card.dataset.vid || '';
   if (!/^[\w-]{11}$/.test(vid)) {
     const m = String(card.dataset.href || '').match(/[?&/]v[=/]([\w-]{11})|\/shorts\/([\w-]{11})/);
     vid = m ? (m[1] || m[2] || '') : '';
   }
-  return /^[\w-]{11}$/.test(vid) ? vid : '';
-}
-function prefetchVideo(vid) {
-  if (!vid) return;
+  if (!/^[\w-]{11}$/.test(vid)) return;
   const last = _prefetched.get(vid) || 0;
   if (Date.now() - last < 300000) return;
   _prefetched.set(vid, Date.now());
   api('/api/watch/' + vid).catch(() => {});            // メタ＋直結判定（SWRキャッシュ入り）
   fetch('/api/warm/' + vid).catch(() => {});           // 先頭 768KB をサーバーRAMへ保温
-}
-document.addEventListener('mouseover', debounce((e) => {
-  const card = e.target.closest?.('[data-vid],[data-href]');
-  if (card) prefetchVideo(vidFromCard(card));
 }, 120), { passive: true });
 document.addEventListener('touchstart', (e) => { // モバイルはホバーが無いのでタッチ即先読み
   const card = e.target.closest?.('[data-vid],[data-href]');
-  if (card) prefetchVideo(vidFromCard(card));
+  if (!card) return;
+  const vid = card.dataset.vid || '';
+  if (!/^[\w-]{11}$/.test(vid)) return;
+  api('/api/watch/' + vid).catch(() => {});
+  fetch('/api/warm/' + vid).catch(() => {});
 }, { passive: true });
-// クリック判定（pointerdown）の瞬間にも先読み — ナビゲーションまでの数100msも使う
-document.addEventListener('pointerdown', (e) => {
-  const card = e.target.closest?.('[data-vid],[data-href]');
-  if (card) prefetchVideo(vidFromCard(card));
-}, { passive: true, capture: true });
 
 /* skeleton screens */
 function skGrid(n = 12, rail = false) {
@@ -613,13 +626,13 @@ function renderResults(params) {
     const meta = it.metaTop?.join(' • ') || [it.views, it.published].filter(Boolean).join(' • ');
     return `
     <div class="result-card" data-href="#/watch?v=${esc(it.id)}" data-vid="${esc(it.id)}">
-      <div class="vthumb"><img loading="lazy" decoding="async" src="${esc(thumbUrl(it))}" alt="">
+      <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt="">
         ${it.duration ? `<span class="dur">${esc(it.duration)}</span>` : ''}
       </div>
       <div class="vinfo result-info">
         <div class="vtitle">${esc(it.title)}</div>
         <div class="result-sub">${esc(meta)}</div>
-        ${it.channel ? `<div class="result-ch"><span>${esc(it.channel)}</span></div>` : ''}
+        ${it.channel ? `<div class="result-ch"><div class="r-ava vava"></div><span>${esc(it.channel)}</span></div>` : ''}
       </div>
     </div>`;
   }
@@ -880,7 +893,6 @@ class PlayerUI {
           <input type="range" class="seek" data-el="volrange" min="0" max="100" value="100" style="width:72px">
           <span class="p-time" data-el="time">0:00 / 0:00</span>
           <div class="p-spacer"></div>
-          <button class="icon-btn" data-el="pip" title="ピクチャーインピクチャー"><svg viewBox="0 0 24 24" class="ic"><path d="M19 11h-8v6h8zm4-7v16H1V4zm-2 2H3v12h18z"/></svg></button>
           <button class="icon-btn" data-el="settings" title="設定"><svg viewBox="0 0 24 24" class="ic"><path d="M19.7 13.4a7.6 7.6 0 0 0 0-2.8l2-1.5a.5.5 0 0 0 .1-.7l-1.9-3.2a.5.5 0 0 0-.6-.2l-2.3.9a7.7 7.7 0 0 0-2.4-1.4L14.2 2a.5.5 0 0 0-.5-.4h-3.8a.5.5 0 0 0-.5.4L9 4.5a7.7 7.7 0 0 0-2.4 1.4l-2.3-.9a.5.5 0 0 0-.6.2L1.8 8.4a.5.5 0 0 0 .1.7l2 1.5a7.6 7.6 0 0 0 0 2.8l-2 1.5a.5.5 0 0 0-.1.7l1.9 3.2c.14.24.42.34.68.22l2.3-.9c.72.56 1.53 1.03 2.4 1.4l.35 2.5c.04.24.24.4.5.4h3.8c.24 0 .45.17.5-.4l.35-2.5a7.7 7.7 0 0 0 2.4-1.4l2.3.9c.24.1.52.02.65-.22l1.9-3.18a.5.5 0 0 0-.1-.73zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"/></svg></button>
           <button class="icon-btn" data-el="fs" title="全画面表示 (f)"><svg viewBox="0 0 24 24" class="ic"><path d="M7 14H5v5h5v-2H7zm-2-4h2V7h3V5H5zm12 7h-3v2h5v-5h-2zM14 5v2h3v3h2V5z"/></svg></button>
         </div>
@@ -911,24 +923,14 @@ class PlayerUI {
   _bind() {
     const v = this.video;
     const seek = this.el.seek;
-    // 音量・ミュートを記憶（次の動画にも引き継ぐ）
-    const sv = Store.get('vol', null);
-    if (sv != null && isFinite(sv)) { v.volume = Math.min(1, Math.max(0, sv)); this.el.volrange.value = Math.round(v.volume * 100); }
-    if (Store.get('muted', false)) v.muted = true;
-    if (!document.pictureInPictureEnabled) this.el.pip.style.display = 'none';
     const setProg = () => {
       const d = v.duration || 0;
       seek.value = d ? Math.round(v.currentTime / d * 1000) : 0;
       seek.style.setProperty('--prog', (seek.value / 10) + '%');
-      try { // バッファ済み範囲もバーに表示
-        const b = v.buffered;
-        seek.style.setProperty('--buff', (d && b.length ? Math.min(100, b.end(b.length - 1) / d * 100) : 0) + '%');
-      } catch (_) {}
       this.el.time.textContent = `${fmtDur(v.currentTime)} / ${fmtDur(d)}`;
     };
     v.addEventListener('timeupdate', setProg);
     v.addEventListener('durationchange', setProg);
-    v.addEventListener('progress', setProg);
     v.addEventListener('play', () => { this.el.play.innerHTML = ICON_PAUSE; this.flash(ICON_PLAY); });
     v.addEventListener('pause', () => { this.el.play.innerHTML = ICON_PLAY; this.flash(ICON_PAUSE); });
     v.addEventListener('waiting', () => this.el.spin.classList.remove('hidden'));
@@ -940,14 +942,8 @@ class PlayerUI {
       seek.style.setProperty('--prog', (seek.value / 10) + '%');
     });
     this.el.play.addEventListener('click', () => this.togglePlay());
-    this.el.vol.addEventListener('click', () => { v.muted = !v.muted; Store.set('muted', v.muted); });
-    this.el.volrange.addEventListener('input', () => { v.volume = this.el.volrange.value / 100; v.muted = false; Store.set('vol', v.volume); Store.set('muted', false); });
-    this.el.pip.addEventListener('click', async () => {
-      try {
-        if (document.pictureInPictureElement) await document.exitPictureInPicture();
-        else await v.requestPictureInPicture();
-      } catch (_) { toast('ピクチャーインピクチャーを開始できませんでした'); }
-    });
+    this.el.vol.addEventListener('click', () => { v.muted = !v.muted; });
+    this.el.volrange.addEventListener('input', () => { v.volume = this.el.volrange.value / 100; v.muted = false; });
     this.el.fs.addEventListener('click', () => this.toggleFs());
     this.el.settings.addEventListener('click', (e) => { e.stopPropagation(); this.toggleMenu(); });
     this.wrap.addEventListener('dblclick', (e) => { if (!e.target.closest('.qmenu')) this.toggleFs(); });
@@ -1005,7 +1001,6 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
   let rescues = 0;
   let suppressErrorHook = false;
   let instantAttached = false;
-  let autoplayId = null;   // サーバーが返す「次に自動再生する動画」
 
   app.innerHTML = `
   <div class="watch">
@@ -1057,85 +1052,83 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
     try { dash?.destroy(); } catch (_) {}
     try { hlsInst?.destroy(); } catch (_) {}
     killPair();
-    panelMoreObs?.disconnect();
-    try { // 離脱直前の位置も保存（続きから再生用）
-      const d = video.duration || 0;
-      if (d && video.currentTime > 10 && video.currentTime < d - 15) Positions.set(id, video.currentTime, d);
-    } catch (_) {}
     try { video.pause(); video.removeAttribute('src'); video.load(); } catch (_) {}
+  }
+
+  /* プレイリスト文脈は URL パラメータ非依存のローカル一次情報源から即時開始
+   * （サーバー往復ゼロ）。サーバー応答にパネルが同梱された場合のみ後追い更新。
+   * （パネル系シンボルは本スコープ末尾で初期化されるため 1 ティックだけ遅延） */
+  let panelStarted = false;
+  if (listId) {
+    panelStarted = true;
+    setTimeout(() => { if (!destroyed) setupPlaylistPanel(listId, id, null, PlCtx.load(listId)); }, 0);
   }
 
   loadWatch(id, false);
 
-  // ---- 続きから再生: 前回位置があれば resume する（10s未満/終盤は無視） ----
-  let resumeAt0 = 0;
-  {
-    const pos = Positions.get(id);
-    if (pos && pos.t > 10 && (!pos.d || pos.t < pos.d - 20)) resumeAt0 = pos.t;
+  /* 「ログインして bot ではないことを確認してください」を絶対に見せない仕組み。
+   * LOGIN_REQUIRED / ERROR / 通信失敗が返った瞬間、ユーザー操作なしで最大3回まで
+   * 自動でプロキシをローテーションし再取得する（サーバー側も同時に総入替）。
+   * 本当に再生不能なケース（削除済み・年齢制限等）だけが最終メッセージに辿り着く。 */
+  const MAX_RESCUES = 3;
+  const DEFINITIVE = /UNPLAYABLE|AGE_CHECK|CONTENT_NOT_AVAILABLE|VIDEO_UNAVAILABLE|OFFLINE|PRIVATE|PLAYLIST_EMPTY|NOT_FOUND/i;
+  const isDefinitive = (status) => {
+    const s = String(status || '').toUpperCase();
+    if (!s || s === 'ERROR' || s === 'LOGIN_REQUIRED' || s === 'NETWORK' || s === 'UPSTREAM') return false;
+    return DEFINITIVE.test(s);
+  };
+  function rescueVeil(n) {
+    if (!n || destroyed) { wrapEl.querySelector('[data-veil]')?.remove(); return; }
+    let v = wrapEl.querySelector('[data-veil]');
+    if (!v) {
+      v = document.createElement('div');
+      v.setAttribute('data-veil', '');
+      v.className = 'rescue-veil';
+      wrapEl.appendChild(v);
+    }
+    v.innerHTML = `<div class="mini-spin light"></div><p>接続経路を自動で切り替えています… <span>(${n}/${MAX_RESCUES})</span></p>`;
   }
-  // 位置の定期保存（4秒間隔）。終盤は「見終わった」として消す。
-  let lastPosSave = 0;
-  video.addEventListener('timeupdate', () => {
-    const now = Date.now();
-    if (now - lastPosSave < 4000) return;
-    lastPosSave = now;
-    const d = video.duration || 0;
-    if (!d) return;
-    if (video.currentTime > d - 15) Positions.clear(id);
-    else if (video.currentTime > 10) Positions.set(id, video.currentTime, d);
-  });
-  video.addEventListener('ended', () => Positions.clear(id));
-
-  // 自動再生（プレイリスト無しのとき、サーバー提示の次動画へ進む）
-  video.addEventListener('ended', () => {
-    if (typeof plState !== 'undefined' && plState.items.length) return; // リスト側の advance に委譲
-    if (!Store.get('autoplay', true) || !autoplayId) return;
-    toast('次の動画を自動再生します', 1500);
-    location.hash = '#/watch?v=' + autoplayId;
-  });
 
   function loadWatch(vid, busted) {
     if (busted) api.invalidate('/api/watch/' + vid);
-    // プレイリスト文脈を必ず送る（送らないとサーバーがパネルを同梱せず、
-    // ミックス/RD系ではパネルが出ない・通常リストも余分な往復が発生していた）
-    const listQ = listId ? '?list=' + encodeURIComponent(listId) : '';
-    api('/api/watch/' + vid + listQ, { ttl: busted ? 0 : 3 * 60e3 })
+    api('/api/watch/' + vid, { ttl: busted ? 0 : 3 * 60e3 })
       .then(async (d) => {
         if (destroyed) return;
-        document.title = (d.title || 'YouTube') + ' - llytpr-wl.v01nh';
-        if (d.lengthSeconds && resumeAt0 > d.lengthSeconds - 15) resumeAt0 = 0; // ほぼ見終わり
-        autoplayId = d.autoplay || null;
+        document.title = (d.title || 'Vandal') + ' - Vandal';
         fillMeta(d);
         loadComments(d);
         fillRail(d);
-        if (listId) setupPlaylistPanel(listId, id, d.panel);
+        if (listId) {
+          if (!panelStarted) { panelStarted = true; setupPlaylistPanel(listId, id, d.panel, PlCtx.load(listId)); }
+          else if (d.panel?.items?.length) updatePlaylistPanel(d.panel);
+        }
         if (!d.playable) {
-          // last-ditch: ask the server to rebuild (LOGIN_REQUIRED recovery path)
-          if (rescues < 1) { await fatalRescue(true); return; }
+          if (!isDefinitive(d.playability?.status) && rescues < MAX_RESCUES) { await fatalRescue(true); return; }
           unplayableBox(d.playability?.reason || 'この動画は再生できません', d.playability?.status || '');
           return;
         }
+        rescueVeil(0);
         await setupPlayback(d);
       })
       .catch(async (e) => {
         if (destroyed) return;
-        if (rescues < 1) { await fatalRescue(true); return; }
+        if (rescues < MAX_RESCUES) { await fatalRescue(true); return; }
         unplayableBox('再生に失敗しました', e.message);
         fillRail({ related: [] });
       });
   }
 
   function unplayableBox(msg, sub) {
+    rescueVeil(0);
     wrapEl.innerHTML = `<div class="unplayable"><div>${esc(msg)}<br><span style="opacity:.6;font-size:12px">${esc(sub || '')}</span><br><button class="retry" id="un-retry" style="margin-top:14px;background:#fff;color:#000;border-radius:18px;padding:0 20px;height:36px;font-size:13px">もう一度試す</button></div></div>`;
-    $('#un-retry')?.addEventListener('click', () => {
-      api.invalidate('/api/watch/' + id);
-      renderWatch(new URLSearchParams('v=' + id + (listId ? '&list=' + encodeURIComponent(listId) : '')), { vertical, shortId });
-    });
+    $('#un-retry')?.addEventListener('click', () => { location.hash = '#/watch?refresh=1&v=' + id; renderWatch(new URLSearchParams('v=' + id), { vertical, shortId }); });
   }
 
   /** full rebuild when every playback route fails (rotates proxies server-side) */
   async function fatalRescue(silent) {
     rescues++;
+    rescueVeil(rescues);
+    if (rescues > 1) await new Promise(r => setTimeout(r, 500 * rescues)); // ローテーション安定待ち
     if (!silent) toast('ストリームを復旧しています…');
     await api('/api/player/refresh', { method: 'POST', body: JSON.stringify({ v: id }) }).catch(() => null);
     if (destroyed) return;
@@ -1184,14 +1177,13 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
       ...((canDash || (autoTrack && audTrack)) ? [{ key: 'hdauto', label: '自動HD (' + (autoTrack?.qualityLabel || '720p') + ')' }] : []),
       ...qList,
     ];
-    let speed = Store.get('rate', 1);
-    if (speed !== 1) video.playbackRate = speed; // 前回の再生速度を復元
+    let speed = 1;
 
     ui = new PlayerUI(wrapEl, video, () => ({
       qualities, current: mode,
       speeds: [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2], speed,
       onPick: (k) => { mode = k; startMode(k, video.currentTime); },
-      onSpeed: (s) => { speed = s; Store.set('rate', s); video.playbackRate = s; },
+      onSpeed: (s) => { speed = s; video.playbackRate = s; },
     }));
     wrapEl.querySelector('[data-spin]')?.remove(); // skeleton spinner -> UI owns one now
 
@@ -1206,7 +1198,7 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
       startHls();
       return;
     }
-    startMode('auto', resumeAt0);
+    startMode('auto', 0);
 
     function pickAuto(tracks) {
       if (!tracks.length) return null;
@@ -1579,7 +1571,8 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
         <button id="dislike-btn" title="低く評価"><svg viewBox="0 0 24 24" class="ic"><path d="M18 3h4v12h-4zM2 14c0 1.1.9 2 2 2h6.3l-.9 4.6v.3c0 .4.2.8.4 1.1l1.1 1 6.5-6.5c.4-.4.6-.9.6-1.4V4.1c0-1.1-.9-2-2-2H7c-.8 0-1.5.5-1.8 1.2l-3 7.1c-.1.2-.2.5-.2.7z"/></svg></button>
       </div>
       <button class="btn-pill" id="share-btn"><svg viewBox="0 0 24 24" class="ic"><path d="M14 9V5l7 7-7 7v-4.1c-5 0-8.5 1.6-11 5.1 1-5 4-10 11-11z"/></svg>共有</button>
-      <button class="btn-pill" id="save-btn" style="${saved0 ? 'color:var(--blue)' : ''}"><svg viewBox="0 0 24 24" class="ic"><path d="M17 3H7a2 2 0 0 0-2 2v16l7-5 7 5V5a2 2 0 0 0-2-2z"/></svg>${saved0 ? '保存済み' : '保存'}</button>`;
+      <button class="btn-pill" id="save-btn" style="${saved0 ? 'color:var(--blue)' : ''}"><svg viewBox="0 0 24 24" class="ic"><path d="M17 3H7a2 2 0 0 0-2 2v16l7-5 7 5V5a2 2 0 0 0-2-2z"/></svg>${saved0 ? '保存済み' : '保存'}</button>
+      <button class="btn-pill ask-btn" id="ask-btn" title="AIに質問（概要欄を読み込み済み）"><span class="ask-gem">♦</span>Ask</button>`;
     const entry = () => ({ v: id, t: d.title || '', cn: ch.name || '', ch: ch.id || '', d: d.lengthSeconds || 0 });
     $('#like-btn')?.addEventListener('click', function () {
       const liked = Likes.toggle(entry());
@@ -1617,6 +1610,108 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
         this.textContent = desc.classList.contains('open') ? '一部を表示' : '...続きを読む';
       });
     }
+    setupAsk(d);
+  }
+
+  /* ---------------- ♦ Ask（HavocPianoAI 連携・概要欄を読み込んだAI） ------------- */
+  function setupAsk(d) {
+    const btn = $('#ask-btn');
+    if (!btn) return;
+    const ASK_KEY = 'llytpr:ask:' + id;
+    let msgs = [];
+    try { msgs = JSON.parse(sessionStorage.getItem(ASK_KEY) || '[]') || []; } catch (_) { msgs = []; }
+    const saveMsgs = () => { try { sessionStorage.setItem(ASK_KEY, JSON.stringify(msgs.slice(-16))); } catch (_) {} };
+    const mdLite = (s) => esc(String(s || ''))
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+      .replace(/\n/g, '<br>');
+    let panel = null, sending = false, autoAsked = msgs.length > 0;
+
+    function bubble(role, html, pending) {
+      const box = panel.querySelector('.ask-msgs');
+      const el = document.createElement('div');
+      el.className = 'ask-msg ' + (role === 'user' ? 'user' : 'ai') + (pending ? ' pending' : '');
+      el.innerHTML = (role === 'ai' ? '<span class="ask-gem sm">♦</span>' : '') + `<div class="ask-body">${html}</div>`;
+      box.appendChild(el);
+      box.scrollTop = box.scrollHeight;
+      return el;
+    }
+    async function send(q) {
+      if (sending || !q) return;
+      sending = true;
+      msgs.push({ role: 'user', content: q });
+      saveMsgs();
+      bubble('user', esc(q));
+      const wait = bubble('ai', '<span class="ask-dots"><i></i><i></i><i></i></span>', true);
+      const inp = panel.querySelector('#ask-in');
+      if (inp) { inp.value = ''; inp.focus(); }
+      try {
+        const r = await api('/api/ask', {
+          method: 'POST', body: JSON.stringify({
+            videoId: id, title: d.title || '', channel: d.channel?.name || '',
+            description: d.description || '', question: q,
+            history: msgs.slice(-9, -1),
+          }),
+        });
+        wait.remove();
+        msgs.push({ role: 'assistant', content: r.answer });
+        saveMsgs();
+        bubble('ai', mdLite(r.answer));
+      } catch (e) {
+        wait.remove();
+        bubble('ai', esc(e.status === 429 ? e.message : '応答に失敗しました。少し待ってからもう一度お試しください。'));
+      }
+      sending = false;
+    }
+    function open() {
+      if (panel) { panel.classList.add('open'); return; }
+      const host = document.createElement('div');
+      host.innerHTML = `
+        <div class="ask-scrim" id="ask-scrim"></div>
+        <div class="ask-panel open" id="ask-panel">
+          <div class="ask-head">
+            <span class="ask-gem">♦</span>
+            <div class="ask-htx">
+              <div class="ask-title">Ask</div>
+              <div class="ask-sub">この動画の概要欄を読み込んで回答します</div>
+            </div>
+            <button class="icon-btn" id="ask-x" title="閉じる"><svg viewBox="0 0 24 24" class="ic"><path d="M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12z"/></svg></button>
+          </div>
+          <div class="ask-msgs"></div>
+          <div class="ask-chips">
+            <button class="ask-chip" data-q="この動画の概要欄を3行で要約して">概要欄を要約</button>
+            <button class="ask-chip" data-q="この動画の見どころを3つ教えて">見どころは？</button>
+            <button class="ask-chip" data-q="概要欄のリンクやタイムスタンプを整理して">リンク・章を整理</button>
+          </div>
+          <form class="ask-form">
+            <input id="ask-in" type="text" placeholder="この動画について質問…" autocomplete="off" maxlength="1000">
+            <button class="ask-send" type="submit" title="送信" aria-label="送信"><svg viewBox="0 0 24 24" class="ic"><path d="M3 20v-6l8-2-8-2V4l19 8z"/></svg></button>
+          </form>
+          <div class="ask-foot">♦Ask by HavocPianoAI ・ Vandal</div>
+        </div>`;
+      app.appendChild(host);
+      panel = host.querySelector('#ask-panel');
+      host.querySelector('#ask-scrim').addEventListener('click', close);
+      host.querySelector('#ask-x').addEventListener('click', close);
+      host.querySelector('.ask-form').addEventListener('submit', (e) => {
+        e.preventDefault();
+        const v = host.querySelector('#ask-in').value.trim();
+        if (v) send(v);
+      });
+      host.querySelectorAll('.ask-chip').forEach(c => c.addEventListener('click', () => send(c.dataset.q)));
+      for (const m of msgs) bubble(m.role, m.role === 'user' ? esc(m.content) : mdLite(m.content));
+      if (!autoAsked) { autoAsked = true; send('この動画の概要欄を3行で要約して'); }
+    }
+    function close() {
+      panel?.classList.remove('open');
+      document.querySelector('#ask-scrim')?.classList.remove('open');
+      panel?.closest('#app > div')?.remove?.(); // overlay ごと破棄（再オープンは再生成。msgs は sessionStorage で保持）
+      panel = null;
+    }
+    btn.addEventListener('click', open);
+    // ページ離脱時に掃除
+    const obs = new MutationObserver(() => { if (!document.body.contains(btn)) { panel?.closest('#app > div')?.remove?.(); obs.disconnect(); } });
+    obs.observe(document.body, { childList: true, subtree: true });
   }
 
   function loadComments(d) {
@@ -1659,7 +1754,7 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
     const handle = cm.author?.startsWith('@') ? cm.author : (cm.author ? '@' + cm.author : '');
     return `
     <div class="cm">
-      <div class="vava" data-href="${authorHref}">${cm.avatar ? `<img loading="lazy" decoding="async" src="${esc(cm.avatar)}" alt="">` : ''}</div>
+      <div class="vava" data-href="${authorHref}">${cm.avatar ? `<img loading="lazy" src="${esc(cm.avatar)}" alt="">` : ''}</div>
       <div class="cm-body">
         <div class="cm-head"><span class="cm-author" data-href="${authorHref}">${esc(handle)}</span><span class="cm-time">${esc(cm.published || '')}</span></div>
         <div class="cm-text">${linkify(cm.text || '')}</div>
@@ -1677,32 +1772,43 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
   const ICON_LIST = '<svg viewBox="0 0 24 24" class="ic"><path d="M3 6h12v2H3zm0 4h12v2H3zm0 4h8v2H3zm14-8v7.5a3 3 0 1 0 2 2.8V8h3V6z"/></svg>';
   const ICON_LOOP = '<svg viewBox="0 0 24 24" class="ic"><path d="M7 7h10v3l4-4-4-4v3H5v6h2zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2z"/></svg>';
   const ICON_SHUFFLE = '<svg viewBox="0 0 24 24" class="ic"><path d="M10.6 9.2 8.9 7.5 4 7.5v2h4l1.7 1.7zm6.1 5.2-1.6 1.6-5.5-5.5 1.4-1.4 5.7 5.3zM14 4l4 4-4 4v-3c-4.95 0-7 3.5-8 8-.3-6 1.5-10 8-10z" opacity="0"/><path d="M14.1 7.4 10.6 3.9 14.1.4v2H18c3.3 0 6 2.7 6 6 0 1.6-.6 3-1.6 4.1l-1.4-1.4c.7-.8 1-1.7 1-2.7 0-2.2-1.8-4-4-4h-3.9zm-4.2 9.2 3.5 3.5-3.5 3.5v-2H6c-3.3 0-6-2.7-6-6 0-1.6.6-3 1.6-4.1l1.4 1.4c-.7.8-1 1.7-1 2.7 0 2.2 1.8 4 4 4h3.9z" transform="translate(-3 3)"/></svg>';
-  const plState = { items: [], idx: -1, loop: false, shuffle: false, title: '', owner: '', totalText: '' };
-  let plCont = null, plUsePanelNext = false, panelLoading = false, panelMoreObs = null;
+  const plState = { items: [], idx: -1, loop: false, shuffle: false, title: '', owner: '', total: 0 };
 
-  async function setupPlaylistPanel(lid, currentVid, panelData) {
+  /* プレイリスト文脈は sessionStorage 保存が一次情報源（即時・往復ゼロ・バグ耐性）。
+   * 読み込み順: (1)ローカルスナップショット即描画 → (2)裏で完全版を取得して追従。 */
+  const normPanelData = (p) => p?.items?.length ? {
+    title: p.title || '', owner: p.owner || '', total: p.totalText || p.total || 0,
+    items: p.items, continuation: p.continuation || null, usePanelNext: true,
+  } : null;
+  const normListData = (d) => d?.items?.length ? {
+    title: d.title || '', owner: d.channelName || '', total: d.items.length,
+    items: d.items, continuation: d.continuation || null, usePanelNext: !!d.panelNext,
+  } : null;
+  const normSnapData = (s) => s?.items?.length ? {
+    title: s.title || '', owner: s.owner || '', total: s.total || 0,
+    items: s.items, continuation: null, usePanelNext: true,
+  } : null;
+
+  let plCont = null, plUsePanelNext = true;
+
+  function adoptPanel(n) {
+    if (!n) return;
+    plState.title = n.title || plState.title || '再生リスト';
+    plState.owner = n.owner || plState.owner || '';
+    plState.total = n.total || plState.total || 0;
+    plState.items = n.items || plState.items;
+    plCont = n.continuation ?? plCont;
+    plUsePanelNext = !!n.usePanelNext;
+    plState.idx = plState.items.findIndex(x => x.id === id);
+  }
+
+  async function setupPlaylistPanel(lid, currentVid, panelData, snapshot) {
     try {
-      if (panelData?.items?.length) {
-        // パネルが watch 応答に同梱されている → そのまま使う (最速・追加往復ゼロ)
-        plState.title = panelData.title || '再生リスト';
-        plState.owner = panelData.owner || '';            // 以前は破棄されていた
-        plState.totalText = panelData.totalText || '';
-        plState.items = panelData.items;
-        plCont = panelData.continuation;
-        plUsePanelNext = true;                            // next エンドポイント系
-      } else {
-        const d = await api('/api/playlist/' + encodeURIComponent(lid), { ttl: 10 * 60e3 });
-        plState.title = d.title || '再生リスト';
-        plState.owner = d.channelName || '';
-        plState.totalText = '';
-        plState.items = d.items || [];
-        plCont = d.continuation;
-        plUsePanelNext = !!d.panelNext;
-      }
+      const seeded = !!(normPanelData(panelData) || normSnapData(snapshot));
+      adoptPanel(normPanelData(panelData) || normSnapData(snapshot));
+      if (!seeded) adoptPanel(normListData(await api('/api/playlist/' + encodeURIComponent(lid), { ttl: 10 * 60e3 })));
       if (destroyed || !document.body.contains(wrapEl)) return;
-      plState.idx = plState.items.findIndex(x => x.id === currentVid);
       const nextUrl = () => (plUsePanelNext ? '/api/playlist/panel-next?c=' : '/api/playlist/next?c=') + encodeURIComponent(plCont);
-      plState._nextUrl = nextUrl;
       // walk continuation pages until the current video shows up (max 3 more)
       let guard = 0;
       while (plState.idx < 0 && plCont && guard < 3) {
@@ -1716,94 +1822,70 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
       // index unknown (huge list): treat as first
       if (plState.idx < 0) plState.items.unshift({ id: currentVid, title: document.title, thumb: '', channel: plState.owner, duration: '' }), plState.idx = 0;
       drawPanel();
-      // 次の動画を事前ウォーム（自動送り・手動送りの初動を限界まで速くする）
-      const nx = plState.items[plState.idx + 1];
-      if (nx && /^[\w-]{11}$/.test(nx.id)) {
-        api('/api/watch/' + nx.id + '?list=' + encodeURIComponent(lid)).catch(() => {});
-        fetch('/api/warm/' + nx.id).catch(() => {});
-      }
+      PlCtx.save(lid, { title: plState.title, owner: plState.owner, total: plState.total, items: plState.items });
       // auto-advance
       video.addEventListener('ended', () => advance(1));
+      // スナップショット起点のときは、裏で完全版を取得して追従（タイトル/継続/残りの項目）
+      if (snapshot && !panelData) {
+        api('/api/playlist/' + encodeURIComponent(lid), { ttl: 10 * 60e3 }).then((full) => {
+          if (destroyed) return;
+          const n = normListData(full);
+          if (!n) return;
+          // ローカル保存済みの項目は信頼できるので、サーバー版が豊富なら差し替え
+          if (n.items.length >= plState.items.length || !plState.title || plState.title === '再生リスト') {
+            adoptPanel(n);
+            if (plState.idx < 0) { plState.items.unshift({ id: currentVid, title: document.title, thumb: '', channel: plState.owner, duration: '' }); plState.idx = 0; }
+            drawPanel();
+            PlCtx.save(lid, { title: plState.title, owner: plState.owner, total: plState.total, items: plState.items });
+          }
+        }).catch(() => { /* snapshot stays */ });
+      }
     } catch (_) { /* playlist panel is additive — never fatal */ }
   }
 
-  function panelRowHtml(v, i) {
-    return `
-      <div class="plp-item ${i === plState.idx ? 'active' : ''}" data-plgo="${i}">
-        <span class="plp-idx">${i === plState.idx ? '<svg viewBox="0 0 24 24" class="ic" style="width:14px;height:14px"><path d="M8 5v14l11-7z"/></svg>' : (i + 1)}</span>
-        <div class="vthumb"><img loading="lazy" decoding="async" src="${esc(v.thumb || ('https://i.ytimg.com/vi/' + v.id + '/hqdefault.jpg'))}" alt="">${v.duration ? `<span class="dur">${esc(v.duration)}</span>` : ''}</div>
-        <div class="vinfo"><div class="plp-tt">${esc(v.title || '')}</div><div class="vsub" style="font-size:12px">${esc(v.channel || '')}</div></div>
-      </div>`;
-  }
-
-  async function loadMorePanel() {
-    if (!plCont || panelLoading || destroyed) return;
-    panelLoading = true;
-    try {
-      const n = await api(plState._nextUrl(), { ttl: 10 * 60e3 });
-      plCont = n.continuation;
-      const base = plState.items.length;
-      plState.items = plState.items.concat(n.items || []);
-      const scroller = $('#rail .plp .plp-items');
-      if (scroller) {
-        scroller.insertAdjacentHTML('beforeend', (n.items || []).map((v, i) => panelRowHtml(v, base + i)).join(''));
-        wirePanelItemClicks(scroller);
-        wirePanelMore();
-      }
-    } catch (_) { /* optional */ }
-    panelLoading = false;
-  }
-
-  /** パネル末尾近くまでスクロールしたら続きを自動読み込み（本家同等） */
-  function wirePanelMore() {
-    panelMoreObs?.disconnect();
-    panelMoreObs = null;
-    if (!plCont) return;
-    const scroller = $('#rail .plp .plp-items');
-    if (!scroller) return;
-    const rows = scroller.querySelectorAll('.plp-item');
-    const last = rows[rows.length - 1];
-    if (!last) return;
-    panelMoreObs = new IntersectionObserver((es) => {
-      if (es.some(e => e.isIntersecting)) loadMorePanel();
-    }, { root: scroller, rootMargin: '240px' });
-    panelMoreObs.observe(last);
-  }
-
-  function wirePanelItemClicks(scope) {
-    scope.querySelectorAll('[data-plgo]').forEach(r => {
-      if (r._wired) return;
-      r._wired = true;
-      r.addEventListener('click', (e) => {
-        e.stopPropagation();
-        const v = plState.items[+r.dataset.plgo];
-        if (v) location.hash = '#/watch?v=' + v.id + '&list=' + encodeURIComponent(listId);
-      });
-    });
+  /** watch 応答にパネルが同梱されていた場合の後追い更新 */
+  function updatePlaylistPanel(panelData) {
+    const n = normPanelData(panelData);
+    if (!n) return;
+    adoptPanel(n);
+    if (plState.idx < 0) plState.idx = 0;
+    drawPanel();
+    PlCtx.save(listId, { title: plState.title, owner: plState.owner, total: plState.total, items: plState.items });
   }
 
   function drawPanel() {
     const rail = $('#rail');
     if (!rail) return;
     rail.querySelector('.plp')?.remove();
-    const rows = plState.items.map((v, i) => panelRowHtml(v, i)).join('');
+    const rows = plState.items.map((v, i) => `
+      <div class="plp-item ${i === plState.idx ? 'active' : ''}" data-plgo="${i}">
+        <span class="plp-idx">${i === plState.idx ? '<svg viewBox="0 0 24 24" class="ic" style="width:14px;height:14px"><path d="M8 5v14l11-7z"/></svg>' : (i + 1)}</span>
+        <div class="vthumb"><img loading="lazy" src="${esc(v.thumb || ('https://i.ytimg.com/vi/' + v.id + '/hqdefault.jpg'))}" alt="">${v.duration ? `<span class="dur">${esc(v.duration)}</span>` : ''}</div>
+        <div class="vinfo"><div class="plp-tt">${esc(v.title || '')}</div><div class="vsub" style="font-size:12px">${esc(v.channel || '')}</div></div>
+      </div>`).join('');
+    const totalTxt = plState.total && Number(plState.total) > plState.items.length ? plState.total : plState.items.length;
     rail.insertAdjacentHTML('afterbegin', `
       <div class="plp">
         <div class="plp-head">
           <div class="plp-t1">
             <span class="plp-ic">${ICON_LIST}</span>
-            <span class="plp-name" title="${esc(plState.title)}">${esc(plState.title)}</span>
+            <span class="plp-name">${esc(plState.title)}</span>
             <div class="plp-spacer"></div>
             <button class="icon-btn plp-btn ${plState.shuffle ? 'on' : ''}" data-plact="shuffle" title="シャッフル">${ICON_SHUFFLE}</button>
             <button class="icon-btn plp-btn ${plState.loop ? 'on' : ''}" data-plact="loop" title="ループ再生">${ICON_LOOP}</button>
             <button class="icon-btn plp-btn" data-plact="fold" title="折りたたむ"><svg viewBox="0 0 24 24" class="ic"><path d="M7.4 8.6 12 13.2l4.6-4.6L18 10l-6 6-6-6z"/></svg></button>
           </div>
-          <div class="plp-sub">${esc(plState.owner || '再生リスト')} ・ ${plState.idx + 1} / ${esc(plState.totalText || String(plState.items.length))}</div>
+          <div class="plp-sub">${esc(plState.owner || '再生リスト')} ・ ${plState.idx + 1} / ${totalTxt}</div>
         </div>
         <div class="plp-items">${rows}</div>
       </div>`);
     const panel = rail.querySelector('.plp');
-    wirePanelItemClicks(panel);
+    panel.querySelectorAll('[data-plgo]').forEach(r => r.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const i = +r.dataset.plgo;
+      const v = plState.items[i];
+      if (v) location.hash = '#/watch?v=' + v.id + '&list=' + encodeURIComponent(listId);
+    }));
     panel.querySelectorAll('[data-plact]').forEach(b => b.addEventListener('click', (e) => {
       e.stopPropagation();
       const act = b.dataset.plact;
@@ -1812,7 +1894,6 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
       if (act === 'fold') { panel.classList.toggle('folded'); b.querySelector('svg').style.transform = panel.classList.contains('folded') ? 'rotate(180deg)' : ''; }
     }));
     panel.querySelector('.plp-item.active')?.scrollIntoView({ block: 'center' });
-    wirePanelMore();
   }
 
   function advance(step) {
@@ -1838,21 +1919,15 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
   function fillRail(d) {
     const rail = $('#rail');
     if (!rail) return;
+    // 即時描画済みの再生リストパネルは生きたまま最上段に温存（イベントリスナごと）
+    const plp = rail.querySelector('.plp');
     const vids = (d.related || []).filter(i => i.kind === 'video');
     const shorts = (d.related || []).filter(i => i.kind === 'short');
-    const autoOn = Store.get('autoplay', true);
     rail.innerHTML =
-      (listId ? '' : `<div class="rail-tools"><span>自動再生</span><button class="ap-toggle ${autoOn ? 'on' : ''}" id="ap-toggle" role="switch" aria-checked="${autoOn}" title="自動再生"><span class="ap-knob"></span></button></div>`) +
       vids.slice(0, 6).map(railCard).join('') +
       (shorts.length ? shortsShelf(shorts, { compact: true }) : '') +
       vids.slice(6).map(railCard).join('');
-    $('#ap-toggle')?.addEventListener('click', function () {
-      const on = !Store.get('autoplay', true);
-      Store.set('autoplay', on);
-      this.classList.toggle('on', on);
-      this.setAttribute('aria-checked', String(on));
-      toast(on ? '自動再生をオンにしました' : '自動再生をオフにしました');
-    });
+    if (plp) rail.insertBefore(plp, rail.firstChild);
   }
 }
 
@@ -1930,40 +2005,46 @@ function renderPlaylist(params) {
   app.innerHTML = skGrid(10);
   api('/api/playlist/' + encodeURIComponent(list), { ttl: 10 * 60e3 })
     .then(d => {
-      const items = d.items || [];
-      const first = items[0];
-      const itemHtml = (v, i) => `
-        <div class="pl-item" data-href="#/watch?v=${esc(v.id)}&list=${esc(list)}">
-          <span class="idx">${i + 1}</span>
-          <div class="vthumb"><img loading="lazy" decoding="async" src="${esc(thumbUrl(v))}" alt="">${v.duration ? `<span class="dur">${esc(v.duration)}</span>` : ''}</div>
-          <div class="vinfo"><div class="vtitle">${esc(v.title)}</div><div class="vsub">${esc(v.channel || '')}</div></div>
-        </div>`;
+      const allItems = [...(d.items || [])];
+      // プレイリスト文脈をローカル保存（視聴ページはこれを一次情報源に即時描画）
+      PlCtx.save(list, { title: d.title, owner: d.channelName, total: d.total || allItems.length, items: allItems });
+      const rowHtml = (v, idx) => `
+            <div class="pl-item" data-href="#/watch?v=${esc(v.id)}&list=${esc(list)}">
+              <span class="idx">${idx}</span>
+              <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(v))}" alt="">${v.duration ? `<span class="dur">${esc(v.duration)}</span>` : ''}</div>
+              <div class="vinfo"><div class="vtitle">${esc(v.title)}</div><div class="vsub">${esc(v.channel || '')}</div></div>
+            </div>`;
       app.innerHTML = `
       <div class="pl-page">
         <div class="pl-side">
-          ${first ? `<div class="pl-thumb"><img src="${esc(thumbUrl(first))}" alt=""></div>` : ''}
+          ${allItems[0] ? `<div class="pl-thumb"><img src="${esc(thumbUrl(allItems[0]))}" alt=""></div>` : ''}
           <h1>${esc(d.title || '再生リスト')}</h1>
-          <div class="pl-meta">${esc(d.channelName || '')}${d.views ? '<br>' + esc(d.views) : ''}<br>${items.length}${d.continuation ? '+' : ''} 本の動画</div>
-          ${first ? `<a class="pl-playall" href="#/watch?v=${esc(first.id)}&list=${esc(list)}"><svg viewBox="0 0 24 24" class="ic"><path d="M8 5v14l11-7z"/></svg>すべて再生</a>` : ''}
+          <div class="pl-meta">${esc(d.channelName || '')}<br>${d.views ? esc(d.views) + '<br>' : ''}${allItems.length} 本の動画${d.isInfinite ? '（ミックス）' : ''}</div>
         </div>
         <div id="pl-items">
-          ${items.map((v, i) => itemHtml(v, i)).join('')}
+          ${allItems.map((v, i) => rowHtml(v, i + 1)).join('')}
         </div>
       </div>`;
       if (d.continuation) {
         let cont = d.continuation, loading = false;
-        let loaded = items.length; // 番号は件数カウンタで管理（sentinel要素を数える従来方式は1ズレた）
-        const nextEp = d.panelNext ? '/api/playlist/panel-next?c=' : '/api/playlist/next?c='; // ミックスは next 系
-        const sent = lazySentinel($('#pl-items'), () => {
+        // ミックス (panelNext=true) は browse 系ではなく next 系の続き読み込みへ正しく振り分け
+        const nextBase = d.panelNext ? '/api/playlist/panel-next?c=' : '/api/playlist/next?c=';
+        const box = $('#pl-items');
+        let loaded = allItems.length; // 専用カウンタ（sentinel を件数に数えない）
+        const sent = lazySentinel(box, () => {
           if (loading || !cont) return;
           loading = true;
-          api(nextEp + encodeURIComponent(cont), { ttl: 10 * 60e3 })
+          api(nextBase + encodeURIComponent(cont), { ttl: 10 * 60e3 })
             .then(n => {
-              loading = false; cont = n.continuation;
-              // sentinel の「直前」へ挿入（従来は末尾に追加され sentinel が中間に取り残されていた）
-              sent.el.insertAdjacentHTML('beforebegin', (n.items || []).map((v, i) => itemHtml(v, loaded + i)).join(''));
-              loaded += (n.items || []).length;
+              loading = false;
+              const items = n.items || [];
+              cont = n.continuation;
               if (!cont) sent.done();
+              // sentinel 直前に挿入（構造の破壊・番号のズレを防ぐ）
+              sent.el.insertAdjacentHTML('beforebegin', items.map((v, i) => rowHtml(v, loaded + i + 1)).join(''));
+              loaded += items.length;
+              allItems.push(...items);
+              PlCtx.save(list, { title: d.title, owner: d.channelName, total: loaded, items: allItems });
             })
             .catch(() => { loading = false; });
         });
@@ -2006,8 +2087,225 @@ function renderShortsHome(chip = 0) {
   }
 }
 
-function renderShort(id) {
-  return renderWatch(new URLSearchParams('v=' + id), { vertical: true, shortId: id });
+/* ---------------- dedicated Shorts player (本家ショート風・全画面縦型) --------
+ * 下スクロール / スワイプ / ↓キーで次のショートへ移行。キューはクリック元の
+ * シェルフから sessionStorage 経由で引き継ぎ、末尾近くでフィードを自動補充。 */
+function renderShort(firstId) {
+  setActiveNav('shorts');
+  document.documentElement.classList.add('sh-lock');
+
+  let q = shqLoad() || { ids: [], meta: {} };
+  if (!q.ids.includes(firstId)) { q.ids.unshift(firstId); }
+  let idx = q.ids.indexOf(firstId);
+  let destroyed = false;
+  let navCool = 0;
+  let watchData = null;
+  let rescuedFor = null; // 動画ごと1回だけのストリーム復旧
+
+  app.innerHTML = `
+  <div class="shp" id="shp">
+    <div class="shp-stage" id="shp-stage">
+      <video class="shp-video" id="shp-video" playsinline autoplay preload="auto"></video>
+      <div class="shp-spin" data-sh-spin><div class="mini-spin light"></div></div>
+      <div class="shp-grad"></div>
+      <div class="shp-info">
+        <div class="shp-title" id="shp-title"></div>
+        <div class="shp-ch">
+          <div class="shp-ava" id="shp-ava"></div>
+          <span class="shp-chname" id="shp-chname"></span>
+          <button class="shp-sub" id="shp-sub">登録</button>
+        </div>
+      </div>
+      <div class="shp-progress"><div class="shp-bar" id="shp-bar"></div></div>
+      <div class="shp-rail" id="shp-rail">
+        <button class="shp-act" data-sh="like" title="高く評価"><svg viewBox="0 0 24 24" class="ic"><path d="M2 21h4V9H2zM22 10c0-1.1-.9-2-2-2h-6.3l.9-4.6c0-.9-.8-1.5-.8-1.5L12.7 1 6.2 8.6C5.8 8.9 5 9.5 5 10v10c0 1.1.9 2 2 2h9c.8 0 1.5-.5 1.8-1.2l3-7.1c.1-.2.2-.5.2-.7z"/></svg><span id="shp-likes"></span></button>
+        <button class="shp-act" data-sh="comments" title="コメント"><svg viewBox="0 0 24 24" class="ic"><path d="M20 2H4a2 2 0 0 0-2 2v18l4-4h14a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z"/></svg><span id="shp-cmcount"></span></button>
+        <button class="shp-act" data-sh="share" title="共有"><svg viewBox="0 0 24 24" class="ic"><path d="M14 9V5l7 7-7 7v-4.1c-5 0-8.5 1.6-11 5.1 1-5 4-10 11-11z"/></svg><span>共有</span></button>
+        <button class="shp-act" data-sh="save" title="保存"><svg viewBox="0 0 24 24" class="ic"><path d="M17 3H7a2 2 0 0 0-2 2v16l7-5 7 5V5a2 2 0 0 0-2-2z"/></svg><span>保存</span></button>
+        <button class="shp-act" data-sh="open" title="通常プレイヤーで開く"><svg viewBox="0 0 24 24" class="ic"><path d="M4 4h7v2H6v12h12v-5h2v7H4zM14 4h6v6h-2V7.4l-6.3 6.3-1.4-1.4L16.6 6H14z"/></svg><span>詳細</span></button>
+      </div>
+    </div>
+    <div class="shp-navs">
+      <button class="shp-nav" id="shp-prev" title="前の動画 (↑)"><svg viewBox="0 0 24 24" class="ic"><path d="M7.4 15.4 12 10.8l4.6 4.6L18 14l-6-6-6 6z"/></svg></button>
+      <button class="shp-nav" id="shp-next" title="次の動画 (↓)"><svg viewBox="0 0 24 24" class="ic"><path d="M7.4 8.6 12 13.2l4.6-4.6L18 10l-6 6-6-6z"/></svg></button>
+    </div>
+  </div>`;
+
+  const video = $('#shp-video');
+  const stage = $('#shp-stage');
+  const spin = () => { const s = stage.querySelector('[data-sh-spin]'); return s; };
+  const showSpin = (on) => spin()?.classList.toggle('hidden', !on);
+
+  function entry() {
+    const id = q.ids[idx];
+    const m = (q.meta || {})[id] || {};
+    return { v: id, t: watchData?.title || m.title || '', cn: watchData?.channel?.name || '', ch: watchData?.channel?.id || '', d: watchData?.lengthSeconds || 0 };
+  }
+
+  async function loadCurrent(animate) {
+    const id = q.ids[idx];
+    if (!id) return;
+    watchData = null;
+    rescuedFor = null;
+    history.replaceState(null, '', '#/shorts/' + id);
+    const m = (q.meta || {})[id] || {};
+    $('#shp-title').textContent = m.title || '';
+    $('#shp-chname').textContent = '';
+    $('#shp-ava').innerHTML = '';
+    $('#shp-likes').textContent = '';
+    $('#shp-cmcount').textContent = '';
+    showSpin(true);
+    try {
+      video.removeAttribute('src'); video.load();
+      video.src = `/api/stream?v=${id}&itag=18`;
+      video.muted = false;
+      await video.play().catch(() => { video.muted = true; return video.play().catch(() => {}); });
+      document.title = (m.title || 'ショート') + ' - Vandal';
+    } catch (_) { /* watchdog below covers */ }
+    // メタは裏で充填（タイトル/チャンネル/高評価数/コメント数）
+    api('/api/watch/' + id, { ttl: 3 * 60e3 }).then((d) => {
+      if (destroyed || q.ids[idx] !== id) return;
+      watchData = d;
+      $('#shp-title').textContent = d.title || m.title || '';
+      $('#shp-chname').textContent = d.channel?.name || '';
+      $('#shp-ava').innerHTML = d.channel?.avatar ? `<img src="${esc(d.channel.avatar)}" alt="">` : '';
+      $('#shp-likes').textContent = d.likeCount || '';
+      $('#shp-cmcount').textContent = d.commentsCount || '';
+      document.title = (d.title || 'ショート') + ' - Vandal';
+      const subbed = Subs.has(d.channel?.id);
+      const sb = $('#shp-sub');
+      if (sb) { sb.textContent = subbed ? '登録済み' : '登録'; sb.classList.toggle('subbed', !!subbed); }
+    }).catch(() => {});
+    History.add(entry());
+    // 次の1本を温める（スクロールした瞬間に再生が始まるように）
+    const nx = q.ids[idx + 1];
+    if (nx) { fetch('/api/warm/' + nx).catch(() => {}); api('/api/watch/' + nx).catch(() => {}); }
+    // 末尾接近: フィードでキューを自動補充
+    if (idx + 3 >= q.ids.length) refill();
+    if (animate) {
+      stage.animate([{ transform: 'translateY(14px)', opacity: 0 }, { transform: 'none', opacity: 1 }], { duration: 180, easing: 'ease-out' });
+    }
+  }
+
+  let refilling = false;
+  async function refill() {
+    if (refilling) return;
+    refilling = true;
+    try {
+      const d = await api('/api/shorts', { ttl: 15 * 60e3 });
+      const fresh = (d.items || []).map(i => i.id).filter(v => /^[\w-]{11}$/.test(v || ''));
+      const seen = new Set(q.ids);
+      for (const id of fresh) if (!seen.has(id)) { seen.add(id); q.ids.push(id); }
+      for (const it of d.items || []) if (it.id && !q.meta[it.id]) q.meta[it.id] = { title: it.title || '', views: it.views || '' };
+      shqSave(q.ids, q.meta);
+    } catch (_) { /* additive */ }
+    refilling = false;
+  }
+
+  function nav(step) {
+    const now = Date.now();
+    if (now - navCool < 420) return;
+    const n = idx + step;
+    if (n < 0 || n >= q.ids.length) {
+      if (n >= q.ids.length) refill();
+      return;
+    }
+    navCool = now;
+    idx = n;
+    stage.animate(
+      [{ transform: `translateY(0)`, opacity: 1 }, { transform: `translateY(${step > 0 ? -26 : 26}px)`, opacity: 0 }],
+      { duration: 130, easing: 'ease-in' });
+    setTimeout(() => { if (!destroyed) loadCurrent(true); }, 120);
+  }
+
+  video.addEventListener('playing', () => showSpin(false));
+  video.addEventListener('waiting', () => showSpin(true));
+  video.addEventListener('ended', () => nav(1));
+  video.addEventListener('click', () => { video.paused ? video.play().catch(() => {}) : video.pause(); });
+  video.addEventListener('timeupdate', () => {
+    const bar = $('#shp-bar');
+    if (bar && video.duration) bar.style.width = ((video.currentTime / video.duration) * 100).toFixed(2) + '%';
+  });
+  video.addEventListener('error', async () => {
+    const id = q.ids[idx];
+    if (!id || rescuedFor === id) return;
+    rescuedFor = id;
+    showSpin(true);
+    await api('/api/player/refresh', { method: 'POST', body: JSON.stringify({ v: id }) }).catch(() => null);
+    if (destroyed || q.ids[idx] !== id) return;
+    api.invalidate('/api/watch/' + id);
+    video.src = `/api/stream?v=${id}&itag=18&_=${Date.now()}`;
+    video.play().catch(() => {});
+  });
+
+  // wheel / touch / keyboard navigation
+  const onWheel = (e) => {
+    e.preventDefault();
+    if (Math.abs(e.deltaY) < 32) return;
+    nav(e.deltaY > 0 ? 1 : -1);
+  };
+  let tsY = null;
+  const onTs = (e) => { tsY = e.touches[0].clientY; };
+  const onTe = (e) => {
+    if (tsY == null) return;
+    const dy = tsY - e.changedTouches[0].clientY;
+    tsY = null;
+    if (Math.abs(dy) > 52) nav(dy > 0 ? 1 : -1);
+  };
+  const onKey = (e) => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); nav(1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); nav(-1); }
+  };
+  stage.addEventListener('wheel', onWheel, { passive: false });
+  stage.addEventListener('touchstart', onTs, { passive: true });
+  stage.addEventListener('touchend', onTe, { passive: true });
+  document.addEventListener('keydown', onKey);
+
+  $('#shp-prev').addEventListener('click', () => nav(-1));
+  $('#shp-next').addEventListener('click', () => nav(1));
+  $('#shp-rail').addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-sh]');
+    if (!b) return;
+    const act = b.dataset.sh;
+    const en = entry();
+    if (act === 'like') {
+      const liked = Likes.toggle(en);
+      b.classList.toggle('on', liked);
+      toast(liked ? '高く評価しました（この端末に保存）' : '取り消しました');
+    } else if (act === 'comments') {
+      location.hash = '#/watch?v=' + en.v;
+    } else if (act === 'share') {
+      const url = location.origin + location.pathname + '#/shorts/' + en.v;
+      try { await navigator.clipboard.writeText(url); toast('リンクをコピーしました'); } catch (_) { toast(url, 6000); }
+    } else if (act === 'save') {
+      const saved = Saves.toggle(en);
+      b.classList.toggle('on', saved);
+      toast(saved ? '保存しました（この端末に保存）' : '取り消しました');
+    } else if (act === 'open') {
+      location.hash = '#/watch?v=' + en.v;
+    }
+  });
+  $('#shp-sub').addEventListener('click', function () {
+    const ch = watchData?.channel;
+    if (!ch?.id) return;
+    const subbed = Subs.toggle({ id: ch.id, name: ch.name, avatar: ch.avatar });
+    this.textContent = subbed ? '登録済み' : '登録';
+    this.classList.toggle('subbed', subbed);
+    toast(subbed ? 'チャンネル登録しました（この端末に保存）' : '登録を解除しました');
+  });
+  // ローカル保存状態の初期反映
+  $('#shp-rail [data-sh="like"]').classList.toggle('on', false);
+  app.querySelector('[data-sh="like"]')?.classList.toggle('on', Likes.has(q.ids[idx]));
+  app.querySelector('[data-sh="save"]')?.classList.toggle('on', Saves.has(q.ids[idx]));
+
+  loadCurrent(false);
+
+  return { destroy() {
+    destroyed = true;
+    document.documentElement.classList.remove('sh-lock');
+    document.removeEventListener('keydown', onKey);
+    try { video.pause(); video.removeAttribute('src'); video.load(); } catch (_) { /* noop */ }
+  } };
 }
 
 /* ================================================================= MY PAGE */
@@ -2170,14 +2468,6 @@ sInput.addEventListener('keydown', (e) => {
   } else if (e.key === 'Escape') sBox.classList.add('hidden');
 });
 
-/* '/' で検索へフォーカス（YouTube同等ショートカット） */
-document.addEventListener('keydown', (e) => {
-  if (e.key !== '/') return;
-  if (/INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName || '')) return;
-  e.preventDefault();
-  $('#search-input')?.focus();
-});
-
 /* options menu */
 $('#opts-btn').addEventListener('click', (e) => {
   e.stopPropagation();
@@ -2203,7 +2493,7 @@ $('#menu-btn').addEventListener('click', () => {
 });
 
 /* done callback to signal full load */
-console.log('%c llytpr-wl.v01nh %c Made by Kakinie with llytpr-wl.v01nh TEAM. V1 ', 'background:#f03;color:#fff;border-radius:4px;padding:2px 6px', 'color:#888');
+console.log('%c Vandal %c Made by Kakinie with llytpr-wl.v01nh TEAM. V1 ', 'background:#ff5a1e;color:#fff;border-radius:4px;padding:2px 6px;font-weight:800', 'color:#888');
 render();
 
 })();
