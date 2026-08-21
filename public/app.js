@@ -179,11 +179,35 @@ function buildProfile() {
 
 /* ----------------------------------------------------------------- api kit */
 const mem = new Map();
-async function api(path, { ttl = 5 * 60e3, method = 'GET', body } = {}) {
+/**
+ * api — メモリキャッシュ + 同一リクエスト束ね + (オプション) セッション持続キャッシュ。
+ *
+ * 高速化（初回の待ち短縮）: persist ミリ秒を渡すと成功応答を sessionStorage に
+ * 保存し、セッション内の再訪（検索→動画→戻る など）はネットワーク往復ゼロで
+ * 即描画される。動画 URL を含む watch 系には使わない（鮮度が命のため）。
+ */
+function scGet(key) {
+  try {
+    const raw = sessionStorage.getItem('llytpr:sc:' + key);
+    if (!raw) return undefined;
+    const j = JSON.parse(raw);
+    if (j && j.exp > Date.now()) return j.d;
+    sessionStorage.removeItem('llytpr:sc:' + key);
+  } catch (_) { /* quota / private mode */ }
+  return undefined;
+}
+function scSet(key, d, ttl) {
+  try { sessionStorage.setItem('llytpr:sc:' + key, JSON.stringify({ d, exp: Date.now() + ttl })); } catch (_) { /* quota */ }
+}
+async function api(path, { ttl = 5 * 60e3, method = 'GET', body, persist = 0 } = {}) {
   const key = method + ':' + path + (body ? ':' + body : '');
   if (method === 'GET') {
     const hit = mem.get(key);
     if (hit && hit.exp > Date.now()) return hit.data;
+    if (persist) {
+      const s = scGet(key);
+      if (s !== undefined) { mem.set(key, { data: s, exp: Date.now() + ttl }); return s; }
+    }
   }
   const inflight = api._inflight.get(key);
   if (inflight) return inflight;
@@ -194,7 +218,10 @@ async function api(path, { ttl = 5 * 60e3, method = 'GET', body } = {}) {
   }).then(async (res) => {
     const j = await res.json().catch(() => ({}));
     if (!res.ok) { const e = new Error(j.error || ('HTTP ' + res.status)); e.status = res.status; e.payload = j; throw e; }
-    if (method === 'GET') mem.set(key, { data: j, exp: Date.now() + ttl });
+    if (method === 'GET') {
+      mem.set(key, { data: j, exp: Date.now() + ttl });
+      if (persist) scSet(key, j, persist);
+    }
     api._inflight.delete(key);
     return j;
   }).catch(e => { api._inflight.delete(key); throw e; });
@@ -496,6 +523,8 @@ function render() {
   if (currentPage?.destroy) { try { currentPage.destroy(); } catch (_) {} }
   currentPage = null;
   window.scrollTo(0, 0);
+  // 狭い画面ではナビゲーション時にドロワーを自動で閉じる
+  if (window.innerWidth < 1100 && document.body.classList.contains('nav-open')) applyNav(false, { save: false });
   for (const [pat, fn] of routes) {
     const m = path.match(pat);
     if (m) { currentPage = fn(...m.slice(1), params) || null; return; }
@@ -507,6 +536,7 @@ window.addEventListener('hashchange', render);
 /* ---------------------------------------------------------------- nav sync */
 function setActiveNav(key) {
   $$('#mini-guide .guide-item').forEach(a => a.classList.toggle('active', a.dataset.nav === key));
+  $$('#bottom-nav a').forEach(a => a.classList.toggle('active', a.dataset.nav === key));
 }
 
 /* ==================================================================== HOME */
@@ -570,9 +600,30 @@ function renderHome(chip = sessionStorage.getItem('chip') || 'all') {
   renderHomePreset(body, chip);
 
   function renderHomePreset(b, c) {
-    api('/api/home?chip=' + encodeURIComponent(c), { ttl: 15 * 60e3 })
-      .then((d) => { if (document.body.contains(b)) drawHomeItems(b, d.items || []); })
-      .catch(e => errBox('ホームを読み込めませんでした: ' + e.message, () => renderHome(chip)));
+    // 高速化: 前回表示したホームを localStorage スナップショットから即描画し、
+    // 裏で最新を取得（stale-while-revalidate）。2回目以降の訪問は一瞬で画面が出る。
+    const SNAP_KEY = 'snap:home:' + c;
+    const snap = Store.get(SNAP_KEY, null);
+    let snapDrawn = false;
+    if (snap?.items?.length && Date.now() - (snap.ts || 0) < 30 * 60e3) {
+      const watched = new Set(History.list().map(h => h.v));
+      const items = (snap.items || []).filter(i => !watched.has(i.id));
+      if (items.length) { drawHomeItems(b, items); snapDrawn = true; }
+    }
+    api('/api/home?chip=' + encodeURIComponent(c), { ttl: 15 * 60e3, persist: 10 * 60e3 })
+      .then((d) => {
+        if (!document.body.contains(b)) return;
+        if (d.items?.length) {
+          Store.set(SNAP_KEY, { ts: Date.now(), items: d.items.slice(0, 60) });
+          // スナップショット描画済み & 中身が同じなら再描画しない（カクつき防止）
+          const same = snapDrawn && snap?.items?.length
+            && snap.items.slice(0, 6).every((s, i) => d.items[i] && s.id === d.items[i].id);
+          if (!same) drawHomeItems(b, d.items || []);
+        } else if (!snapDrawn) {
+          drawHomeItems(b, []);
+        }
+      })
+      .catch(() => { if (!snapDrawn && document.body.contains(b)) errBox('ホームを読み込めませんでした', () => renderHome(chip)); });
   }
 }
 
@@ -673,7 +724,7 @@ function renderResults(params) {
       .catch(() => { spin.remove(); loading = false; });
   }
 
-  api('/api/search?q=' + encodeURIComponent(q), { ttl: 10 * 60e3 })
+  api('/api/search?q=' + encodeURIComponent(q), { ttl: 10 * 60e3, persist: 5 * 60e3 })
     .then(d => {
       allItems = d.items || [];
       continuation = d.continuation;
@@ -1772,7 +1823,11 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
   function loadComments(d) {
     const box = $('#comments');
     if (!box) return;
-    api('/api/comments/' + id, { ttl: 5 * 60e3 })
+    // 高速化: watch 応答に同梱の commentsToken を再利用 → サーバー側の
+    // トークン発見往復が消えてコメント表示が約半分の速度に。
+    // （サーバーは watch 応答時にコメントを先行取得済み = キャッシュヒットが多い）
+    const token = d?.commentsToken ? '?token=' + encodeURIComponent(d.commentsToken) : '';
+    api('/api/comments/' + id + token, { ttl: 5 * 60e3 })
       .then((c) => {
         if (destroyed || !document.body.contains(box)) return;
         if (c.disabled && !(c.comments || []).length) {
@@ -2000,7 +2055,7 @@ function renderChannel(rawId, params) {
       ${skGrid(8)}
     </div>`;
 
-  api(`/api/channel/${encodeURIComponent(id)}${tabParams ? '?params=' + encodeURIComponent(tabParams) : ''}${cont ? (tabParams ? '&' : '?') + 'c=' + encodeURIComponent(cont) : ''}`, { ttl: 8 * 60e3 })
+  api(`/api/channel/${encodeURIComponent(id)}${tabParams ? '?params=' + encodeURIComponent(tabParams) : ''}${cont ? (tabParams ? '&' : '?') + 'c=' + encodeURIComponent(cont) : ''}`, { ttl: 8 * 60e3, persist: 5 * 60e3 })
     .then((d) => {
       const tabsHtml = (d.tabs || []).map(t =>
         `<a class="ch-tab ${t.selected || (!tabParams && t.title === 'ホーム') ? 'active' : ''}" href="#/channel/${encodeURIComponent(id)}${t.params ? '?params=' + encodeURIComponent(t.params) : ''}">${esc(t.title)}</a>`).join('');
@@ -2127,7 +2182,7 @@ function renderShortsHome(chip = 0) {
   };
   const q = SHORT_CHIPS[chip][1];
   if (!q) {
-    api('/api/shorts', { ttl: 15 * 60e3 })
+    api('/api/shorts', { ttl: 15 * 60e3, persist: 10 * 60e3 })
       .then(d => draw(d.items || [], 'ショート'))
       .catch(() => errBox('読み込めませんでした', () => renderShortsHome(chip)));
   } else {
@@ -2443,6 +2498,456 @@ function renderSubscriptions() {
   });
 }
 
+/* ========================================================== SETTINGS (+診断) */
+/**
+ * 設定・診断ページ（#/settings）
+ *  - エンジン設定: プロキシ運用モード / プールサイズ / 先読み量 / 各種トグル
+ *  - プロキシプール: 生きているプロキシの一覧・等級（L1/L2/L3）をライブ表示
+ *  - プロキシレース: L1→L2→L3 段階選抜の同時レースを実行して勝者を決定
+ *  - ストリーム取得テスト: 発行〜初バイトまでの実測タイミング
+ *  - メタ情報取得テスト: watchNext / コメント(トークン有無) / 検索のタイミング
+ *  - ライブログ: サーバー内の超細かいログを SSE でリアルタイム閲覧
+ */
+function renderSettings() {
+  setActiveNav('settings');
+  let destroyed = false;
+  const timers = [];
+  let es = null;          // EventSource (SSE ログ)
+  let esPaused = false;
+  let logLines = 0;
+
+  app.innerHTML = `
+  <div class="set-page">
+    <div class="set-head">
+      <img src="/logo-mark.svg" alt="" class="set-logo">
+      <div>
+        <h1>設定・診断</h1>
+        <p class="set-sub">エンジンの挙動変更・プロキシの実測テスト・超精密ライブログ</p>
+      </div>
+      <div class="set-head-stats" id="st-summary"></div>
+    </div>
+
+    <!-- ================= エンジン設定 ================= -->
+    <section class="set-card" id="sec-engine">
+      <h2><span class="set-ic">⚙️</span>エンジン設定 <span class="set-badge" id="cfg-dirty" style="display:none">未保存</span></h2>
+      <div class="set-grid">
+        <div class="set-field span2">
+          <label>プロキシ運用モード <span class="set-hint">InnerTube 発行と中継にプロキシをどう使うか</span></label>
+          <div class="seg" id="cfg-proxyMode">
+            <button data-v="auto" class="sel">自動<small>プロキシ優先 + 直結保険</small></button>
+            <button data-v="proxy">プロキシのみ<small>直結を極力使わない</small></button>
+            <button data-v="direct">直結のみ<small>プロキシ不使用（BAN時は不可）</small></button>
+          </div>
+        </div>
+        <div class="set-field">
+          <label>プール維持数 <output id="cfg-poolSize-o"></output><span class="set-hint">常時温存するプロキシの数</span></label>
+          <input type="range" id="cfg-poolSize" min="8" max="120" step="2">
+        </div>
+        <div class="set-field">
+          <label>先読み量 <output id="cfg-warmBytes-o"></output><span class="set-hint">ホットキャッシュの先頭プリフェッチ</span></label>
+          <input type="range" id="cfg-warmBytes" min="64" max="4096" step="64">
+        </div>
+        <div class="set-field"><label class="tgl"><input type="checkbox" id="cfg-certify"><span>L2/L3 認定を回す<small>googlevideo トンネル・発行可否の実測</small></span></label></div>
+        <div class="set-field"><label class="tgl"><input type="checkbox" id="cfg-commentsPrefetch"><span>コメント先行取得<small>watch 表示直後に裏で取得して即表示</small></span></label></div>
+        <div class="set-field"><label class="tgl"><input type="checkbox" id="cfg-homeKeepWarm"><span>ホーム常時暖機<small>誰かが見ている間キャッシュを保つ</small></span></label></div>
+        <div class="set-field span2">
+          <label>ログ最小レベル <span class="set-hint">SSE 配信されるログの下限（負荷に合わせて）</span></label>
+          <div class="seg seg-sm" id="cfg-logLevel">
+            ${['trace', 'debug', 'info', 'warn', 'error'].map(l => `<button data-v="${l}">${l}</button>`).join('')}
+          </div>
+        </div>
+      </div>
+      <div class="set-actions">
+        <button class="set-btn primary" id="cfg-save">保存して適用</button>
+        <button class="set-btn" id="cfg-reset-values">初期値に戻す</button>
+        <span class="set-note" id="cfg-note"></span>
+      </div>
+    </section>
+
+    <!-- ================= プロキシプール ================= -->
+    <section class="set-card" id="sec-pool">
+      <h2><span class="set-ic">🛰️</span>プロキシプール <span class="set-live" id="pool-live">●</span></h2>
+      <div class="set-kv" id="pool-kv"></div>
+      <div class="set-actions">
+        <button class="set-btn" id="pool-refresh">💧 プールを強制更新（全候補再スキャン）</button>
+        <button class="set-btn" id="pool-certify">🏅 L2/L3 認定を今すぐ実行</button>
+      </div>
+      <div class="pool-table-wrap">
+        <table class="pool-table" id="pool-table">
+          <thead><tr><th>プロキシ</th><th>遅延</th><th>等級</th><th>失敗</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ================= プロキシレース ================= -->
+    <section class="set-card" id="sec-race">
+      <h2><span class="set-ic">🏁</span>プロキシレース <span class="set-hint-inline">L1 トンネル → L2 googlevideo → L3 発行実測の段階選抜を全員同時に実走</span></h2>
+      <div class="set-actions" style="margin-top:10px">
+        <label class="set-inline">台数
+          <select id="race-n"><option value="4">4</option><option value="6" selected>6</option><option value="8">8</option><option value="12">12</option></select>
+        </label>
+        <label class="set-inline">検証動画ID
+          <input id="race-v" class="set-input mono" placeholder="dQw4w9WgXcQ（既定）" maxlength="11" spellcheck="false">
+        </label>
+        <button class="set-btn primary" id="race-run">🏁 レース開始</button>
+        <span class="set-note">結果はライブログ(ch: race)にも超細かく流れます</span>
+      </div>
+      <div id="race-result" class="race-result"></div>
+    </section>
+
+    <!-- ================= ストリーム取得テスト ================= -->
+    <section class="set-card" id="sec-stream">
+      <h2><span class="set-ic">🎬</span>ストリーム取得テスト <span class="set-hint-inline">発行 → 直結/ピン経由の初バイト → ホットキャッシュ載せまで実測</span></h2>
+      <div class="set-actions" style="margin-top:10px">
+        <input id="st-v" class="set-input mono" placeholder="動画ID (11文字)" maxlength="11" spellcheck="false">
+        <button class="set-btn primary" id="st-run">▶ テスト実行</button>
+      </div>
+      <div id="st-result"></div>
+    </section>
+
+    <!-- ================= メタ情報取得テスト ================= -->
+    <section class="set-card" id="sec-meta">
+      <h2><span class="set-ic">🧪</span>メタ情報取得テスト <span class="set-hint-inline">watchNext / コメント（トークン再利用 vs 2往復）/ 検索 の実測タイミング</span></h2>
+      <div class="set-actions" style="margin-top:10px">
+        <input id="mt-v" class="set-input mono" placeholder="動画ID (任意)" maxlength="11" spellcheck="false">
+        <input id="mt-q" class="set-input" placeholder="検索語 (任意)" maxlength="60" spellcheck="false">
+        <button class="set-btn primary" id="mt-run">▶ テスト実行</button>
+      </div>
+      <div id="mt-result"></div>
+    </section>
+
+    <!-- ================= ライブログ ================= -->
+    <section class="set-card" id="sec-logs">
+      <h2><span class="set-ic">📡</span>ライブログ（SSE 超精密ストリーム）
+        <span class="set-live" id="log-live">○</span>
+        <span class="set-note" id="log-stat"></span>
+      </h2>
+      <div class="set-actions" style="margin-top:10px">
+        <label class="set-inline">レベル
+          <select id="log-level">
+            <option value="trace" selected>trace（全部）</option>
+            <option value="debug">debug+</option>
+            <option value="info">info+</option>
+            <option value="warn">warn+</option>
+            <option value="error">errorのみ</option>
+          </select>
+        </label>
+        <label class="set-inline">チャンネル
+          <select id="log-ch">
+            <option value="">すべて</option>
+            ${['proxy', 'player', 'stream', 'comments', 'meta', 'http', 'race', 'streamtest', 'metatest', 'engine'].map(c => `<option value="${c}">${c}</option>`).join('')}
+          </select>
+        </label>
+        <button class="set-btn" id="log-pause">⏸ 一時停止</button>
+        <button class="set-btn" id="log-clear">🗑 クリア</button>
+      </div>
+      <div class="log-console" id="log-console"><div class="log-empty">— ログ待ち —（接続中）</div></div>
+    </section>
+
+    <!-- ================= その他 ================= -->
+    <section class="set-card" id="sec-about">
+      <h2><span class="set-ic">🖐️</span>その他</h2>
+      <div class="set-actions" style="margin-top:10px">
+        <button class="set-btn" id="about-theme">🌓 テーマ切り替え</button>
+        <button class="set-btn" id="about-clear-history">🧹 履歴を全消去</button>
+        <button class="set-btn" id="about-clear-cache">🧹 セッションキャッシュを消去</button>
+      </div>
+      <p class="set-about">Vandal — llytpr++ 直結エンジン搭載。<br>Made by Kakinie with llytpr-wl.v01nh TEAM. V1</p>
+    </section>
+  </div>`;
+
+  /* ------------------------------------------------ helpers */
+  const $$one = (sel) => $(sel, app);
+  const fmtMs = (ms) => (ms == null ? '—' : ms < 1000 ? ms + 'ms' : (ms / 1000).toFixed(2) + 's');
+  async function post(path, body) {
+    const res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+    return res.json().catch(() => ({}));
+  }
+
+  /* ------------------------------------------------ engine config */
+  let cfg = null;
+  const segSet = (id, value) => {
+    $$(`#${id} button`, app).forEach(b => b.classList.toggle('sel', b.dataset.v === value));
+  };
+  const cfgDirtyUI = () => { $$one('#cfg-dirty').style.display = ''; };
+
+  function cfgFill(c) {
+    cfg = c;
+    segSet('cfg-proxyMode', c.proxyMode);
+    segSet('cfg-logLevel', c.logLevel);
+    $$one('#cfg-poolSize').value = c.poolSize; $$one('#cfg-poolSize-o').textContent = c.poolSize + ' 台';
+    $$one('#cfg-warmBytes').value = c.warmBytes; $$one('#cfg-warmBytes-o').textContent = c.warmBytes + ' KB';
+    $$one('#cfg-certify').checked = !!c.certify;
+    $$one('#cfg-commentsPrefetch').checked = !!c.commentsPrefetch;
+    $$one('#cfg-homeKeepWarm').checked = !!c.homeKeepWarm;
+    $$one('#cfg-dirty').style.display = 'none';
+  }
+
+  function cfgCollect() {
+    return {
+      proxyMode: $('#cfg-proxyMode .sel', app)?.dataset.v || 'auto',
+      logLevel: $('#cfg-logLevel .sel', app)?.dataset.v || 'trace',
+      poolSize: Number($$one('#cfg-poolSize').value) || 30,
+      warmBytes: Number($$one('#cfg-warmBytes').value) || 768,
+      certify: $$one('#cfg-certify').checked,
+      commentsPrefetch: $$one('#cfg-commentsPrefetch').checked,
+      homeKeepWarm: $$one('#cfg-homeKeepWarm').checked,
+    };
+  }
+
+  ['cfg-proxyMode', 'cfg-logLevel'].forEach(id => {
+    $$one('#' + id)?.addEventListener('click', (e) => {
+      const b = e.target.closest('button[data-v]');
+      if (!b) return;
+      segSet(id, b.dataset.v); cfgDirtyUI();
+    });
+  });
+  ['cfg-poolSize', 'cfg-warmBytes'].forEach(id => {
+    $$one('#' + id)?.addEventListener('input', (e) => {
+      const o = $$one('#' + id + '-o');
+      if (id === 'cfg-poolSize') o.textContent = e.target.value + ' 台';
+      else o.textContent = e.target.value + ' KB';
+      cfgDirtyUI();
+    });
+  });
+  ['cfg-certify', 'cfg-commentsPrefetch', 'cfg-homeKeepWarm'].forEach(id => {
+    $$one('#' + id)?.addEventListener('change', cfgDirtyUI);
+  });
+  $$one('#cfg-save')?.addEventListener('click', async () => {
+    const note = $$one('#cfg-note');
+    note.textContent = '適用中…';
+    try {
+      const res = await fetch('/api/diag/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfgCollect()) });
+      cfgFill(await res.json());
+      note.textContent = '✓ 適用しました（ライブログ ch:engine に反映記録が出ます）';
+      toast('エンジン設定を適用しました');
+    } catch (e) { note.textContent = '✗ ' + e.message; }
+  });
+  $$one('#cfg-reset-values')?.addEventListener('click', async () => {
+    const out = await post('/api/diag/config/reset');
+    cfgFill(out); toast('設定を初期値に戻しました');
+  });
+
+  /* ------------------------------------------------ state polling */
+  async function pollState() {
+    if (destroyed) return;
+    try {
+      const st = await api('/api/diag/state', { ttl: 0 });
+      if (destroyed || !st) return;
+      // summary
+      const up = st.uptime || 0;
+      $$one('#st-summary').innerHTML =
+        `<div><b>${(st.proxies?.pool || []).length}</b><span>プール</span></div>` +
+        `<div><b>${st.proxies?.issuers || 0}</b><span>L3発行可</span></div>` +
+        `<div><b>${st.proxies?.gvOk || 0}</b><span>L2中継可</span></div>` +
+        `<div><b>${Math.round((st.hot?.bytes || 0) / 1024)}KB</b><span>ホット</span></div>` +
+        `<div><b>${st.logbus?.rate || 0}/s</b><span>ログ速度</span></div>` +
+        `<div><b>${Math.floor(up / 60)}分</b><span>稼働</span></div>`;
+      // pool kv
+      const p = st.proxies || {};
+      $$one('#pool-kv').innerHTML = [
+        ['有効', p.enabled ? '✅ 有効' : '⛔ 無効 (direct)'],
+        ['プール', `${(p.pool || []).length} / 目標 ${p.poolTarget}`],
+        ['L3 発行可', `${p.issuers || 0} 台`],
+        ['L2 中継可', `${p.gvOk || 0} 台`],
+        ['水源リスト', `${(p.listSize || 0).toLocaleString()} 件（cursor ${p.cursor || 0}）`],
+        ['状態', [p.refreshing ? '更新中' : '', p.certifying ? '認定中' : ''].filter(Boolean).join(' + ') || '安定'],
+      ].map(([k, v]) => `<div class="kv"><span>${k}</span><b>${esc(v)}</b></div>`).join('');
+      // pool table
+      const tb = $('#pool-table tbody', app);
+      if (tb) {
+        const rows = (p.pool || []).slice(0, 40).map(pr => `
+          <tr>
+            <td class="mono">${esc(pr.url)}</td>
+            <td>${fmtMs(pr.latency)}</td>
+            <td>${pr.issuer ? '<i class="gr g3">L3 発行可</i>' : pr.gv ? '<i class="gr g2">L2 中継可</i>' : '<i class="gr g1">L1 トンネル</i>'}</td>
+            <td>${pr.fails ? '⚠︎' + pr.fails : '·'}</td>
+          </tr>`).join('');
+        tb.innerHTML = rows || '<tr><td colspan="4" class="dim">プールが空です — 「プールを強制更新」を実行してください</td></tr>';
+      }
+      // pool live dot
+      $$one('#pool-live').classList.toggle('on', !!(p.refreshing || p.certifying));
+      if (!cfg) cfgFill(st.config);
+    } catch (_) { /* transient */ }
+  }
+  timers.push(setInterval(pollState, 4000));
+  pollState();
+
+  $$one('#pool-refresh')?.addEventListener('click', async (e) => {
+    e.target.disabled = true; e.target.textContent = '💧 更新中…（最大数十秒）';
+    const r = await post('/api/proxies/refresh').catch(() => ({}));
+    e.target.disabled = false; e.target.textContent = '💧 プールを強制更新（全候補再スキャン）';
+    toast(`プール更新完了: ${r.pool ?? '?'} 台`);
+    pollState();
+  });
+  $$one('#pool-certify')?.addEventListener('click', async () => {
+    toast('L2/L3 認定を開始しました（ライブログ ch:proxy を見てください）');
+    await post('/api/diag/certify').catch(() => {});
+  });
+
+  /* ------------------------------------------------ proxy race */
+  $$one('#race-run')?.addEventListener('click', async (e) => {
+    const btn = e.target;
+    btn.disabled = true; btn.textContent = '🏁 レース中…（ライブログ ch:race に経過が流れます）';
+    $$one('#race-result').innerHTML = '<div class="mini-spin"></div>';
+    const v = $$one('#race-v').value.trim();
+    const r = await post('/api/diag/race', { n: Number($$one('#race-n').value) || 6, v: /^[\w-]{11}$/.test(v) ? v : undefined }).catch(err => ({ error: err.message }));
+    btn.disabled = false; btn.textContent = '🏁 レース開始';
+    if (destroyed) return;
+    if (r.error) { $$one('#race-result').innerHTML = `<div class="test-err">✗ ${esc(r.error)}</div>`; return; }
+    const rows = (r.results || []).map((x, i) => {
+      const grade = x.l3?.ok ? 'L3' : x.l2?.ok ? 'L2' : x.l1?.ok ? 'L1' : '✗';
+      return `<tr class="${r.winner?.url === x.url ? 'win' : ''}">
+        <td>${r.winner?.url === x.url ? '👑' : i + 1}</td>
+        <td class="mono">${esc(x.url)}</td>
+        <td>${fmtMs(x.l1?.ms)}</td>
+        <td>${x.l2 ? (x.l2.ok ? '✓ ' + fmtMs(x.l2.ms) : '✗') : '—'}</td>
+        <td>${x.l3 ? (x.l3.ok ? '✓ ' + fmtMs(x.l3.ms) : '✗ ' + esc(x.l3.playability || '')) : '—'}</td>
+        <td><i class="gr ${grade === 'L3' ? 'g3' : grade === 'L2' ? 'g2' : grade === 'L1' ? 'g1' : 'g0'}">${grade}</i></td>
+      </tr>`;
+    }).join('');
+    $$one('#race-result').innerHTML = `
+      <div class="race-win">${r.winner ? `🏆 勝者: <span class="mono">${esc(r.winner.url)}</span> — L1 ${fmtMs(r.winner.l1)}${r.winner.l2 != null ? ' / L2 ' + fmtMs(r.winner.l2) : ''}${r.winner.l3 != null ? ' / L3 ' + fmtMs(r.winner.l3) : ''}` : '勝者なし（全滅 — プール更新を推奨）'}</div>
+      <div class="pool-table-wrap"><table class="pool-table race">
+        <thead><tr><th>#</th><th>プロキシ</th><th>L1 トンネル</th><th>L2 googlevideo</th><th>L3 発行実測</th><th>等級</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>
+      <p class="set-note">L1=YouTube への到達 / L2=googlevideo 中継可 / L3=player 発行が通る（= 動画URL発行に使える最高等級）</p>`;
+  });
+
+  /* ------------------------------------------------ stream test */
+  $$one('#st-run')?.addEventListener('click', async (e) => {
+    const btn = e.target;
+    const v = $$one('#st-v').value.trim();
+    if (!/^[\w-]{11}$/.test(v)) { toast('動画ID (11文字) を入力してください'); return; }
+    btn.disabled = true; btn.textContent = '▶ 実行中…（ch: streamtest / player に経過が流れます）';
+    $$one('#st-result').innerHTML = '<div class="mini-spin"></div>';
+    const r = await post('/api/diag/stream-test', { v }).catch(err => ({ error: err.message }));
+    btn.disabled = false; btn.textContent = '▶ テスト実行';
+    if (destroyed) return;
+    if (r.error && !r.steps?.length) { $$one('#st-result').innerHTML = `<div class="test-err">✗ ${esc(r.error)}</div>`; return; }
+    const labels = {
+      cacheCheck: 'キャッシュ確認', issuance: 'URL 発行（player）',
+      ttfbDirect: '初バイト・直結', ttfbPinned: '初バイト・ピン経由', hotCache: 'ホットキャッシュ',
+    };
+    $$one('#st-result').innerHTML = `
+      <div class="steps">${(r.steps || []).map(s => `
+        <div class="step">
+          <span class="step-name">${labels[s.name] || s.name}</span>
+          <span class="step-val">${s.name === 'issuance' ? (s.ok ? '✓ ' : '✗ ') : ''}${fmtMs(s.ms ?? null)}</span>
+          <span class="step-note">${esc(
+            s.name === 'cacheCheck' ? (s.hit ? 'キャッシュ済み（即応答可） source=' + (s.source || '') : '未キャッシュ（新規発行から計測）')
+            : s.name === 'issuance' ? (s.ok ? `経路: ${s.viaPin}` : '発行失敗')
+            : s.name === 'ttfbDirect' || s.name === 'ttfbPinned' ? (s.ok ? `HTTP ${s.status}` : '失敗')
+            : s.name === 'hotCache' ? (s.warmed ? `${(s.bytes / 1024) | 0}KB 載せ替え ✓` : '未載せ')
+            : '')}</span>
+        </div>`).join('')}</div>
+      ${r.error ? `<div class="test-err">途中でエラー: ${esc(r.error)}</div>` : ''}`;
+  });
+
+  /* ------------------------------------------------ meta test */
+  $$one('#mt-run')?.addEventListener('click', async (e) => {
+    const btn = e.target;
+    const v = $$one('#mt-v').value.trim();
+    const q = $$one('#mt-q').value.trim();
+    if (!v && !q) { toast('動画ID か 検索語 を入力してください'); return; }
+    btn.disabled = true; btn.textContent = '▶ 実行中…（ch: metatest / meta に経過が流れます）';
+    $$one('#mt-result').innerHTML = '<div class="mini-spin"></div>';
+    const r = await post('/api/diag/meta-test', { v, q }).catch(err => ({ error: err.message }));
+    btn.disabled = false; btn.textContent = '▶ テスト実行';
+    if (destroyed) return;
+    const t = r.tests || {};
+    const row = (label, o, note) => `<div class="step">
+        <span class="step-name">${label}</span>
+        <span class="step-val">${o?.ok === false ? '✗' : ''}${fmtMs(o?.ms ?? null)}</span>
+        <span class="step-note">${esc(note || '')}</span></div>`;
+    $$one('#mt-result').innerHTML = `
+      <div class="steps">
+        ${t.watchNext ? row('watchNext（動画メタ）', t.watchNext, `${t.watchNext.related || 0} 関連 / ${t.watchNext.hasCommentsToken ? 'コメントToken同梱 ✓' : 'Tokenなし'}${t.watchNext.title ? ' — ' + t.watchNext.title : ''}`) : ''}
+        ${t.commentsWithToken ? row('コメント（トークン再利用）', t.commentsWithToken, `${t.commentsWithToken.count || 0} 件 / ${t.commentsWithToken.count2 || ''}`) : ''}
+        ${t.commentsNoToken ? row('コメント（従来 2 往復）', t.commentsNoToken, `${t.commentsNoToken.count || 0} 件`) : ''}
+        ${t.commentsSpeedup ? `<div class="step speedup"><span class="step-name">コメント高速化効果</span><span class="step-val">${esc(t.commentsSpeedup)}</span></div>` : ''}
+        ${t.search ? row('search（検索）', t.search, `${t.search.items || 0} 件`) : ''}
+      </div>
+      ${r.error ? `<div class="test-err">途中でエラー: ${esc(r.error)}</div>` : ''}`;
+  });
+
+  /* ------------------------------------------------ SSE live logs */
+  const logConsole = () => $$one('#log-console');
+  const pushLog = (ev) => {
+    if (esPaused || destroyed) return;
+    const con = logConsole();
+    if (!con) return;
+    if (con.querySelector('.log-empty')) con.innerHTML = '';
+    const row = document.createElement('div');
+    row.className = 'log-row lv-' + ev.level;
+    const t = new Date(ev.ts);
+    const hh = String(t.getHours()).padStart(2, '0') + ':' + String(t.getMinutes()).padStart(2, '0') + ':' + String(t.getSeconds()).padStart(2, '0');
+    let data = '';
+    if (ev.data && Object.keys(ev.data).length) {
+      data = ' ' + JSON.stringify(ev.data);
+      if (data.length > 320) data = data.slice(0, 320) + '…';
+    }
+    row.innerHTML = `<span class="log-t">${hh}</span><span class="log-lv">${ev.level}</span><span class="log-ch">${esc(ev.ch)}</span><span class="log-msg">${esc(ev.msg)}<span class="log-data">${esc(data)}</span></span>`;
+    const stick = con.scrollTop + con.clientHeight >= con.scrollHeight - 60;
+    con.appendChild(row);
+    logLines++;
+    while (logLines > 500 && con.firstElementChild) { con.removeChild(con.firstElementChild); logLines--; }
+    if (stick) con.scrollTop = con.scrollHeight;
+    $$one('#log-stat').textContent = `${logLines} 行`;
+  };
+
+  function connectLogs() {
+    if (destroyed) return;
+    es?.close();
+    const lv = $$one('#log-level').value;
+    const ch = $$one('#log-ch').value;
+    const url = `/api/diag/logs?sse=1&level=${encodeURIComponent(lv)}${ch ? '&ch=' + encodeURIComponent(ch) : ''}`;
+    es = new EventSource(url);
+    es.onopen = () => { if (destroyed) return; $$one('#log-live').classList.add('on'); $$one('#log-live').textContent = '●'; };
+    es.onerror = () => { if (destroyed) return; $$one('#log-live').classList.remove('on'); $$one('#log-live').textContent = '○'; };
+    es.onmessage = (m) => {
+      try { pushLog(JSON.parse(m.data)); } catch (_) { /* skip */ }
+    };
+    // ※ 過去バッファは SSE 接続時にサーバー側から同じフィルタで再生される
+    //    （二重取得不要）
+  }
+  $$one('#log-level')?.addEventListener('change', () => { logClear(); connectLogs(); });
+  $$one('#log-ch')?.addEventListener('change', () => { logClear(); connectLogs(); });
+  function logClear() {
+    const con = logConsole();
+    if (con) { con.innerHTML = '<div class="log-empty">— ログ待ち —</div>'; logLines = 0; }
+  }
+  $$one('#log-clear')?.addEventListener('click', logClear);
+  $$one('#log-pause')?.addEventListener('click', (e) => {
+    esPaused = !esPaused;
+    e.target.textContent = esPaused ? '▶ 再開' : '⏸ 一時停止';
+    e.target.classList.toggle('warn', esPaused);
+  });
+  connectLogs();
+
+  /* ------------------------------------------------ misc */
+  $$one('#about-theme')?.addEventListener('click', () => $('#theme-toggle')?.click());
+  $$one('#about-clear-history')?.addEventListener('click', () => {
+    History.clear(); toast('履歴を消去しました');
+  });
+  $$one('#about-clear-cache')?.addEventListener('click', () => {
+    try {
+      Object.keys(sessionStorage).filter(k => k.startsWith('llytpr:sc:')).forEach(k => sessionStorage.removeItem(k));
+      Object.keys(localStorage).filter(k => k.startsWith('llytpr:snap:')).forEach(k => localStorage.removeItem(k));
+      toast('キャッシュを消去しました');
+    } catch (_) { toast('消去に失敗しました'); }
+  });
+
+  return {
+    destroy() {
+      destroyed = true;
+      timers.forEach(clearInterval);
+      es?.close();
+    },
+  };
+}
+
 /* routes */
 route(/^\/$/, () => renderHome());
 route(/^\/results$/, (params) => renderResults(params));
@@ -2453,6 +2958,7 @@ route(/^\/shorts$/, () => renderShortsHome());
 route(/^\/shorts\/([\w-]{11})$/, (id) => renderShort(id));
 route(/^\/feed\/subscriptions$/, () => renderSubscriptions());
 route(/^\/feed\/you$/, () => renderMyPage());
+route(/^\/settings$/, () => renderSettings());
 
 /* ------------------------------------------------------------ masthead wire */
 $('#search-form').addEventListener('submit', (e) => {
@@ -2523,32 +3029,48 @@ sInput.addEventListener('keydown', (e) => {
   } else if (e.key === 'Escape') sBox.classList.add('hidden');
 });
 
-/* options menu */
-$('#opts-btn').addEventListener('click', (e) => {
-  e.stopPropagation();
-  $('#opts-menu').classList.toggle('hidden');
-});
-document.addEventListener('click', (e) => {
-  if (!e.target.closest('#opts-menu') && !e.target.closest('#opts-btn')) $('#opts-menu').classList.add('hidden');
-});
-$('#theme-toggle').addEventListener('click', () => {
-  const dark = document.documentElement.classList.toggle('dark');
-  localStorage.setItem('llytpr-theme', dark ? 'dark' : 'light');
-  $('#theme-label').textContent = dark ? 'ライト モードに切り替え' : 'ダーク モードに切り替え';
-  $('meta[name=theme-color]').setAttribute('content', dark ? '#0f0f0f' : '#ffffff');
-});
-if ((localStorage.getItem('llytpr-theme') || 'light') === 'dark') {
-  document.documentElement.classList.add('dark');
-  $('#theme-label').textContent = 'ライト モードに切り替え';
+/* ============================================================ テーマ / ナビ */
+function applyTheme(dark, { save = true } = {}) {
+  document.documentElement.classList.toggle('dark', !!dark);
+  document.body.classList.toggle('dark', !!dark);
+  if (save) { try { localStorage.setItem('llytpr-theme', dark ? 'dark' : 'light'); } catch (_) {} }
+  $('meta[name=theme-color]')?.setAttribute('content', dark ? '#0c0d10' : '#ffffff');
 }
+$('#theme-toggle').addEventListener('click', () => {
+  applyTheme(!document.documentElement.classList.contains('dark'));
+});
 
+/* ナビゲーションドロワー — 既定は「閉じた」状態。開閉状態は記憶するが、
+ * 狭い画面では次のナビゲーションで自動的に閉じる（オーバーレイ運用）。 */
+function applyNav(open, { save = true } = {}) {
+  document.body.classList.toggle('nav-open', !!open);
+  if (save) Store.set('nav', open ? 'open' : 'closed');
+}
 $('#menu-btn').addEventListener('click', () => {
-  const g = $('#mini-guide');
-  g.style.display = g.style.display === 'none' ? '' : 'none';
+  applyNav(!document.body.classList.contains('nav-open'));
+});
+$('#nav-backdrop').addEventListener('click', () => applyNav(false));
+applyNav(Store.get('nav', 'closed') === 'open', { save: false });
+
+/* キーボードショートカット:
+ *   /        → 検索へフォーカス
+ *   Esc      → ドロワー/サジェストを閉じる
+ *   Ctrl+K   → 検索へフォーカス */
+document.addEventListener('keydown', (e) => {
+  const typing = /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName || '');
+  if ((e.key === '/' || (e.key.toLowerCase() === 'k' && (e.ctrlKey || e.metaKey))) && !typing) {
+    e.preventDefault();
+    $('#search-input')?.focus();
+    $('#search-input')?.select();
+    return;
+  }
+  if (e.key === 'Escape') {
+    if (document.body.classList.contains('nav-open')) applyNav(false);
+  }
 });
 
 /* done callback to signal full load */
-console.log('%c Vandal %c Made by Kakinie with llytpr-wl.v01nh TEAM. V1 ', 'background:#ff5a1e;color:#fff;border-radius:4px;padding:2px 6px;font-weight:800', 'color:#888');
+console.log('%c Vandal %c Made by Kakinie with llytpr-wl.v01nh TEAM. V1 ', 'background:linear-gradient(90deg,#ff8a3c,#e3143f);color:#fff;border-radius:4px;padding:2px 6px;font-weight:800', 'color:#888');
 render();
 
 })();

@@ -13,6 +13,8 @@ const { proxyManager } = require('./proxies');
 const { sigSolver } = require('./solver');
 const { piped } = require('./piped');
 const { TTLCache } = require('./cache');
+const { logbus } = require('./logbus');
+const { engineConfig } = require('./config');
 
 const API_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
 const HOST_WEB = 'https://www.youtube.com';
@@ -131,7 +133,7 @@ const fs = require('node:fs');
 const nodePath = require('node:path');
 const RT_DIR = process.env.VERCEL ? '/tmp/llytpr-data' : nodePath.join(__dirname, '..', 'data');
 const RT_FILE = nodePath.join(RT_DIR, 'runtime-cache.json');
-const rt = { goodCombo: null, streams: {} }; // streams['m:'+id]={e,exp} / ['p:'+id]={e,exp}
+const rt = { goodCombo: null, streams: {}, home: {} }; // streams['m:'+id]={e,exp} / ['p:'+id]={e,exp}
 try { fs.mkdirSync(RT_DIR, { recursive: true }); } catch (_) { /* noop */ }
 try {
   const raw = JSON.parse(fs.readFileSync(RT_FILE, 'utf8'));
@@ -141,6 +143,19 @@ try {
       const now = Date.now();
       for (const [k, v] of Object.entries(raw.streams)) {
         if (v && typeof v.exp === 'number' && v.exp > now) rt.streams[k] = v;
+      }
+    }
+    // 高速化: ホームの前回表示内容をディスクから復元（stale-while-revalidate）。
+    // コールドブート直後の初回 /api/home が「プロキシ温まるまで白画面」だったのを、
+    // 最大30分前のスナップショットで即描画し、裏で最新化が走る。
+    if (raw.home && typeof raw.home === 'object') {
+      const now = Date.now();
+      for (const [chip, snap] of Object.entries(raw.home)) {
+        if (snap && Array.isArray(snap.data?.items) && snap.data.items.length
+          && now - (snap.savedAt || 0) < 30 * 60 * 1000) {
+          rt.home[chip] = snap;
+          caches.api.set('home:' + chip, snap.data, 8 * 60 * 1000); // 短めの再検証TTL
+        }
       }
     }
   }
@@ -155,7 +170,12 @@ function rtSave() {
         keys.sort((a, b) => (rt.streams[a].exp - rt.streams[b].exp));
         for (const k of keys.slice(0, keys.length - 500)) delete rt.streams[k];
       }
-      fs.writeFileSync(RT_FILE, JSON.stringify({ savedAt: Date.now(), goodCombo: rt.goodCombo, streams: rt.streams }));
+      const homeKeys = Object.keys(rt.home);
+      if (homeKeys.length > 8) { // チップ別スナップショットは最大8種保持
+        homeKeys.sort((a, b) => (rt.home[b].savedAt || 0) - (rt.home[a].savedAt || 0));
+        for (const k of homeKeys.slice(8)) delete rt.home[k];
+      }
+      fs.writeFileSync(RT_FILE, JSON.stringify({ savedAt: Date.now(), goodCombo: rt.goodCombo, streams: rt.streams, home: rt.home }));
     } catch (_) { /* read-only */ }
   }, 700);
 }
@@ -214,8 +234,15 @@ function transports(preferProxy, count = 2) {
     if (u) { seen.add(u); list.push({ kind: 'proxy', url: u, dispatcher: proxyManager.dispatcherFor(u) }); }
   };
   const direct = { kind: 'direct', dispatcher: undefined };
+  // 設定ページの proxyMode が最優先（direct = プロキシ完全不使用）
+  const mode = engineConfig.get('proxyMode');
+  if (mode === 'direct') return [direct];
   if (preferProxy === 'direct') return [direct];
-  if (preferProxy === 'proxy') { for (let i = 0; i < count + 1; i++) addProxy(); list.push(direct); return list; }
+  if (mode === 'proxy' || preferProxy === 'proxy') {
+    for (let i = 0; i < count + 1; i++) addProxy();
+    list.push(direct); // 絶命時の保険だけは残す
+    return list;
+  }
   // auto: proxies first (block-safe), direct as the safety net
   for (let i = 0; i < count; i++) addProxy();
   list.push(direct);
@@ -251,13 +278,16 @@ async function callApi(endpoint, payload, client = CLIENTS.WEB, { hl = 'ja', gl 
   let lastErr = null;
   let lastJson = null;
   const chain = transport ? [transport] : transports(preferProxy, transportCount);
+  const ch = ENDPOINT_LOG_CH[endpoint] || 'meta';
   for (const t of chain) {
+    const via = t.kind === 'proxy' ? `proxy ${t.url}` : 'direct';
     try {
       const start = Date.now();
       const res = await rawFetch(url, { method: 'POST', headers, body, dispatcher: t.dispatcher, timeout });
       if (!res.ok) {
         const txt = await res.text().catch(() => '');
         lastJson = tryParse(txt);
+        logbus.warn(ch, `${endpoint} HTTP ${res.status}`, { via, ms: Date.now() - start });
         // 5xx or weird -> rotate transport. 4xx -> definitive API error.
         if (res.status >= 500 || res.status === 429) {
           if (t.kind === 'proxy') proxyManager.markBad(t.url);
@@ -270,16 +300,30 @@ async function callApi(endpoint, payload, client = CLIENTS.WEB, { hl = 'ja', gl 
       const json = await res.json();
       if (t.kind === 'proxy') proxyManager.markGood(t.url, Date.now() - start);
       if (ret) ret.transport = t;
+      logbus.debug(ch, `${endpoint} ✓`, {
+        via, ms: Date.now() - start,
+        client: client.ctx.clientName,
+        playability: json?.playabilityStatus?.status || undefined,
+      });
       return json;
     } catch (e) {
       if (e instanceof YTError && e.status === 400) throw e; // bad payload: no point rotating
       if (e instanceof YTError && e.code === 'LOGIN_DATA') throw e;
       lastErr = e;
+      logbus.warn(ch, `${endpoint} 試行失敗 → 経路ローテーション`, { via, err: e?.message });
       if (t.kind === 'proxy') proxyManager.markBad(t.url);
     }
   }
   throw lastErr || new YTError('upstream unreachable', 502);
 }
+
+/** endpoint → ログチャンネル割当（設定ページのフィルタ用） */
+const ENDPOINT_LOG_CH = {
+  player: 'player',
+  next: 'meta',
+  search: 'meta',
+  browse: 'meta',
+};
 
 function tryParse(s) { try { return JSON.parse(s); } catch (_) { return null; } }
 
@@ -651,10 +695,12 @@ function extractItems(root) {
 
 /* ------------------------------------------------------------------- search */
 
-async function search(query, { sp, hl = 'ja', gl = 'JP' } = {}) {
+async function search(query, { sp, hl = 'ja', gl = 'JP', fresh = false } = {}) {
   const key = `s:${query}:${sp || ''}:${hl}${gl}`;
+  if (fresh) caches.api.delete(key);
   return caches.api.wrap(key, 10 * CACHE_MIN, async () => {
     const visitorId = getVisitorIdFast(); // 高速化: 未取得なら並行取得し、今回のリクエストは待たせない
+    const spanDone = logbus.span('meta', 'search', { q: String(query).slice(0, 60) });
     const payload = { query };
     if (sp) payload.params = sp;
     let lastSearchError = null;
@@ -664,7 +710,7 @@ async function search(query, { sp, hl = 'ja', gl = 'JP' } = {}) {
         || res?.onResponseReceivedCommands?.[0]?.appendContinuationItemsAction?.continuationItems
         || res;
       const { items, continuation } = extractItems(root);
-      if (items.length || sp) return { query, items, continuation };
+      if (items.length || sp) { spanDone({ ok: true, items: items.length, via: 'innertube' }); return { query, items, continuation }; }
     } catch (e) {
       // fall through to the youtube-search-api backup below
       lastSearchError = e;
@@ -746,9 +792,11 @@ function parsePrimaryInfo(c) {
   };
 }
 
-async function watchNext(videoId, { hl = 'ja', gl = 'JP', playlistId } = {}) {
+async function watchNext(videoId, { hl = 'ja', gl = 'JP', playlistId, fresh = false } = {}) {
   const cacheKey = 'w:' + videoId + hl + gl + (playlistId ? ':' + playlistId : '');
+  if (fresh) caches.api.delete(cacheKey);
   return caches.api.wrap(cacheKey, 10 * CACHE_MIN, async () => {
+    const spanDone = logbus.span('meta', 'watchNext (動画メタ)', { v: videoId });
     const visitorId = getVisitorIdFast(); // 高速化: 未取得なら並行取得し、今回のリクエストは待たせない
     const payload = { videoId, contentCheckOk: true, racyCheckOk: true };
     if (playlistId) payload.playlistId = playlistId;
@@ -793,6 +841,7 @@ async function watchNext(videoId, { hl = 'ja', gl = 'JP', playlistId } = {}) {
       };
       if (panel.currentIndex < 0) panel.currentIndex = 0;
     }
+    spanDone({ ok: true, related: related.length, hasCommentsToken: !!commentsToken, panel: !!panel });
     return {
       videoId,
       ...meta,
@@ -918,6 +967,7 @@ async function player(videoId, { hl = 'ja', gl = 'JP' } = {}) {
   let lastErr = null;
   let lastStatus = null;
   let sabrFallback = null;             // OK response without usable urls
+  const spanAll = logbus.span('player', 'player 発行', { v: videoId });
 
   const tryOnce = async (clientKey, params, transport) => {
     const client = CLIENTS[clientKey];
@@ -984,22 +1034,69 @@ async function player(videoId, { hl = 'ja', gl = 'JP' } = {}) {
   // 無ければ従来プール（pickIssuer 内部で自動フォールバック）。
   const proxyUrls = (n) => { const out = []; const seen = new Set(); for (let i = 0; i < n * 2 && out.length < n; i++) { const u = proxyManager.pickIssuer(out); if (u && !seen.has(u)) { seen.add(u); out.push(u); } else break; } return out; };
 
-  const plan = [];
-  if (goodCombo) plan.push({ clientKey: goodCombo.clientKey, params: goodCombo.params, transports: [goodCombo.transportKind === 'direct' ? directT : { kind: 'proxy', url: goodCombo.transportUrl, dispatcher: proxyManager.dispatcherFor(goodCombo.transportUrl) }] });
-  PLAYER_CHAIN.forEach((step, idx) => {
-    const n = idx === 0 ? 4 : idx === 1 ? 3 : 2; // proxy fan-out per client
-    plan.push({ clientKey: step.client, params: step.params, transports: [directT, ...transportsForUrls(proxyUrls(n))] });
+  /**
+   * 高速化（並列ヘッジ）: かつては direct → proxy1 → proxy2 … を直列に総当たり
+   * しており、コールド時の初回視聴が「1 本失敗 ≒ +数秒」で劣化していた。
+   * 新方式では各波で 2〜3 経路を**同時に**撃ち、最初に OK が戻った瞬間に確定する
+   * （プロキシレース）。serial だった worst = N×timeout が max(1×timeout) になる。
+   * 定番 (goodCombo) があるときはさらに direct 1 本を保険で並走させ、
+   * 「定番が死んでいた瞬間」の数的確定待ちも消している。
+   */
+  const firstWin = (jobs) => new Promise((resolve, reject) => {
+    let pending = jobs.length;
+    let settled = false;
+    let softErr = null;
+    if (!pending) { reject(new YTError('no transports', 502)); return; }
+    for (const p of jobs) {
+      Promise.resolve(p).then((r) => {
+        if (settled) return;
+        if (r) { settled = true; resolve(r); }
+        else if (--pending <= 0) { settled = true; reject(softErr || new YTError('wave failed', 502)); }
+      }).catch((e) => {
+        if (settled) return;
+        // definitive unplayable (UNPLAYABLE / AGE_CHECK …) はレース全中止で即報告
+        if (e && e.status === 451) { settled = true; reject(e); return; }
+        softErr = softErr || e;
+        if (--pending <= 0) { settled = true; reject(softErr); }
+      });
+    }
   });
 
+  const step0 = PLAYER_CHAIN[0];
+  const wave1 = [];
+  if (goodCombo) {
+    wave1.push({ clientKey: goodCombo.clientKey, params: goodCombo.params, transports: [goodCombo.transportKind === 'direct' ? directT : { kind: 'proxy', url: goodCombo.transportUrl, dispatcher: proxyManager.dispatcherFor(goodCombo.transportUrl) }] });
+  }
+  // wave 1: 定番 + 先頭クライアント (direct × 1 + issuer プロキシ × 2) の同時レース
+  const head = { clientKey: step0.client, params: step0.params, transports: [directT, ...transportsForUrls(proxyUrls(goodCombo ? 2 : 3))] };
+  wave1.push(head);
+
   let win = null;
-  outer:
-  for (const step of plan) {
-    for (const t of step.transports) {
+  try {
+    win = await firstWin(wave1.flatMap(s => s.transports.map(t => tryOnce(s.clientKey, s.params, t))));
+  } catch (e) {
+    if (e && e.status === 451) { lastErr = e; win = null; }
+    else lastErr = e;
+  }
+  logbus.debug('player', 'wave1 (並列レース) 終了', { v: videoId, win: !!win });
+
+  // wave 2+: 残りのクライアント群をステップごとに並列ヘッジで総当たり
+  // （wave1 で試した direct×1 + issuer×2〜3 は tryOnce の used チェックで自動重複排除）
+  if (!win && Date.now() < deadline && (!lastErr || lastErr.status !== 451)) {
+    outer:
+    for (let idx = 0; idx < PLAYER_CHAIN.length; idx++) {
+      const step = PLAYER_CHAIN[idx];
       if (Date.now() > deadline) break outer;
+      const n = idx === 0 ? 4 : idx === 1 ? 3 : 2; // proxy fan-out per client
+      const transports = [directT, ...transportsForUrls(proxyUrls(n))];
       try {
-        const r = await tryOnce(step.clientKey, step.params, t);
+        const r = await firstWin(transports.map(t => tryOnce(step.client, step.params, t)));
         if (r) { win = r; break outer; }
-      } catch (e) { lastErr = e; break outer; } // definitive unplayable
+      } catch (e) {
+        if (e && e.status === 451) { lastErr = e; break outer; } // definitive unplayable
+        lastErr = e;
+        if (Date.now() > deadline) break outer;
+      }
     }
   }
 
@@ -1018,14 +1115,16 @@ async function player(videoId, { hl = 'ja', gl = 'JP' } = {}) {
       }
       const rescueDeadline = Date.now() + 30000;
       for (const step of rescue) {
-        for (const t of step.transports) {
-          if (Date.now() > rescueDeadline) break;
-          try {
-            const r = await tryOnce(step.clientKey, step.params, t);
-            if (r) { win = r; break; }
-          } catch (e) { lastErr = e; break; }
+        if (Date.now() > rescueDeadline) break;
+        try {
+          // 高速化: 緊急時こそ直列総当たりは致命的に遅い — 各ステップの全経路を
+          // 同時レースにして、最初に生き残った egress で即確定する
+          const r = await firstWin(step.transports.map(t => tryOnce(step.clientKey, step.params, t)));
+          if (r) { win = r; break; }
+        } catch (e) {
+          if (e && e.status === 451) { lastErr = e; break; }
+          lastErr = e;
         }
-        if (win) break;
       }
     } catch (_) { /* rescue is best-effort; Piped が後に控える */ }
   }
@@ -1041,6 +1140,16 @@ async function player(videoId, { hl = 'ja', gl = 'JP' } = {}) {
     };
     rt.goodCombo = goodCombo;
     rtSave();
+    const urlCount = usable.filter(f => f.url).length;
+    spanAll({
+      ok: true, client: clientKey, via: transport?.kind === 'proxy' ? `proxy ${transport.url}` : 'direct',
+      formats: urlCount, hls: !!res.streamingData?.hlsManifestUrl,
+    });
+    logbus.info('player', '発行成功', {
+      v: videoId, client: clientKey,
+      via: transport?.kind === 'proxy' ? 'proxy ' + transport.url : 'direct',
+      formats: urlCount,
+    });
     const sd = res.streamingData || {};
     const fmt = sd.formats || [];
     const maps = buildStreamMaps(videoId, usable, res);
@@ -1078,6 +1187,8 @@ async function player(videoId, { hl = 'ja', gl = 'JP' } = {}) {
   try {
     const p = await piped.getStreams(videoId);
     if (p && (p.progressive.length || p.videos.length)) {
+      spanAll({ ok: true, client: 'piped:' + p.host, formats: p.progressive.length + p.videos.length });
+      logbus.warn('player', '全経路失敗 → Piped で救済', { v: videoId, host: p.host });
       return {
         videoId,
         __transport: null,
@@ -1104,6 +1215,8 @@ async function player(videoId, { hl = 'ja', gl = 'JP' } = {}) {
   const err = lastErr || new YTError('player failed', 502);
   err.statusHint = lastStatus?.status;
   err.reason = lastStatus?.reason;
+  spanAll({ __error: true, status: err.statusHint || err.code, reason: err.reason || err.message });
+  logbus.error('player', '発行失敗', { v: videoId, status: err.statusHint || err.code, reason: err.reason || err.message });
   throw err;
 }
 
@@ -1484,23 +1597,45 @@ function parseCommentPage(res) {
   return { comments, continuation, count };
 }
 
-async function comments(videoId) {
+/**
+ * comments — コメント取得。
+ *
+ * 高速化（コメントが遅い問題の根治）:
+ *   旧実装は ①next{videoId} でトークン発見 → ②next{continuation} で本文取得、
+ *   と 2 往復が**直列**に走っており、プロキシ経由だと 1 往復数百ms〜数秒で
+ *   合計で数秒待たされていた。
+ *   新実装:
+ *     (1) 呼び出し側が watch 応答に同梱の commentsToken を渡せる（?token=）→
+ *         ① を丸ごとスキップし 1 往復で済む（実測で半分以下に短縮）。
+ *     (2) サーバーは /api/watch 応答後にコメントを先行取得（prefetch）して
+ *         5 分キャッシュへ載せる。ユーザーがコメント欄を開く頃には完成している。
+ *     (3) single-flight により prefetch と実際のリクエストが同時でも 1 往復に束ねる。
+ */
+async function comments(videoId, tokenIn) {
   return caches.api.wrap('c0:' + videoId, 5 * CACHE_MIN, async () => {
-    const visitorId = getVisitorIdFast(); // 高速化: 未取得なら並行取得し、今回のリクエストは待たせない
-    const res = await callApi('next', { videoId, contentCheckOk: true }, CLIENTS.WEB, { visitorId });
-    const panels = res?.engagementPanels || [];
-    let token = null;
-    for (const p of panels) {
-      const r = p?.engagementPanelSectionListRenderer;
-      if (r?.panelIdentifier === 'engagement-panel-comments-section') {
-        token = deepFind(r, 'continuationCommand', 4)?.map(x => x.token).find(Boolean) || null;
+    const visitorId = getVisitorIdFast(); // 高速化: 未取得なら並行取得し、今回のリクエストを待たせない
+    const spanDone = logbus.span('comments', 'コメント取得', { v: videoId, tokenGiven: !!tokenIn });
+    let token = tokenIn && String(tokenIn).length > 20 ? String(tokenIn) : null;
+    let entryCount = '';
+    if (!token) {
+      const res = await callApi('next', { videoId, contentCheckOk: true }, CLIENTS.WEB, { visitorId });
+      const panels = res?.engagementPanels || [];
+      for (const p of panels) {
+        const r = p?.engagementPanelSectionListRenderer;
+        if (r?.panelIdentifier === 'engagement-panel-comments-section') {
+          token = deepFind(r, 'continuationCommand', 4)?.map(x => x.token).find(Boolean) || null;
+        }
       }
+      const hd = deepFind(res, 'commentsEntryPointHeaderRenderer', 1)?.[0];
+      entryCount = hd ? (textOf(hd.commentCount) || '') : '';
     }
-    const hd = deepFind(res, 'commentsEntryPointHeaderRenderer', 1)?.[0];
-    const entryCount = hd ? (textOf(hd.commentCount) || '') : '';
-    if (!token) return { comments: [], continuation: null, count: entryCount, disabled: true };
+    if (!token) {
+      spanDone({ disabled: true });
+      return { comments: [], continuation: null, count: entryCount, disabled: true };
+    }
     const page1 = await callApi('next', { continuation: token }, CLIENTS.WEB, { visitorId });
     const parsed = parseCommentPage(page1);
+    spanDone({ got: parsed.comments.length, count: parsed.count || entryCount });
     return { ...parsed, count: parsed.count || entryCount, disabled: false };
   });
 }
@@ -1734,6 +1869,7 @@ const HOME_PRESETS = {
 
 async function home(chip = 'all') {
   return caches.api.wrap('home:' + chip, 15 * CACHE_MIN, async () => {
+    const spanDone = logbus.span('meta', 'ホーム構築', { chip });
     const presets = HOME_PRESETS[chip] || HOME_PRESETS.all;
     const pages = await Promise.allSettled(presets.map(p => search(p.q)));
     const items = [];
@@ -1749,7 +1885,14 @@ async function home(chip = 'all') {
     }
     // interleave-ish shuffle for variety but stable within TTL
     items.sort((a, b) => ((a.id || '').charCodeAt(2) || 0) - ((b.id || '').charCodeAt(2) || 0));
-    return { chip, items, continuation: null };
+    const out = { chip, items, continuation: null };
+    // ディスクスナップショット保存（次回コールドブートの即時ホーム描画用）
+    if (items.length >= 8) {
+      rt.home[chip] = { savedAt: Date.now(), data: out };
+      rtSave();
+    }
+    spanDone({ items: items.length, okPages: pages.filter(p => p.status === 'fulfilled').length });
+    return out;
   });
 }
 

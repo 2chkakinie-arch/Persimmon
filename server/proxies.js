@@ -27,6 +27,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { ProxyAgent, fetch: undiciFetch } = require('undici');
+const { logbus } = require('./logbus');
+const { engineConfig } = require('./config');
 
 const LIST_URLS = [
   'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
@@ -42,10 +44,11 @@ const TEST_TARGET = 'https://www.youtube.com/generate_204';
 const GV_TARGET = 'https://rr5---sn-nx57ynsl.googlevideo.com/generate_204';
 const TEST_TIMEOUT = 3800;
 const MAX_TEST_BATCH = 300;      // candidates per refresh round
-const POOL_SIZE = 30;            // proxies kept hot
+const SCAN_WIDTH = 48;           // 高速化: 並列スキャン幅（旧36→48、プール充填が約1.3倍速い）
 const REFRESH_INTERVAL = 12 * 60 * 1000;
 const CERTIFY_INTERVAL = 10 * 60 * 1000;
-const CERTIFY_TOP_N = 20;        // certify only the fastest N per round
+const CERTIFY_TOP_N = 24;        // certify only the fastest N per round
+const CERTIFY_WIDTH = 4;         // 高速化: 認定の並列幅（旧2→4、L3 issuer 揃いが約2倍速い）
 const CERT_TTL = 2 * 3600 * 1000;
 const FAIL_EVICT = 3;
 
@@ -107,6 +110,11 @@ class ProxyManager {
         scanCursor: this.scanCursor,
       }));
     } catch (_) { /* read-only fs (vercel) */ }
+  }
+
+  /** 設定ページから変更可能なプール維持数（動的） */
+  poolTarget() {
+    return Math.max(8, Number(engineConfig.get('poolSize')) || 30);
   }
 
   _agent(url) {
@@ -211,21 +219,31 @@ class ProxyManager {
   certify({ force = false } = {}) {
     if (!this.enabled) return Promise.resolve();
     if (this.certifying) return this.certifying;
+    if (!engineConfig.get('certify')) return Promise.resolve();
     if (!force && Date.now() - this.lastCertify < CERTIFY_INTERVAL) return Promise.resolve();
     this.certifying = (async () => {
       const targets = [...this.pool].sort((a, b) => a.latency - b.latency).slice(0, CERTIFY_TOP_N);
       const stale = targets.filter(p => Date.now() - (p.issuerTs || 0) > CERT_TTL || Date.now() - (p.gvOkTs || 0) > CERT_TTL);
-      // 2 並列でじわじわ認定（無料プロキシを過負荷にしない）
-      for (let i = 0; i < stale.length; i += 2) {
-        await Promise.all(stale.slice(i, i + 2).map(async (p) => {
+      const spanDone = logbus.span('proxy', 'L2/L3 認定ラウンド', { candidates: stale.length });
+      // 4 並列で認定（無料プロキシを過負荷にしない範囲で最速。発行可能プロキシが
+      // 早く揃うほど初回視聴の player 発行が速くなる）
+      for (let i = 0; i < stale.length; i += CERTIFY_WIDTH) {
+        await Promise.all(stale.slice(i, i + CERTIFY_WIDTH).map(async (p) => {
           const gv = await this._testGv(p.url).catch(() => false);
           if (gv) p.gvOkTs = Date.now();
           const issuerLat = await this._testIssuer(p.url).catch(() => null);
           if (issuerLat != null) { p.issuerTs = Date.now(); p.latency = Math.round(p.latency * 0.5 + issuerLat * 0.5); }
+          logbus.trace('proxy', '認定', {
+            url: p.url, gv: gv ? 'OK' : 'NG', issuer: issuerLat != null ? `OK ${issuerLat}ms` : 'NG',
+          });
         }));
       }
       this.lastCertify = Date.now();
       this._saveDisk();
+      spanDone({
+        gvOk: this.pool.filter(p => p.gvOkTs && Date.now() - p.gvOkTs < CERT_TTL).length,
+        issuerOk: this.pool.filter(p => p.issuerTs && Date.now() - p.issuerTs < CERT_TTL).length,
+      });
     })().finally(() => { this.certifying = null; });
     return this.certifying;
   }
@@ -233,24 +251,31 @@ class ProxyManager {
   async refresh({ force = false } = {}) {
     if (this.refreshing) return this.refreshing;
     if (!force && Date.now() - this.lastRefresh < 60000 && this.pool.length >= 8) return this.pool;
+    const spanDone = logbus.span('proxy', 'プール更新開始', { pool: this.pool.length });
     this.refreshing = (async () => {
       // 1) re-validate existing pool first (cheap, keeps the good cache warm)
       if (this.pool.length) {
+        const spanRe = logbus.span('proxy', '既存プール再検証', { n: this.pool.length });
         const checked = await Promise.all(this.pool.map(p => this._testOne(p.url)));
         const live = new Map(checked.filter(Boolean).map(p => [p.url, p]));
+        const dead = this.pool.length - live.size;
         // keep certification flags of survivors
         this.pool = this.pool
           .filter(p => live.has(p.url))
           .map(p => ({ ...p, latency: live.get(p.url).latency, lastOk: live.get(p.url).lastOk, fails: 0 }))
           .sort((a, b) => a.latency - b.latency);
+        spanRe({ alive: live.size, dead });
       }
       // 2) top up from the lists if needed
+      const POOL_SIZE = this.poolTarget();
       if (this.pool.length < POOL_SIZE) {
         if (!this.list.length || this.scanCursor + MAX_TEST_BATCH > this.list.length * 2) {
+          const spanLists = logbus.span('proxy', '水源リスト取得', { sources: LIST_URLS.length });
           try {
             const fresh = await this._fetchLists();
             if (fresh.length) { this.list = fresh; this.scanCursor = 0; }
-          } catch (_) { /* keep old list */ }
+            spanLists({ candidates: this.list.length });
+          } catch (e) { spanLists({ __error: true, msg: e?.message }); /* keep old list */ }
         }
         const known = new Set(this.pool.map(p => p.url));
         const rejected = new Set();
@@ -261,21 +286,23 @@ class ProxyManager {
             if (!known.has(cand) && !rejected.has(cand)) batch.push(cand);
           }
           if (!batch.length) break;
-          for (let i = 0; i < batch.length; i += 36) {
+          for (let i = 0; i < batch.length; i += SCAN_WIDTH) {
             if (this.pool.length >= POOL_SIZE) break;
-            const chunk = batch.slice(i, i + 36);
+            const chunk = batch.slice(i, i + SCAN_WIDTH);
             const results = await Promise.all(chunk.map(u => this._testOne(u)));
             results.forEach((r, j) => { if (r) this.pool.push(r); else rejected.add(chunk[j]); });
+            logbus.debug('proxy', '候補スキャン', { tested: chunk.length, passed: results.filter(Boolean).length, pool: this.pool.length, cursor: this.scanCursor, listSize: this.list.length });
             if (this.scanCursor >= this.list.length) break;
           }
           if (this.pool.length >= POOL_SIZE || this.scanCursor >= this.list.length) break;
         }
         this.pool = [...new Map(this.pool.map(p => [p.url, p])).values()]
           .sort((a, b) => a.latency - b.latency)
-          .slice(0, POOL_SIZE * 2);
+          .slice(0, Math.max(POOL_SIZE * 2, 40));
       }
       this.lastRefresh = Date.now();
       this._saveDisk();
+      spanDone({ pool: this.pool.length, issuers: this.pool.filter(p => p.issuerTs && Date.now() - p.issuerTs < CERT_TTL).length });
       // L2/L3 認定は裏で走らせる（発行用途は認定フラグで選別）
       this.certify().catch(() => {});
       return this.pool;
@@ -339,7 +366,9 @@ class ProxyManager {
     const p = this.pool.find(p => p.url === url);
     if (!p) return;
     p.fails++;
+    logbus.debug('proxy', '失敗カウント', { url, fails: p.fails });
     if (p.fails >= FAIL_EVICT) {
+      logbus.info('proxy', 'プールから除外', { url, latency: p.latency });
       this.pool = this.pool.filter(x => x.url !== url);
       const a = this.agents.get(url);
       if (a) { a.close?.().catch(() => {}); this.agents.delete(url); }
@@ -352,6 +381,7 @@ class ProxyManager {
     if (!url) return;
     const p = this.pool.find(p => p.url === url);
     if (p && p.issuerTs) { p.issuerTs = 0; this._saveDisk(); }
+    logbus.warn('proxy', '発行用途から降格（LOGIN_REQUIRED）', { url });
     // 発行可能プロキシが枯渇しそうなら即座に再認定を蹴る（無料プロキシは鮮度が命）
     const live = this.pool.filter(x => x.issuerTs && Date.now() - x.issuerTs < CERT_TTL).length;
     if (live < 3) { clearTimeout(this._recertT); this._recertT = setTimeout(() => this.certify({ force: true }).catch(() => {}), 1500); this._recertT.unref?.(); }
@@ -374,9 +404,14 @@ class ProxyManager {
         issuer: !!p.issuerTs && Date.now() - p.issuerTs < CERT_TTL,
       })),
       issuers: this.pool.filter(p => p.issuerTs && Date.now() - p.issuerTs < CERT_TTL).length,
+      gvOk: this.pool.filter(p => p.gvOkTs && Date.now() - p.gvOkTs < CERT_TTL).length,
       listSize: this.list.length,
       cursor: this.scanCursor,
       lastRefresh: this.lastRefresh,
+      lastCertify: this.lastCertify,
+      certifying: !!this.certifying,
+      refreshing: !!this.refreshing,
+      poolTarget: this.poolTarget(),
     };
   }
 }

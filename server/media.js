@@ -18,8 +18,11 @@
  */
 const { request: undiciRequest } = require('undici');
 const { proxyManager } = require('./proxies');
+const { logbus } = require('./logbus');
+const { engineConfig } = require('./config');
 
-const WARM_BYTES = 768 * 1024;      // ~enough for the first seconds of 360p
+// 設定ページから変更可能（KB 指定）。既定 768KB = 360p 冒頭数秒分。
+const warmBytes = () => Math.max(64, Number(engineConfig.get('warmBytes')) || 768) * 1024;
 const MAX_ENTRIES = 48;             // ~36 MB worst-case RAM
 const TTL = 6 * 60 * 1000;
 
@@ -103,13 +106,14 @@ class HotChunks {
     (async () => {
       const ac = new AbortController();
       const t = setTimeout(() => ac.abort(), 15000);
+      const spanDone = logbus.span('stream', 'ホットキャッシュ先読み', { v, itag, kb: Math.round(warmBytes() / 1024), via: proxyUrl ? 'proxy' : 'direct' });
       try {
         const dispatcher = proxyUrl ? proxyManager.dispatcherFor(proxyUrl) : undefined;
         const up = await undiciRequest(url, {
           method: 'GET',
           headers: {
             'User-Agent': 'com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip',
-            'Range': `bytes=0-${WARM_BYTES - 1}`,
+            'Range': `bytes=0-${warmBytes() - 1}`,
             'Accept': '*/*',
           },
           dispatcher,
@@ -125,18 +129,23 @@ class HotChunks {
         for await (const c of up.body) {
           chunks.push(c);
           let len = 0; for (const x of chunks) len += x.length;
-          if (len >= WARM_BYTES) break;
+          if (len >= warmBytes()) break;
         }
         ac.abort(); // we took what we need
-        const buf = Buffer.concat(chunks).subarray(0, WARM_BYTES);
+        const WB = warmBytes();
+        const buf = Buffer.concat(chunks).subarray(0, WB);
         if (buf.length >= 64 * 1024) {
           // full=true: ファイル全体（終端まで）が RAM に載っている状態。
           // ショート動画など小さいファイルはこれで完全サーブ＝上流往復ゼロ。
           this.map.set(key, { buf, exp: Date.now() + TTL, full: total > 0 && total <= buf.length });
           while (this.map.size > MAX_ENTRIES) this.map.delete(this.map.keys().next().value);
+          spanDone({ ok: true, got: buf.length, full: total > 0 && total <= buf.length });
+        } else {
+          spanDone({ __warn: true, note: 'too small', got: buf.length });
         }
-      } catch (_) {
+      } catch (e) {
         /* warming is best-effort — the relay path still works without it */
+        spanDone({ __warn: true, err: e?.message || 'aborted' });
       } finally {
         clearTimeout(t);
         this.warming.delete(key);
