@@ -1,0 +1,327 @@
+/* ================================================================== WATCH */
+
+/* ---------- MSE "DashLite" engine for HD (adaptive video+audio) ---------- */
+class DashLite {
+  static isSupported(vTrack, aTrack) {
+    if (!window.MediaSource || !vTrack || !aTrack) return false;
+    const vc = `${vTrack.mime};codecs="${vTrack.codecs}"`;
+    const ac = `${aTrack.mime};codecs="${aTrack.codecs}"`;
+    try { return MediaSource.isTypeSupported(vc) && MediaSource.isTypeSupported(ac); } catch (_) { return false; }
+  }
+
+  constructor(video, videoId, vTrack, aTrack) {
+    this.video = video;
+    this.videoId = videoId;
+    this.vTrack = vTrack;
+    this.aTrack = aTrack;
+    this.mse = new MediaSource();
+    this.url = URL.createObjectURL(this.mse);
+    this.dead = false;
+    this.posV = 0; this.posA = 0;      // segment indexes
+    this.pumpRunning = false;
+    this.startAt = 0;
+    this.retry403 = 0;
+    this._onTime = () => this.pump().catch(() => {});
+    this._onSeek = () => this._handleSeek().catch(() => {});
+  }
+
+  async _range(itag, start, end) {
+    let res = await fetch(`/api/stream?v=${this.videoId}&itag=${itag}`, { headers: { Range: `bytes=${start}-${end}` } });
+    if (res.status === 403 && this.retry403 < 2) {
+      // upstream URL died (IP mismatch / expiry): make the server rebuild it once
+      this.retry403++;
+      await api('/api/player/refresh', { method: 'POST', body: JSON.stringify({ v: this.videoId }) }).catch(() => {});
+      res = await fetch(`/api/stream?v=${this.videoId}&itag=${itag}&r=${Date.now()}`, { headers: { Range: `bytes=${start}-${end}` } });
+    }
+    if (!res.ok && res.status !== 206) throw new Error('range ' + res.status);
+    return res.arrayBuffer();
+  }
+
+  _parseSidx(buf, indexEnd) {
+    const dv = new DataView(buf);
+    let off = 0;
+    while (off + 8 <= dv.byteLength) {
+      const size = dv.getUint32(off);
+      const type = String.fromCharCode(dv.getUint8(off + 4), dv.getUint8(off + 5), dv.getUint8(off + 6), dv.getUint8(off + 7));
+      if (type === 'sidx') {
+        const version = dv.getUint8(off + 8);
+        let p = off + 12; // skip fullbox
+        p += 4; // reference_id
+        const timescale = dv.getUint32(p); p += 4;
+        let earliest, firstOffset;
+        if (version === 0) { earliest = dv.getUint32(p); p += 4; firstOffset = dv.getUint32(p); p += 4; }
+        else { earliest = Number(dv.getBigUint64(p)); p += 8; firstOffset = Number(dv.getBigUint64(p)); p += 8; }
+        p += 2; // reserved
+        const count = dv.getUint16(p); p += 2;
+        const segs = [];
+        let cumDur = 0;
+        let cur = indexEnd + 1 + firstOffset;
+        for (let i = 0; i < count; i++) {
+          const ref = dv.getUint32(p); const dur = dv.getUint32(p + 4); p += 12;
+          const refSize = ref & 0x7fffffff;
+          const t0 = (earliest + cumDur) / timescale;
+          const t1 = (earliest + cumDur + dur) / timescale;
+          segs.push({ start: cur, end: cur + refSize - 1, t0, t1 });
+          cur += refSize; cumDur += dur;
+        }
+        return segs;
+      }
+      if (!size || size < 8) break;
+      off += size;
+    }
+    throw new Error('no sidx');
+  }
+
+  async init(startTime = 0) {
+    const v = this.vTrack, a = this.aTrack;
+    if (!v.initRange || !v.indexRange || !a.initRange || !a.indexRange) throw new Error('no index');
+    const [vInit, vIdx, aInit, aIdx] = await Promise.all([
+      this._range(v.itag, v.initRange.start, v.initRange.end),
+      this._range(v.itag, +v.indexRange.start, +v.indexRange.end),
+      this._range(a.itag, a.initRange.start, a.initRange.end),
+      this._range(a.itag, +a.indexRange.start, +a.indexRange.end),
+    ]);
+    if (this.dead) return;
+    this.vSegs = this._parseSidx(vIdx, +v.indexRange.end);
+    this.aSegs = this._parseSidx(aIdx, +a.indexRange.end);
+    this.vInit = vInit; this.aInit = aInit;
+    this.video.src = this.url;
+    await new Promise((res, rej) => {
+      const to = setTimeout(() => rej(new Error('mse open timeout')), 8000);
+      this.mse.addEventListener('sourceopen', () => { clearTimeout(to); res(); }, { once: true });
+    });
+    if (this.dead) return;
+    this.vbuf = this.mse.addSourceBuffer(`${v.mime};codecs="${v.codecs}"`);
+    this.abuf = this.mse.addSourceBuffer(`${a.mime};codecs="${a.codecs}"`);
+    this.posV = this._segIndex(this.vSegs, startTime);
+    this.posA = this._segIndex(this.aSegs, startTime);
+    this.startAt = startTime;
+    this.pending = [{ buf: this.abuf, data: aInit }, { buf: this.vbuf, data: vInit }];
+    await this._flush();
+    this.video.addEventListener('timeupdate', this._onTime);
+    this.video.addEventListener('seeking', this._onSeek);
+    this.pumpRunning = true;
+    await this.pump();
+  }
+
+  _segIndex(segs, t) {
+    for (let i = 0; i < segs.length; i++) if (t < segs[i].t1) return i;
+    return segs.length - 1;
+  }
+
+  _append(buf, data) {
+    return new Promise((res, rej) => {
+      if (this.dead || this.mse.readyState !== 'open') return rej(new Error('destroyed'));
+      const done = () => { cleanup(); res(); };
+      const fail = () => { cleanup(); rej(new Error('append error')); };
+      const cleanup = () => {
+        buf.removeEventListener('updateend', done);
+        buf.removeEventListener('error', fail);
+      };
+      buf.addEventListener('updateend', done, { once: true });
+      buf.addEventListener('error', fail, { once: true });
+      try { buf.appendBuffer(data); } catch (e) { cleanup(); rej(e); }
+    });
+  }
+
+  async _flush() {
+    while (this.pending?.length) {
+      const { buf, data } = this.pending.shift();
+      await this._append(buf, data);
+      if (this.dead) return;
+    }
+  }
+
+  _bufferedEnd(which) {
+    const b = which === 'v' ? this.vbuf : this.abuf;
+    try { const r = b.buffered; return r.length ? r.end(r.length - 1) : 0; } catch (_) { return 0; }
+  }
+
+  async pump() {
+    if (!this.pumpRunning || this._pumping || this.dead) return;
+    if (this.video.error) return; // メディア要素がエラー状態なら append は常に失敗する
+    this._pumping = true;
+    try {
+      for (;;) {
+        if (this.dead) return;
+        if (this.video.error) return;
+        const t = this.video.currentTime;
+        const endV = this._bufferedEnd('v'), endA = this._bufferedEnd('a');
+        if (endV - t > 24 && endA - t > 24) return;
+        if (this.posV >= this.vSegs.length && this.posA >= this.aSegs.length) return;
+        // fetch whichever buffer is shorter
+        const pickVideo = this.posV < this.vSegs.length && (this.posA >= this.aSegs.length || endV <= endA + 0.5);
+        if (pickVideo) {
+          if (this.posV >= this.vSegs.length) return;
+          const seg = this.vSegs[this.posV++];
+          const data = await this._range(this.vTrack.itag, seg.start, seg.end);
+          if (this.dead) return;
+          await this._append(this.vbuf, data);
+        } else {
+          if (this.posA >= this.aSegs.length) return;
+          const seg = this.aSegs[this.posA++];
+          const data = await this._range(this.aTrack.itag, seg.start, seg.end);
+          if (this.dead) return;
+          await this._append(this.abuf, data);
+        }
+      }
+    } finally {
+      this._pumping = false;
+    }
+  }
+
+  async _handleSeek() {
+    if (this.dead || !this.vbuf) return;
+    const t = this.video.currentTime;
+    const inV = t >= 0 && t < this._bufferedEnd('v');
+    const inA = t >= 0 && t < this._bufferedEnd('a');
+    if (inV && inA) { this.pump().catch(() => {}); return; }
+    // re-sync both pipelines at t
+    try {
+      await this._clear(this.vbuf); await this._clear(this.abuf);
+      this.posV = this._segIndex(this.vSegs, t);
+      this.posA = this._segIndex(this.aSegs, t);
+      this.pump().catch(() => {});
+    } catch (_) { /* leave it; progressive fallback handled by caller on fatal */ }
+  }
+
+  _clear(buf) {
+    return new Promise((res) => {
+      if (this.mse.readyState !== 'open' || buf.updating) { const h = () => { buf.removeEventListener('updateend', h); res(); }; if (buf.updating) { buf.addEventListener('updateend', h); return; } return res(); }
+      const r = buf.buffered;
+      if (!r.length) return res();
+      buf.addEventListener('updateend', () => res(), { once: true });
+      try { buf.remove(r.start(0), r.end(r.length - 1)); } catch (_) { res(); }
+    });
+  }
+
+  destroy() {
+    this.dead = true;
+    this.pumpRunning = false;
+    this.video.removeEventListener('timeupdate', this._onTime);
+    this.video.removeEventListener('seeking', this._onSeek);
+    try { if (this.mse.readyState === 'open') this.mse.endOfStream(); } catch (_) {}
+    try { URL.revokeObjectURL(this.url); } catch (_) {}
+  }
+}
+
+/* --------------------------- custom player chrome --------------------------- */
+class PlayerUI {
+  constructor(wrap, video, getQualities) {
+    this.wrap = wrap;
+    this.video = video;
+    this.getQualities = getQualities;
+    this._build();
+    this._bind();
+  }
+  _build() {
+    this.wrap.insertAdjacentHTML('beforeend', `
+      <div class="spin hidden" data-el="spin"></div>
+      <div class="center-flash hidden" data-el="flash"></div>
+      <div class="qmenu hidden" data-el="qmenu"></div>
+      <div class="player-overlay">
+        <input type="range" class="seek" data-el="seek" min="0" max="1000" value="0" step="1">
+        <div class="ctl-row">
+          <button class="icon-btn" data-el="play" title="再生 (k)">${ICON_PLAY}</button>
+          <button class="icon-btn" data-el="vol" title="ミュート (m)"><svg viewBox="0 0 24 24" class="ic"><path d="M3 9v6h4l5 5V4L7 9zm13.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4zM14 2.2v2.1a7 7 0 0 1 0 15.4v2.1a9 9 0 0 0 0-19.6z"/></svg></button>
+          <input type="range" class="seek" data-el="volrange" min="0" max="100" value="100" style="width:72px">
+          <span class="p-time" data-el="time">0:00 / 0:00</span>
+          <div class="p-spacer"></div>
+          <button class="icon-btn" data-el="settings" title="設定"><svg viewBox="0 0 24 24" class="ic"><path d="M19.7 13.4a7.6 7.6 0 0 0 0-2.8l2-1.5a.5.5 0 0 0 .1-.7l-1.9-3.2a.5.5 0 0 0-.6-.2l-2.3.9a7.7 7.7 0 0 0-2.4-1.4L14.2 2a.5.5 0 0 0-.5-.4h-3.8a.5.5 0 0 0-.5.4L9 4.5a7.7 7.7 0 0 0-2.4 1.4l-2.3-.9a.5.5 0 0 0-.6.2L1.8 8.4a.5.5 0 0 0 .1.7l2 1.5a7.6 7.6 0 0 0 0 2.8l-2 1.5a.5.5 0 0 0-.1.7l1.9 3.2c.14.24.42.34.68.22l2.3-.9c.72.56 1.53 1.03 2.4 1.4l.35 2.5c.04.24.24.4.5.4h3.8c.24 0 .45.17.5-.4l.35-2.5a7.7 7.7 0 0 0 2.4-1.4l2.3.9c.24.1.52.02.65-.22l1.9-3.18a.5.5 0 0 0-.1-.73zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"/></svg></button>
+          <button class="icon-btn" data-el="fs" title="全画面表示 (f)"><svg viewBox="0 0 24 24" class="ic"><path d="M7 14H5v5h5v-2H7zm-2-4h2V7h3V5H5zm12 7h-3v2h5v-5h-2zM14 5v2h3v3h2V5z"/></svg></button>
+        </div>
+      </div>`);
+    this.el = {};
+    $$('[data-el]', this.wrap).forEach(n => this.el[n.dataset.el] = n);
+  }
+  flash(icon) {
+    const f = this.el.flash;
+    f.innerHTML = `<div>${icon}</div>`;
+    f.classList.remove('hidden');
+    clearTimeout(this._ft);
+    this._ft = setTimeout(() => f.classList.add('hidden'), 480);
+  }
+  /** big center play button when autoplay is blocked */
+  showBigPlay() {
+    if (this.el.bigplay) { this.el.bigplay.classList.remove('hidden'); return; }
+    const b = document.createElement('button');
+    b.className = 'center-play';
+    b.dataset.el = 'bigplay';
+    b.innerHTML = `<div style="background:rgba(0,0,0,.65);border-radius:50%;width:76px;height:76px;display:grid;place-items:center;cursor:pointer">${ICON_PLAY}</div>`;
+    b.style.cssText = 'position:absolute;inset:0;display:grid;place-items:center;background:none';
+    b.addEventListener('click', () => { this.video.play().catch(() => {}); b.classList.add('hidden'); });
+    this.video.addEventListener('play', () => b.classList.add('hidden'));
+    this.wrap.appendChild(b);
+    this.el.bigplay = b;
+  }
+  _bind() {
+    const v = this.video;
+    const seek = this.el.seek;
+    const setProg = () => {
+      const d = v.duration || 0;
+      seek.value = d ? Math.round(v.currentTime / d * 1000) : 0;
+      seek.style.setProperty('--prog', (seek.value / 10) + '%');
+      this.el.time.textContent = `${fmtDur(v.currentTime)} / ${fmtDur(d)}`;
+    };
+    v.addEventListener('timeupdate', setProg);
+    v.addEventListener('durationchange', setProg);
+    v.addEventListener('play', () => { this.el.play.innerHTML = ICON_PAUSE; this.flash(ICON_PLAY); });
+    v.addEventListener('pause', () => { this.el.play.innerHTML = ICON_PLAY; this.flash(ICON_PAUSE); });
+    v.addEventListener('waiting', () => this.el.spin.classList.remove('hidden'));
+    v.addEventListener('playing', () => this.el.spin.classList.add('hidden'));
+    v.addEventListener('canplay', () => this.el.spin.classList.add('hidden'));
+    seek.addEventListener('input', () => {
+      const d = v.duration || 0;
+      if (d) v.currentTime = seek.value / 1000 * d;
+      seek.style.setProperty('--prog', (seek.value / 10) + '%');
+    });
+    this.el.play.addEventListener('click', () => this.togglePlay());
+    this.el.vol.addEventListener('click', () => { v.muted = !v.muted; });
+    this.el.volrange.addEventListener('input', () => { v.volume = this.el.volrange.value / 100; v.muted = false; });
+    this.el.fs.addEventListener('click', () => this.toggleFs());
+    this.el.settings.addEventListener('click', (e) => { e.stopPropagation(); this.toggleMenu(); });
+    this.wrap.addEventListener('dblclick', (e) => { if (!e.target.closest('.qmenu')) this.toggleFs(); });
+    v.addEventListener('click', () => this.togglePlay());
+    // 修正: document レベルのキーハンドラは destroy() で必ず外す
+    // （動画を渡り歩くたびにハンドラが累積し、ショートカットが多重発火していた）
+    this._key = (e) => {
+      if (!document.body.contains(this.wrap)) return;
+      if (/INPUT|TEXTAREA/.test(document.activeElement?.tagName || '')) return;
+      if (e.key === 'k' || (e.key === ' ' && document.fullscreenElement === this.wrap)) { e.preventDefault(); this.togglePlay(); }
+      if (e.key === 'f') this.toggleFs();
+      if (e.key === 'm') v.muted = !v.muted;
+      if (e.key === 'ArrowRight') v.currentTime += 5;
+      if (e.key === 'ArrowLeft') v.currentTime -= 5;
+    };
+    document.addEventListener('keydown', this._key);
+  }
+  togglePlay() { const v = this.video; v.paused ? v.play().catch(() => {}) : v.pause(); }
+  toggleFs() {
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    else this.wrap.requestFullscreen?.().catch(() => {});
+  }
+  toggleMenu() {
+    const q = this.el.qmenu;
+    if (!q.classList.contains('hidden')) { q.classList.add('hidden'); return; }
+    const { qualities, current, onPick, speeds, speed, onSpeed } = this.getQualities();
+    q.innerHTML =
+      `<div class="qhead">画質</div>` +
+      qualities.map(ql => `<div class="qi ${ql.key === current ? 'sel' : ''}" data-q="${ql.key}"><span>${esc(ql.label)}</span></div>`).join('') +
+      `<div class="qhead">再生速度</div>` +
+      speeds.map(s => `<div class="qi" data-s="${s}" style="${s === speed ? 'color:#3ea6ff' : ''}"><span>${s === 1 ? '標準' : s + 'x'}</span></div>`).join('');
+    q.classList.remove('hidden');
+    const close = (e) => {
+      if (!q.contains(e.target)) { q.classList.add('hidden'); document.removeEventListener('click', close); }
+    };
+    document.addEventListener('click', close);
+    $$('.qi', q).forEach(n => n.addEventListener('click', () => {
+      if (n.dataset.q) onPick(n.dataset.q);
+      if (n.dataset.s) onSpeed(parseFloat(n.dataset.s));
+      q.classList.add('hidden');
+    }));
+  }
+  destroy() {
+    if (this._key) { document.removeEventListener('keydown', this._key); this._key = null; }
+    clearTimeout(this._ft);
+  }
+}

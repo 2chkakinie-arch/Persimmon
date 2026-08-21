@@ -1,0 +1,248 @@
+/* llytpr-wl.v01nh — frontend SPA.
+ * InnerTube-backed YouTube experience: personalized home / search / watch
+ * (direct-first playback with instant relay fallback, MSE HD "DashLite") /
+ * comments / channel / playlist / dedicated shorts surfaces.
+ * Local profile (history / likes / saved / subs) lives in localStorage only —
+ * nothing personal ever leaves the browser except anonymous query signals.
+ *
+ * Made by Kakinie with llytpr-wl.v01nh TEAM. V1 */
+'use strict';
+(() => {
+
+/* ------------------------------------------------------------ tiny helpers */
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+const app = $('#app');
+
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+
+function toast(msg, ms = 2600) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.classList.remove('hidden');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => t.classList.add('hidden'), ms);
+}
+window.toast = toast;
+
+const fmtDur = (sec) => {
+  sec = Math.max(0, Math.floor(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const mm = h ? String(m).padStart(2, '0') : String(m);
+  return (h ? h + ':' : '') + mm + ':' + String(s).padStart(2, '0');
+};
+
+function linkify(text) {
+  const escT = esc(text);
+  return escT
+    .replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>')
+    .replace(/(^|\s)#([\p{L}\p{N}_ー-龯ぁ-んァ-ヶ]+)/gu, (m, p1, p2) => p1 + `<a href="#/results?search_query=${encodeURIComponent('#' + p2)}">#${esc(p2)}</a>`);
+}
+
+/* -------------------------------------------------- local profile storage */
+const Store = {
+  get(k, def) { try { const v = JSON.parse(localStorage.getItem('llytpr:' + k)); return v ?? def; } catch (_) { return def; } },
+  set(k, v) { try { localStorage.setItem('llytpr:' + k, JSON.stringify(v)); } catch (_) { /* private mode */ } },
+  del(k) { try { localStorage.removeItem('llytpr:' + k); } catch (_) { /* private mode */ } },
+};
+/** 期限付きローカル保存（直結学習など鮮度が命の情報用）。
+ *  かつて directOk / directBlocked が無期限の localStorage フラグだったため、
+ *  「一時的な直結失敗が永遠に残り、直結できる動画がプロキシされ続ける」
+ *  バグが発生していた。期限切れ自動失効で構造的に再発防止する。 */
+const DIRECT_OK_TTL = 24 * 3600e3;     // 「この回線は直結OK」学習の有効期限
+const DIRECT_BLOCK_TTL = 10 * 60e3;    // 「直結不安定」判定の有効期限（10分で再挑戦）
+Store.setExp = (k, v, ttl) => Store.set('exp:' + k, { v, e: Date.now() + ttl });
+Store.getExp = (k, def) => {
+  const r = Store.get('exp:' + k, null);
+  if (r && typeof r === 'object' && typeof r.e === 'number') {
+    if (r.e > Date.now()) return r.v;
+    Store.del('exp:' + k); // 期限切れは即掃除
+  }
+  return def;
+};
+
+/** watch history: [{v,t,cn,ch,d,ts}] newest-first, unique per video */
+const History = {
+  list() { return Store.get('history', []); },
+  add(entry) {
+    if (!entry?.v) return;
+    let list = History.list().filter(h => h.v !== entry.v);
+    entry.ts = Date.now();
+    list.unshift(entry);
+    Store.set('history', list.slice(0, 200));
+  },
+  remove(v) { Store.set('history', History.list().filter(h => h.v !== v)); },
+  clear() { Store.set('history', []); },
+};
+/** liked videos: {v: {v,t,cn,ch,ts}} */
+const Likes = {
+  map() { return Store.get('likes', {}); },
+  has(v) { return !!Likes.map()[v]; },
+  toggle(entry) {
+    const m = Likes.map();
+    if (m[entry.v]) { delete m[entry.v]; Store.set('likes', m); return false; }
+    m[entry.v] = { ...entry, ts: Date.now() };
+    const keys = Object.keys(m);
+    if (keys.length > 200) delete m[keys.sort((a, b) => m[a].ts - m[b].ts)[0]];
+    Store.set('likes', m);
+    return true;
+  },
+  list() { return Object.values(Likes.map()).sort((a, b) => b.ts - a.ts); },
+};
+/** saved ("watch later") videos */
+const Saves = {
+  map() { return Store.get('saves', {}); },
+  has(v) { return !!Saves.map()[v]; },
+  toggle(entry) {
+    const m = Saves.map();
+    if (m[entry.v]) { delete m[entry.v]; Store.set('saves', m); return false; }
+    m[entry.v] = { ...entry, ts: Date.now() };
+    Store.set('saves', m);
+    return true;
+  },
+  list() { return Object.values(Saves.map()).sort((a, b) => b.ts - a.ts); },
+};
+/** locally-subscribed channels: {id: {id,name,avatar,ts}} */
+const Subs = {
+  map() { return Store.get('subs', {}); },
+  has(id) { return !!id && !!Subs.map()[id]; },
+  toggle(ch) {
+    if (!ch?.id) return false;
+    const m = Subs.map();
+    if (m[ch.id]) { delete m[ch.id]; Store.set('subs', m); return false; }
+    m[ch.id] = { id: ch.id, name: ch.name || '', avatar: ch.avatar || '', ts: Date.now() };
+    Store.set('subs', m);
+    return true;
+  },
+  list() { return Object.values(Subs.map()).sort((a, b) => b.ts - a.ts); },
+};
+/** recent search phrases — strongest preference signal */
+const Searches = {
+  list() { return Store.get('searches', []); },
+  add(q) {
+    q = (q || '').trim();
+    if (!q) return;
+    let list = Searches.list().filter(s => s !== q);
+    list.unshift(q);
+    Store.set('searches', list.slice(0, 30));
+  },
+};
+
+/** playlist context — クリック時点で文脈を sessionStorage 保存。
+ *  視聴ページはサーバー往復を待たずローカルスナップショットから瞬時に
+ *  パネルを描画し（バグの隙も無い）、裏で完全版に追従する。 */
+const PlCtx = {
+  key: (lid) => 'plctx:' + lid,
+  save(lid, data) {
+    try {
+      if (!lid || !data?.items?.length) return;
+      const slim = {
+        id: lid, title: data.title || '', owner: data.owner || '',
+        total: data.total || data.items.length || 0, ts: Date.now(),
+        items: data.items.slice(0, 120).map(v => ({
+          id: v.id, title: v.title || '', channel: v.channel || '',
+          thumb: v.thumb ? String(v.thumb).slice(0, 120) : '', duration: v.duration || '',
+        })),
+      };
+      sessionStorage.setItem(this.key(lid), JSON.stringify(slim));
+    } catch (_) { /* quota — additive only */ }
+  },
+  load(lid) {
+    try {
+      const j = JSON.parse(sessionStorage.getItem(this.key(lid)) || 'null');
+      if (j && j.items?.length && Date.now() - j.ts < 3600e3) return j;
+    } catch (_) { /* parse — ignore */ }
+    return null;
+  },
+};
+
+/** preference profile inferred from history + likes + searches */
+function buildProfile() {
+  const hist = History.list();
+  const likes = Likes.list();
+  const searches = Searches.list();
+  if (!hist.length && !likes.length && !searches.length) return null;
+  const queries = [];
+  const push = (q) => { q = String(q || '').trim(); if (q && !queries.includes(q) && queries.length < 4) queries.push(q); };
+  searches.slice(0, 2).forEach(push);
+  const chCount = {};
+  for (const h of hist.slice(0, 40)) if (h.cn) chCount[h.cn] = (chCount[h.cn] || 0) + 1;
+  for (const l of likes) if (l.cn) chCount[l.cn] = (chCount[l.cn] || 0) + 2;
+  Object.entries(chCount).sort((a, b) => b[1] - a[1]).slice(0, 2).forEach(([cn]) => push(cn));
+  likes.slice(0, 2).forEach(l => push((l.t || '').slice(0, 50)));
+  if (!queries.length) hist.slice(0, 2).forEach(h => push((h.t || '').slice(0, 50)));
+  const relatedOf = [...likes.map(l => l.v), ...hist.map(h => h.v)]
+    .filter(v => /^[\w-]{11}$/.test(v || '')).slice(0, 3);
+  return { queries, relatedOf };
+}
+
+/* ----------------------------------------------------------------- api kit */
+const mem = new Map();
+/**
+ * api — メモリキャッシュ + 同一リクエスト束ね + (オプション) セッション持続キャッシュ。
+ *
+ * 高速化（初回の待ち短縮）: persist ミリ秒を渡すと成功応答を sessionStorage に
+ * 保存し、セッション内の再訪（検索→動画→戻る など）はネットワーク往復ゼロで
+ * 即描画される。動画 URL を含む watch 系には使わない（鮮度が命のため）。
+ */
+function scGet(key) {
+  try {
+    const raw = sessionStorage.getItem('llytpr:sc:' + key);
+    if (!raw) return undefined;
+    const j = JSON.parse(raw);
+    if (j && j.exp > Date.now()) return j.d;
+    sessionStorage.removeItem('llytpr:sc:' + key);
+  } catch (_) { /* quota / private mode */ }
+  return undefined;
+}
+function scSet(key, d, ttl) {
+  try { sessionStorage.setItem('llytpr:sc:' + key, JSON.stringify({ d, exp: Date.now() + ttl })); } catch (_) { /* quota */ }
+}
+async function api(path, { ttl = 5 * 60e3, method = 'GET', body, persist = 0 } = {}) {
+  const key = method + ':' + path + (body ? ':' + body : '');
+  if (method === 'GET') {
+    const hit = mem.get(key);
+    if (hit && hit.exp > Date.now()) return hit.data;
+    if (persist) {
+      const s = scGet(key);
+      if (s !== undefined) { mem.set(key, { data: s, exp: Date.now() + ttl }); return s; }
+    }
+  }
+  const inflight = api._inflight.get(key);
+  if (inflight) return inflight;
+  const p = fetch(path, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body,
+  }).then(async (res) => {
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) { const e = new Error(j.error || ('HTTP ' + res.status)); e.status = res.status; e.payload = j; throw e; }
+    if (method === 'GET') {
+      mem.set(key, { data: j, exp: Date.now() + ttl });
+      if (persist) scSet(key, j, persist);
+    }
+    api._inflight.delete(key);
+    return j;
+  }).catch(e => { api._inflight.delete(key); throw e; });
+  api._inflight.set(key, p);
+  return p;
+}
+api._inflight = new Map();
+api.invalidate = (prefix) => { for (const k of mem.keys()) if (String(k).includes(prefix)) mem.delete(k); };
+
+/* infinite scroll helper */
+function lazySentinel(container, onFire) {
+  const io = new IntersectionObserver((es) => {
+    if (es.some(e => e.isIntersecting)) onFire();
+  }, { rootMargin: '1200px' });
+  const el = document.createElement('div');
+  el.className = 'sentinel';
+  el.style.height = '1px';
+  container.appendChild(el);
+  io.observe(el);
+  return {
+    done() { io.disconnect(); el.remove(); },
+    el,
+  };
+}

@@ -1,0 +1,105 @@
+/* ================================================================== SEARCH */
+function renderResults(params) {
+  const q = params.get('search_query') || params.get('q') || '';
+  setActiveNav('home');
+  $('#search-input').value = q;
+  if (!q) { renderHome(); return; }
+  Searches.add(q);
+  app.innerHTML = `<div class="results" id="res-body">${skGrid(6)}</div>`;
+  let continuation = null;
+  let loading = false;
+  let sentinel = null;
+  let filtered = 'すべて';
+
+  function listCard(it) {
+    if (it.kind === 'video') return resultCard(it);
+    if (it.kind === 'playlist') return playlistRow(it);
+    if (it.kind === 'short') return shortCard(it);
+    return videoCard(it); // channels via channelRow inside
+  }
+
+  function draw(list) {
+    const body = $('#res-body');
+    if (!body) return;
+    const KEY = { '動画': 'video', 'チャンネル': 'channel', '再生リスト': 'playlist', 'ショート': 'short' };
+    const chipsHtml = `
+      <div class="chips" style="position:static;padding:0 0 16px">
+        ${['すべて', '動画', 'チャンネル', '再生リスト', 'ショート'].map(f => `<button class="chip ${f === filtered ? 'active' : ''}" data-f="${f}">${f}</button>`).join('')}
+      </div>`;
+
+    let content = '';
+    if (filtered === 'すべて') {
+      // YouTube behavior: one dedicated Shorts shelf inside the vertical list
+      const shorts = list.filter(it => it.kind === 'short');
+      const others = list.filter(it => it.kind !== 'short');
+      const head = others.slice(0, 3), tail = others.slice(3);
+      content = `<div class="results-list">`
+        + head.map(listCard).join('')
+        + `</div>`
+        + (shorts.length ? shortsShelf(shorts) : '')
+        + `<div class="results-list">`
+        + tail.map(listCard).join('')
+        + `</div>`;
+      if (!others.length && !shorts.length) content = emptyResult();
+    } else if (filtered === 'ショート') {
+      const shorts = list.filter(it => it.kind === 'short');
+      content = shorts.length
+        ? `<div class="sec-title" style="padding:0 0 12px">ショート</div><div class="shorts-grid">${shorts.map(shortCard).join('')}</div>`
+        : emptyResult('この検索ではショート動画が見つかりませんでした。');
+    } else {
+      const show = list.filter(it => it.kind === KEY[filtered]);
+      content = show.length
+        ? `<div class="results-list">${show.map(listCard).join('')}</div>`
+        : emptyResult();
+    }
+    body.innerHTML = chipsHtml + content;
+    $$('.chip', body).forEach(b => b.addEventListener('click', () => { filtered = b.dataset.f; draw(allItems); }));
+    if (sentinel) { sentinel.done(); sentinel = null; }
+    if (continuation) sentinel = lazySentinel(body, loadMore);
+  }
+
+  function emptyResult(msg = '別のキーワードで検索してみてください。') {
+    return `<div class="empty-state"><h1>結果が見つかりません</h1><p>${esc(msg)}</p></div>`;
+  }
+
+  function resultCard(it) {
+    const meta = it.metaTop?.join(' • ') || [it.views, it.published].filter(Boolean).join(' • ');
+    return `
+    <div class="result-card" data-href="#/watch?v=${esc(it.id)}" data-vid="${esc(it.id)}">
+      <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt="">
+        ${it.duration ? `<span class="dur">${esc(it.duration)}</span>` : ''}
+      </div>
+      <div class="vinfo result-info">
+        <div class="vtitle">${esc(it.title)}</div>
+        <div class="result-sub">${esc(meta)}</div>
+        ${it.channel ? `<div class="result-ch"><div class="r-ava vava">${it.channelAvatar ? `<img loading="lazy" src="${esc(it.channelAvatar)}" alt="">` : '<svg viewBox="0 0 24 24" style="width:100%;height:100%;fill:var(--text-3)"><path d="M12 4a3.5 3.5 0 1 1 0 7 3.5 3.5 0 0 1 0-7zm0 18c-3.2 0-6-.5-6-1.5 0-2.5 3.5-4 6-4s6 1.5 6 4c0 1-2.8 1.5-6 1.5z"/></svg>'}</div><span>${esc(it.channel)}</span></div>` : ''}
+      </div>
+    </div>`;
+  }
+
+  let allItems = [];
+  function loadMore() {
+    if (loading || !continuation) return;
+    loading = true;
+    const spin = document.createElement('div');
+    spin.className = 'mini-spin';
+    $('#res-body')?.appendChild(spin);
+    api('/api/search/next?c=' + encodeURIComponent(continuation), { ttl: 10 * 60e3 })
+      .then(d => {
+        spin.remove();
+        loading = false;
+        continuation = d.continuation;
+        allItems = allItems.concat(d.items || []);
+        draw(allItems);
+      })
+      .catch(() => { spin.remove(); loading = false; });
+  }
+
+  api('/api/search?q=' + encodeURIComponent(q), { ttl: 10 * 60e3, persist: 5 * 60e3 })
+    .then(d => {
+      allItems = d.items || [];
+      continuation = d.continuation;
+      draw(allItems);
+    })
+    .catch(e => errBox('検索に失敗しました: ' + e.message, () => renderResults(params)));
+}

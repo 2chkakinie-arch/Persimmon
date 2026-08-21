@@ -1,0 +1,991 @@
+/* --------------------------------- watch page -------------------------------- */
+function renderWatch(params, { vertical = false, shortId = null } = {}) {
+  const id = shortId || params.get('v') || '';
+  if (!/^[\w-]{11}$/.test(id)) { errBox('動画IDが不正です', () => render()); return; }
+  setActiveNav(vertical ? 'shorts' : 'home');
+  const listId = params.get('list') || '';
+  let destroyed = false;
+  let dash = null;
+  let hlsInst = null;
+  let pair = null;              // {audio, iv} — HD video + separate audio sync
+  let mode = 'auto'; // 'auto' | 'hdauto' | 'direct' | '360p' | itag string
+  let ui = null;
+  let rescues = 0;
+  let suppressErrorHook = false;
+  let instantAttached = false;
+
+  app.innerHTML = `
+  <div class="watch">
+    <div class="player-col">
+      <div class="player-wrap ${vertical ? 'vertical' : ''}" id="pwrap">
+        <video id="pvideo" playsinline autoplay preload="auto" ${vertical ? 'loop' : ''}></video>
+        <div class="spin" data-spin></div>
+      </div>
+      <div class="wtitle"><div class="sk sk-line" style="width:70%"></div></div>
+      <div class="action-row"><div class="sk sk-line" style="width:280px"></div></div>
+      <div class="desc-card"><div class="sk sk-line"></div><div class="sk sk-line w60"></div></div>
+      <div class="comments" id="comments"><h3>コメント</h3><div class="mini-spin"></div></div>
+    </div>
+    <div class="rail" id="rail"></div>
+  </div>`;
+
+  const video = $('#pvideo');
+  const wrapEl = $('#pwrap');
+
+  // ---- INSTANT START: don't wait for the API round-trip. Attach the default
+  // 360p relay immediately; the server resolves the (IP-pinned) URL and the
+  // RAM hot-cache answers the first bytes. UI/meta fill in alongside.
+  try {
+    suppressErrorHook = true; // verdict arrives with /api/watch
+    video.src = `/api/stream?v=${id}&itag=18`;
+    instantAttached = true;
+    const early = video.play();
+    if (early?.catch) early.catch(() => { /* autoplay policy — safePlay later */ });
+  } catch (_) { /* continue without instant attach */ }
+
+  function killPair() {
+    if (!pair) return;
+    try { clearInterval(pair.iv); } catch (_) {}
+    try { video.removeEventListener('play', pair.onPlay); } catch (_) {}
+    try { video.removeEventListener('pause', pair.onPause); } catch (_) {}
+    try { video.removeEventListener('seeked', pair.onSeeked); } catch (_) {}
+    try { video.removeEventListener('waiting', pair.onWaiting); } catch (_) {}
+    try { video.removeEventListener('playing', pair.onPlaying); } catch (_) {}
+    try { video.removeEventListener('ratechange', pair.onRate); } catch (_) {}
+    try { video.removeEventListener('volumechange', pair.onVol); } catch (_) {}
+    try { pair.audio.pause(); pair.audio.removeAttribute('src'); pair.audio.load(); } catch (_) {}
+    pair.audioEl?.remove?.();
+    pair = null;
+    video.muted = false;
+  }
+
+  function cleanup() {
+    destroyed = true;
+    try { dash?.destroy(); } catch (_) {}
+    try { hlsInst?.destroy(); } catch (_) {}
+    try { ui?.destroy(); } catch (_) {}
+    killPair();
+    try { video.pause(); video.removeAttribute('src'); video.load(); } catch (_) {}
+  }
+
+  /* プレイリスト文脈は URL パラメータ非依存のローカル一次情報源から即時開始
+   * （サーバー往復ゼロ）。サーバー応答にパネルが同梱された場合のみ後追い更新。
+   * （パネル系シンボルは本スコープ末尾で初期化されるため 1 ティックだけ遅延） */
+  let panelStarted = false;
+  if (listId) {
+    panelStarted = true;
+    setTimeout(() => { if (!destroyed) setupPlaylistPanel(listId, id, null, PlCtx.load(listId)); }, 0);
+  }
+
+  loadWatch(id, false);
+
+  /* 「ログインして bot ではないことを確認してください」を絶対に見せない仕組み。
+   * LOGIN_REQUIRED / ERROR / 通信失敗が返った瞬間、ユーザー操作なしで最大3回まで
+   * 自動でプロキシをローテーションし再取得する（サーバー側も同時に総入替）。
+   * 本当に再生不能なケース（削除済み・年齢制限等）だけが最終メッセージに辿り着く。 */
+  const MAX_RESCUES = 3;
+  const DEFINITIVE = /UNPLAYABLE|AGE_CHECK|CONTENT_NOT_AVAILABLE|VIDEO_UNAVAILABLE|OFFLINE|PRIVATE|PLAYLIST_EMPTY|NOT_FOUND/i;
+  const isDefinitive = (status) => {
+    const s = String(status || '').toUpperCase();
+    if (!s || s === 'ERROR' || s === 'LOGIN_REQUIRED' || s === 'NETWORK' || s === 'UPSTREAM') return false;
+    return DEFINITIVE.test(s);
+  };
+  function rescueVeil(n) {
+    if (!n || destroyed) { wrapEl.querySelector('[data-veil]')?.remove(); return; }
+    let v = wrapEl.querySelector('[data-veil]');
+    if (!v) {
+      v = document.createElement('div');
+      v.setAttribute('data-veil', '');
+      v.className = 'rescue-veil';
+      wrapEl.appendChild(v);
+    }
+    v.innerHTML = `<div class="mini-spin light"></div><p>接続経路を自動で切り替えています… <span>(${n}/${MAX_RESCUES})</span></p>`;
+  }
+
+  function loadWatch(vid, busted) {
+    if (busted) api.invalidate('/api/watch/' + vid);
+    api('/api/watch/' + vid, { ttl: busted ? 0 : 3 * 60e3 })
+      .then(async (d) => {
+        if (destroyed) return;
+        document.title = (d.title || 'Vandal') + ' - Vandal';
+        fillMeta(d);
+        loadComments(d);
+        fillRail(d);
+        // 高速化: 関連動画の先頭2本のメタを先読み（視聴完了→次動画の初速短縮）。
+        // ホバー先読みと同じ /api/watch なのでサーバー側 90 秒キャッシュに乗る。
+        for (const r of (d.related || []).filter(i => i?.kind === 'video' && i.id).slice(0, 2)) {
+          if (/^[\w-]{11}$/.test(r.id)) api('/api/watch/' + r.id, { ttl: 2 * 60e3 }).catch(() => {});
+        }
+        if (listId) {
+          if (!panelStarted) { panelStarted = true; setupPlaylistPanel(listId, id, d.panel, PlCtx.load(listId)); }
+          else if (d.panel?.items?.length) updatePlaylistPanel(d.panel);
+        }
+        if (!d.playable) {
+          if (!isDefinitive(d.playability?.status) && rescues < MAX_RESCUES) { await fatalRescue(true); return; }
+          unplayableBox(d.playability?.reason || 'この動画は再生できません', d.playability?.status || '');
+          return;
+        }
+        rescueVeil(0);
+        await setupPlayback(d);
+      })
+      .catch(async (e) => {
+        if (destroyed) return;
+        if (rescues < MAX_RESCUES) { await fatalRescue(true); return; }
+        unplayableBox('再生に失敗しました', e.message);
+        fillRail({ related: [] });
+      });
+  }
+
+  function unplayableBox(msg, sub) {
+    rescueVeil(0);
+    wrapEl.innerHTML = `<div class="unplayable"><div>${esc(msg)}<br><span style="opacity:.6;font-size:12px">${esc(sub || '')}</span><br><button class="retry" id="un-retry" style="margin-top:14px;background:#fff;color:#000;border-radius:18px;padding:0 20px;height:36px;font-size:13px">もう一度試す</button></div></div>`;
+    // 修正: 旧実装は location.hash 変更（hashchange→render）と手動 renderWatch の
+    // 両方を起こし、watch ページが二重に初期化されていた。router 経由で
+    // 旧ページを必ず destroy してから再構築する（同値 hash は手動 render）。
+    $('#un-retry')?.addEventListener('click', () => {
+      rescues = 0;
+      api.invalidate('/api/watch/' + id);
+      const target = vertical ? '/shorts/' + id : ('/watch?v=' + id + (listId ? '&list=' + encodeURIComponent(listId) : ''));
+      if (location.hash === '#' + target) render(); else location.hash = target;
+    });
+  }
+
+  /** full rebuild when every playback route fails (rotates proxies server-side) */
+  async function fatalRescue(silent) {
+    rescues++;
+    rescueVeil(rescues);
+    if (rescues > 1) await new Promise(r => setTimeout(r, 500 * rescues)); // ローテーション安定待ち
+    if (!silent) toast('ストリームを復旧しています…');
+    await api('/api/player/refresh', { method: 'POST', body: JSON.stringify({ v: id }) }).catch(() => null);
+    if (destroyed) return;
+    loadWatch(id, true);
+  }
+
+  async function setupPlayback(d) {
+    const streams = d.streams || {};
+    const prog = (streams.progressive || []).slice().sort((a, b) => (b.height || 0) - (a.height || 0));
+    const bestProg = prog[0];
+    const allVids = (streams.videos || []);
+    const container = (t) => String(t.mime || '').split('/')[1] || '';
+    let vidTracks = allVids.filter(t => t.mime === 'video/mp4' && /avc1/.test(t.codecs));
+    if (!vidTracks.length) vidTracks = allVids.filter(t => t.mime === 'video/mp4');
+    if (!vidTracks.length) vidTracks = allVids.filter(t => t.mime === 'video/webm' && /vp9|vp09/.test(t.codecs));
+    if (!vidTracks.length) vidTracks = allVids;
+    const auds = (streams.audios || []).slice().sort((a, b) =>
+      ((a.mime === 'audio/mp4' ? 0 : 1) - (b.mime === 'audio/mp4' ? 0 : 1)) || (b.bitrate || 0) - (a.bitrate || 0));
+    const wantCont = container(vidTracks[0] || {});
+    const audTrack = auds.find(a => container(a) === wantCont) || auds[0];
+
+    const qList = [];
+    const byLabel = new Map();
+    for (const t of vidTracks) {
+      const label = t.qualityLabel || (t.height + 'p');
+      const prev = byLabel.get(label);
+      if (!prev || ((prev.fps || 30) > 30 && (t.fps || 30) <= 30) || ((prev.fps || 0) === (t.fps || 0) && (t.bitrate || 0) > (prev.bitrate || 0))) byLabel.set(label, t);
+    }
+    const adapt = [...byLabel.values()].sort((a, b) => (b.height || 0) - (a.height || 0) || (b.fps || 0) - (a.fps || 0));
+    for (const t of adapt) qList.push({ key: String(t.itag), label: t.qualityLabel, track: t });
+    if (bestProg) qList.push({ key: '360p', label: '360p', prog: bestProg });
+    const direct = streams.direct || null;
+
+    const autoTrack = pickAuto(adapt);
+    const canDash = !!(audTrack && autoTrack && DashLite.isSupported(autoTrack, audTrack));
+    let activeTrack = null;
+
+    // llytpr++ 直結: 生 URL がある限り常に「影武者プローブ」で直結を試す。
+    // 従来はサーバー側実測 (streams.playDirect) が true の時しか試さず、
+    // 「サーバー egress は 403 でも ユーザー網からは直接再生できる」動画が
+    // 無条件にプロキシされ続けるバグがあった。影武者はリレー再生を一切妨げない
+    // ため、判定は毎動画クライアント実機で行うのが最善。サーバー実測値と
+    // directOk 学習は HD 直結の信頼度ボーナス（＝高速に開始できる保証）として使う。
+    // ※ directOk / directBlocked は TTL 付き学習に変更（一時不調の永久化を防止）。
+    const dBlocked = () => Store.getExp('directBlocked', false);
+    const dOk = () => Store.getExp('directOk', false);
+    const directReady0 = !!(direct?.url && !dBlocked() && (streams.playDirect || dOk()));
+    const canDirect = () => !!(direct?.url && !dBlocked());
+    const canHdRaw = () => !!(canDirect() && streams.directUrls && (streams.hdDirect || dOk()));
+    const markDirectOn = () => { Store.del('exp:directBlocked'); Store.setExp('directOk', true, DIRECT_OK_TTL); };
+    const markDirectOff = () => { Store.setExp('directBlocked', true, DIRECT_BLOCK_TTL); Store.del('exp:directOk'); };
+    const qualities = [
+      { key: 'auto', label: directReady0 ? ('自動 (' + (direct?.height || 360) + 'p・直結最速)') : '自動 (360p・最速)' },
+      ...((canDash || (autoTrack && audTrack)) ? [{ key: 'hdauto', label: '自動HD (' + (autoTrack?.qualityLabel || '720p') + ')' }] : []),
+      ...qList,
+    ];
+    let speed = 1;
+
+    ui = new PlayerUI(wrapEl, video, () => ({
+      qualities, current: mode,
+      speeds: [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2], speed,
+      onPick: (k) => { mode = k; startMode(k, video.currentTime); },
+      onSpeed: (s) => { speed = s; video.playbackRate = s; },
+    }));
+    wrapEl.querySelector('[data-spin]')?.remove(); // skeleton spinner -> UI owns one now
+
+    // a relayed stream can still die mid-playback (403): rebuild once
+    video.addEventListener('error', () => {
+      if (destroyed || suppressErrorHook || dash || pair) return;
+      if (rescues < 2) fatalRescue(false);
+      else unplayableBox('ストリームに接続できませんでした', '経路の再取得に失敗しました');
+    });
+
+    if (streams.hls && !qList.length && !bestProg) {
+      startHls();
+      return;
+    }
+    startMode('auto', 0);
+
+    function pickAuto(tracks) {
+      if (!tracks.length) return null;
+      const h = wrapEl.clientHeight || 640;
+      const target = h >= 900 ? 1080 : h >= 600 ? 720 : h >= 400 ? 480 : 360;
+      let best = tracks[0];
+      for (const t of tracks) {
+        if ((t.height || 0) <= target && ((t.fps || 30) <= 30 || (best.fps || 30) > 30)) { best = t; break; }
+      }
+      return best || tracks[tracks.length - 1];
+    }
+
+    async function startMode(k, resumeAt = 0) {
+      if (destroyed) return;
+      const detach = () => {
+        try { dash?.destroy(); dash = null; } catch (_) {}
+        try { hlsInst?.destroy(); hlsInst = null; } catch (_) {}
+        killPair();
+        video.removeAttribute('src');
+        video.load();
+      };
+      if (k === 'auto') {
+        // 既定は最速プログレッシブ。直結可能と実測済みなら（ほとんどの動画が該当）
+        // 影武者プローブで生 URL を試し、進行確認できた時だけ無停止で載せ替える。
+        // ※ instant attach のリレーが既に再生開始しているため、ここではスピナーを出さない
+        //   （出すとダイレクト再生に載せ替わるまで出続けるバグになる）。
+        if (canDirect()) {
+          if (await tryDirect(direct, resumeAt)) return;
+        }
+        if (instantAttached && bestProg && !video.error) {
+          suppressErrorHook = false;
+          safePlay();
+          // 修正: instant attach のリレーは PlayerUI 生成より前に 'playing'/'canplay' を
+          // 発火済みで再発火しないため、スピナーが出たまま残っていた。明示的に消す。
+          ui?.el.spin?.classList.add('hidden');
+          armProgressWatchdog('relay-instant', resumeAt);
+          return;
+        }
+        detach();
+        ui?.el.spin?.classList.remove('hidden');
+        startProg(bestProg, resumeAt);
+        return;
+      }
+      detach();
+      ui?.el.spin?.classList.remove('hidden');
+      if (k === 'hdauto') {
+        if (canHdRaw() && await tryPair(autoTrack, resumeAt, true)) return;
+        if (canDash && await tryDash(autoTrack, resumeAt)) return;
+        if (await tryPair(autoTrack, resumeAt)) return;
+        startProg(bestProg, resumeAt);
+      } else if (k === '360p') {
+        startProg(bestProg, resumeAt);
+      } else {
+        const t = qList.find(q => q.key === k)?.track;
+        if (canHdRaw() && t && await tryPair(t, resumeAt, true)) return;
+        if (t && await tryDash(t, resumeAt)) return;
+        if (t && await tryPair(t, resumeAt)) return;
+        startProg(bestProg, resumeAt);
+      }
+    }
+
+    /**
+     * Dual-element HD: <video> が映像専用 adaptive、不可視の <audio> が音声を
+     * 受け持ち、ドリフト補正でリップシンクを保つ。MSE が使えない/音声バッファが
+     * 不安定な環境でも「360p以外で音が出ない」を確実に潰すための同期経路。
+     */
+    function tryPair(track, resumeAt, raw = false) {
+      return new Promise((resolve) => {
+        let audio = null;
+        let timer = null;
+        let settled = false;
+        const finish = (val) => {
+          if (settled) return;
+          settled = true;
+          try { clearTimeout(timer); } catch (_) {}
+          if (!val && audio) { try { audio.pause(); audio.removeAttribute('src'); audio.load(); } catch (_) {} }
+          resolve(val);
+        };
+        try {
+        if (!track || !audTrack) return finish(false);
+        // raw モード(llytpr++ 直結HD): <video>/<audio> のメディア要素は CORS 不要の
+        // ため、生 googlevideo URL をそのまま装着できる（MSE と違い fetch を通らない）。
+        const vSrc = raw ? streams.directUrls?.[track.itag] : `/api/stream?v=${id}&itag=${track.itag}`;
+        const aSrc = raw ? streams.directUrls?.[audTrack.itag] : `/api/stream?v=${id}&itag=${audTrack.itag}`;
+        if (!vSrc || !aSrc) return finish(false);
+        killPair();
+        audio = new Audio();
+        audio.preload = 'auto';
+        timer = setTimeout(() => finish(false), 9000);
+        const fail = () => finish(false);
+        const ok = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          suppressErrorHook = false;
+          activeTrack = track;
+          const onPlay = () => audio.play().catch(() => {});
+          const onPause = () => audio.pause();
+          const onSeeked = () => { audio.currentTime = video.currentTime + 0.04; };
+          const onWaiting = () => audio.pause();
+          const onPlaying = () => {
+            if (Math.abs(audio.currentTime - video.currentTime) > 0.35) audio.currentTime = video.currentTime + 0.04;
+            audio.play().catch(() => {});
+          };
+          const onRate = () => { audio.playbackRate = video.playbackRate; };
+          const onVol = () => { audio.volume = video.volume; audio.muted = video.muted; };
+          video.addEventListener('play', onPlay);
+          video.addEventListener('pause', onPause);
+          video.addEventListener('seeked', onSeeked);
+          video.addEventListener('waiting', onWaiting);
+          video.addEventListener('playing', onPlaying);
+          video.addEventListener('ratechange', onRate);
+          video.addEventListener('volumechange', onVol);
+          audio.volume = video.volume; audio.muted = video.muted;
+          const iv = setInterval(() => {
+            if (destroyed || !pair) return;
+            if (video.paused || video.seeking) return;
+            if (Math.abs(audio.currentTime - video.currentTime) > 0.38) {
+              audio.currentTime = video.currentTime + 0.04;
+            }
+          }, 500);
+          pair = { audio, iv, onPlay, onPause, onSeeked, onWaiting, onPlaying, onRate, onVol, audioEl: audio };
+          audio.currentTime = resumeAt || 0;
+          safePlay();
+          // raw HD の stall 監視: 開始後に映像が進まなければ MSE→リレーへ降格
+          if (raw) {
+            const t0p = video.currentTime;
+            setTimeout(() => {
+              if (destroyed || !pair || dBlocked()) return;
+              if (video.paused || video.seeking) return;
+              if (video.currentTime - t0p < 0.15 && video.readyState < 3) {
+                Store.setExp('directBlocked', true, DIRECT_BLOCK_TTL);
+                toast('直結HDが不安定なため切り替えます');
+                killPair();
+                (async () => {
+                  if (canDash && await tryDash(track, video.currentTime)) return;
+                  if (await tryPair(track, video.currentTime, false)) return;
+                  startProg(bestProg, video.currentTime);
+                })();
+              }
+            }, 6000);
+          }
+          resolve(true);
+        };
+        let vReady = false, aReady = false;
+        const maybe = () => { if (vReady && aReady) ok(); };
+        video.addEventListener('error', fail, { once: true });
+        audio.addEventListener('error', fail, { once: true });
+        video.addEventListener('canplay', () => { vReady = true; maybe(); }, { once: true });
+        audio.addEventListener('canplay', () => { aReady = true; maybe(); }, { once: true });
+        video.src = vSrc;
+        audio.src = aSrc;
+        video.currentTime = resumeAt || 0;
+        } catch (_) { finish(false); }
+      });
+    }
+
+    /**
+     * llytpr++ 直結スワップ: 生 googlevideo/Piped URL を不可視の「影武者」<video> で
+     * 先行試聴し、実際に再生時間が進むことを確認できた時だけ本体に載せ替える。
+     * 失敗しても本体（リレー再生中）は一切妨げられない = 直結判定を常に楽観試行できる。
+     */
+    function tryDirect(d, resumeAt) {
+      if (!d?.url) return Promise.resolve(false);
+      if (dBlocked()) return Promise.resolve(false);
+      const shadowOk = instantAttached && !video.error;
+      if (shadowOk) return new Promise((resolve) => {
+        const probe = document.createElement('video');
+        probe.muted = true;
+        probe.playsInline = true;
+        probe.preload = 'auto';
+        let settled = false;
+        const cleanup = () => { try { probe.pause(); probe.removeAttribute('src'); probe.load(); } catch (_) {} probe.remove(); };
+        const timer = setTimeout(() => done(false), 5000);
+        probe.addEventListener('error', () => done(false), { once: true });
+        let mark = -1;
+        probe.addEventListener('playing', () => {
+          mark = probe.currentTime;
+          setTimeout(() => {
+            if (settled) return;
+            if (probe.currentTime - mark > 0.25) done(true); // 実進行を確認
+          }, 900);
+        }, { once: true });
+        probe.src = d.url;
+        probe.currentTime = resumeAt || 0;
+        probe.play().catch(() => {});
+        function done(ok) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (ok) {
+            markDirectOn(); // 学習: この回線は生 URL 再生可能（24h キャッシュ）
+            mode = 'auto'; // 「自動」のまま = 直結が既定動作
+            if (qualities[0]) qualities[0].label = '自動 (' + (d.height || 360) + 'p・直結最速)';
+            const carry = Math.max(probe.currentTime, video.currentTime || 0, resumeAt || 0);
+            cleanup();
+            video.src = d.url;
+            video.currentTime = carry;
+            safePlay();
+            armProgressWatchdog('direct', carry);
+            resolve(true);
+          } else {
+            cleanup(); // 本体は無傷（リレー再生継続）
+            resolve(false);
+          }
+        }
+      });
+      // 本体がまだ空のときは従来どおり直下試行（2.6s watchdog→リレー）
+      ui?.el.spin?.classList.remove('hidden');
+      return new Promise((resolve) => {
+        let settled = false;
+        suppressErrorHook = true;
+        const timer = setTimeout(() => done(false), 2600);
+        const onErr = () => done(false);
+        const onPlay = () => done(true);
+        video.addEventListener('error', onErr, { once: true });
+        video.addEventListener('playing', onPlay, { once: true });
+        video.src = d.url;
+        video.currentTime = resumeAt || 0;
+        safePlay();
+        function done(ok) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          video.removeEventListener('error', onErr);
+          video.removeEventListener('playing', onPlay);
+          suppressErrorHook = false;
+          if (ok) {
+            markDirectOn();                            // learned: this network can play raw urls
+            if (qualities[0]) qualities[0].label = '自動 (' + (d.height || 360) + 'p・直結最速)';
+            mode = 'auto';                             // 「自動」画質のまま = 直結が既定動作
+            // post-success stall watchdog: 「playing は出たが秒数が進まない」
+            // （発信元 IP レピュテーション等で途中 stall）を検知してリレーへ強制復帰
+            const t0 = video.currentTime;
+            setTimeout(() => {
+              if (destroyed || dash || pair || dBlocked()) return;
+              if (mode !== 'auto') return;
+              if (video.paused || video.seeking || video.ended) return;
+              if (video.currentTime - t0 < 0.15 && video.readyState < 3) {
+                Store.setExp('directBlocked', true, DIRECT_BLOCK_TTL);
+                toast('直結が不安定なためリレーに切り替えます');
+                startProg(bestProg, video.currentTime || resumeAt || 0);
+              }
+            }, 5000);
+            armProgressWatchdog('direct', resumeAt);
+            resolve(true);
+          } else {
+            // 直結不可（ユーザ網が googlevideo を遮断等）: しばらく（10分）リレー固定
+            markDirectOff();
+            try { video.pause(); video.removeAttribute('src'); video.load(); } catch (_) {}
+            resolve(false);
+          }
+        }
+      });
+    }
+
+    function safePlay() {
+      const attempt = video.play();
+      if (attempt?.catch) attempt.catch(() => {
+        video.muted = true;
+        video.play().catch(() => ui?.showBigPlay());
+      });
+    }
+
+    async function tryDash(track, resumeAt) {
+      try {
+        activeTrack = track;
+        dash = new DashLite(video, id, track, audTrack);
+        await dash.init(resumeAt);
+        if (destroyed) return false;
+        suppressErrorHook = false;
+        video.currentTime = resumeAt || 0;
+        wireEndGuard();
+        // 音声パイプライン・ウォッチドッグ: 映像が進むのに音声バッファが
+        // 空のままなら、同期デュアルストリームに組み替える（無音HDの根治）。
+        setTimeout(() => {
+          if (destroyed || !dash || dash.dead) return;
+          const aEnd = dash._bufferedEnd('a');
+          if (aEnd < video.currentTime - 0.8) {
+            const t = video.currentTime;
+            try { dash?.destroy(); dash = null; } catch (_) {}
+            toast('高画質モードの音声を再構成しています');
+            tryPair(track, t).then(ok => { if (!ok) startProg(bestProg, t); });
+          }
+        }, 2600);
+        safePlay();
+        return true;
+      } catch (e) {
+        try { dash?.destroy(); } catch (_) {}
+        dash = null;
+        return false;
+      }
+    }
+
+    /** 進行watchdog: src 装着後に再生が一向に進まない（経路 stall）場合の
+     *  最終安全網。直結はリレーへ即無段階復帰、リレーは URL 再生成→再挑戦する。 */
+    function armProgressWatchdog(tag, resumeAt) {
+      const t0 = video.currentTime;
+      setTimeout(() => {
+        if (destroyed || dash || pair) return;
+        if (video.paused || video.seeking || video.ended) return;
+        if (video.currentTime - t0 >= 0.15 || video.readyState >= 3) return; // 健康
+        if (tag === 'direct') {
+          // 直結スワップ後に止まった: ページ全体を再構築せずリレーへ即復帰
+          // （従来は fatalRescue で全面リロードしており、再生できる状態まで
+          // 画面を落としてしまう過剰反応だった）
+          console.warn('[llytpr++] direct stall detected — reverting to relay');
+          Store.setExp('directBlocked', true, DIRECT_BLOCK_TTL);
+          toast('直結が不安定なためリレーに切り替えます');
+          startProg(bestProg, Math.max(video.currentTime, resumeAt || 0));
+          return;
+        }
+        if (rescues < 3) {
+          console.warn('[llytpr++] stall detected (' + tag + ') — rescuing');
+          fatalRescue(true);
+        } else {
+          unplayableBox('ストリームに接続できませんでした', 'ネットワークが googlevideo への接続を制限している可能性があります');
+        }
+      }, 7000);
+    }
+
+    function startProg(p, resumeAt) {
+      if (!p) {
+        if (streams.hls) { startHls(); return; }
+        if (rescues < 2) { fatalRescue(false); return; }
+        unplayableBox('再生可能なフォーマットがありません', 'すべての取得経路が失敗しました');
+        return;
+      }
+      dash?.destroy(); dash = null;
+      killPair();
+      suppressErrorHook = false;
+      video.src = `/api/stream?v=${id}&itag=${p.itag}`;
+      video.currentTime = resumeAt || 0;
+      safePlay();
+      armProgressWatchdog('relay', resumeAt);
+    }
+
+    async function startHls() {
+      const proxied = '/api/hls?v=' + id;
+      if (window.Hls && window.Hls.isSupported()) {
+        hlsInst = new window.Hls({ maxBufferLength: 30 });
+        hlsInst.loadSource(proxied);
+        hlsInst.attachMedia(video);
+        hlsInst.on(window.Hls.Events.MANIFEST_PARSED, () => safePlay());
+        hlsInst.on(window.Hls.Events.ERROR, (_e, data) => {
+          if (data?.fatal) { if (bestProg) startProg(bestProg, 0); else if (rescues < 2) fatalRescue(false); }
+        });
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = proxied;
+        safePlay();
+      } else if (bestProg) startProg(bestProg, 0);
+      else if (rescues < 2) fatalRescue(false);
+    }
+
+    function wireEndGuard() {
+      const iv = setInterval(() => {
+        if (destroyed || !dash || dash.dead) { clearInterval(iv); return; }
+        const d = video.duration || 0;
+        if (d && video.currentTime > d - 0.4 && dash.posV >= dash.vSegs.length && dash.posA >= dash.aSegs.length) {
+          try { if (dash.mse.readyState === 'open' && !dash.vbuf.updating && !dash.abuf.updating) dash.mse.endOfStream(); } catch (_) {}
+          clearInterval(iv);
+        }
+      }, 700);
+    }
+  }
+
+  function fillMeta(d) {
+    // record the visit for the recommendation engine
+    History.add({ v: id, t: d.title || '', cn: d.channel?.name || '', ch: d.channel?.id || '', d: d.lengthSeconds || 0 });
+
+    const titleEl = $('.wtitle');
+    if (titleEl) titleEl.textContent = d.title || '';
+    const ch = d.channel || {};
+    const stats = [d.viewCount, d.dateText].filter(Boolean).join(' • ');
+    const actRow = $('.action-row');
+    const liked0 = Likes.has(id);
+    const saved0 = Saves.has(id);
+    const subbed0 = Subs.has(ch.id);
+    if (actRow) actRow.innerHTML = `
+      <div class="ch-chip">
+        <div class="ch-ava" data-href="${ch.id ? '#/channel/' + esc(ch.id) : '#'}">${ch.avatar ? `<img src="${esc(ch.avatar)}" alt="">` : ''}</div>
+        <div class="ch-names">
+          <div class="ch-name" data-href="${ch.id ? '#/channel/' + esc(ch.id) : '#'}">${esc(ch.name || '')} ${ch.verified ? ICON_CHECK : ''}</div>
+          <div class="ch-subs">${esc(ch.subs || '')}</div>
+        </div>
+        <button class="sub-btn ${subbed0 ? 'subbed' : ''}" id="sub-btn">${subbed0 ? '登録済み' : 'チャンネル登録'}</button>
+      </div>
+      <div class="p-spacer" style="flex:1"></div>
+      <div class="like-group">
+        <button id="like-btn" title="高く評価" style="${liked0 ? 'color:var(--blue)' : ''}"><svg viewBox="0 0 24 24" class="ic"><path d="M2 21h4V9H2zM22 10c0-1.1-.9-2-2-2h-6.3l.9-4.6v-.3c0-.4-.2-.8-.4-1.1L13.1 1 6.6 8.6c-.4.3-.6.8-.6 1.4v10c0 1.1.9 2 2 2h9c.8 0 1.5-.5 1.8-1.2l3-7.1c.1-.2.2-.5.2-.7z"/></svg><span id="like-count">${esc(d.likeCount || '')}</span></button>
+        <button id="dislike-btn" title="低く評価"><svg viewBox="0 0 24 24" class="ic"><path d="M18 3h4v12h-4zM2 14c0 1.1.9 2 2 2h6.3l-.9 4.6v.3c0 .4.2.8.4 1.1l1.1 1 6.5-6.5c.4-.4.6-.9.6-1.4V4.1c0-1.1-.9-2-2-2H7c-.8 0-1.5.5-1.8 1.2l-3 7.1c-.1.2-.2.5-.2.7z"/></svg></button>
+      </div>
+      <button class="btn-pill" id="share-btn"><svg viewBox="0 0 24 24" class="ic"><path d="M14 9V5l7 7-7 7v-4.1c-5 0-8.5 1.6-11 5.1 1-5 4-10 11-11z"/></svg>共有</button>
+      <button class="btn-pill" id="save-btn" style="${saved0 ? 'color:var(--blue)' : ''}"><svg viewBox="0 0 24 24" class="ic"><path d="M17 3H7a2 2 0 0 0-2 2v16l7-5 7 5V5a2 2 0 0 0-2-2z"/></svg>${saved0 ? '保存済み' : '保存'}</button>
+      <button class="btn-pill ask-btn" id="ask-btn" title="AIに質問（概要欄を読み込み済み）"><span class="ask-gem">♦</span>Ask</button>`;
+    const entry = () => ({ v: id, t: d.title || '', cn: ch.name || '', ch: ch.id || '', d: d.lengthSeconds || 0 });
+    $('#like-btn')?.addEventListener('click', function () {
+      const liked = Likes.toggle(entry());
+      this.style.color = liked ? 'var(--blue)' : '';
+      toast(liked ? '高く評価しました（この端末に保存）' : '取り消しました');
+    });
+    $('#dislike-btn')?.addEventListener('click', () => toast('フィードバックありがとうございます'));
+    $('#share-btn')?.addEventListener('click', async () => {
+      const url = location.origin + location.pathname + '#/watch?v=' + id;
+      try { await navigator.clipboard.writeText(url); toast('リンクをコピーしました'); }
+      catch (_) { toast(url, 6000); }
+    });
+    $('#save-btn')?.addEventListener('click', function () {
+      const saved = Saves.toggle(entry());
+      this.style.color = saved ? 'var(--blue)' : '';
+      this.innerHTML = this.innerHTML.replace(saved ? '>保存<' : '>保存済み<', saved ? '>保存済み<' : '>保存<');
+      toast(saved ? '保存しました（この端末に保存）' : '取り消しました');
+    });
+    $('#sub-btn')?.addEventListener('click', function () {
+      if (!ch.id) { toast('チャンネル情報を取得できませんでした'); return; }
+      const subbed = Subs.toggle({ id: ch.id, name: ch.name, avatar: ch.avatar });
+      this.classList.toggle('subbed', subbed);
+      this.textContent = subbed ? '登録済み' : 'チャンネル登録';
+      toast(subbed ? 'チャンネル登録しました（この端末に保存）' : '登録を解除しました');
+    });
+
+    const desc = $('.desc-card');
+    if (desc) {
+      desc.innerHTML = `
+        <div class="desc-stats">${esc(stats)}</div>
+        <div class="desc-body">${linkify(d.description || '概要欄はありません')}</div>
+        <span class="desc-more">...続きを読む</span>`;
+      $('.desc-more', desc).addEventListener('click', function () {
+        desc.classList.toggle('open');
+        this.textContent = desc.classList.contains('open') ? '一部を表示' : '...続きを読む';
+      });
+    }
+    setupAsk(d);
+  }
+
+  /* ---------------- ♦ Ask（HavocPianoAI 連携・概要欄を読み込んだAI） ------------- */
+  function setupAsk(d) {
+    const btn = $('#ask-btn');
+    if (!btn) return;
+    const ASK_KEY = 'llytpr:ask:' + id;
+    let msgs = [];
+    try { msgs = JSON.parse(sessionStorage.getItem(ASK_KEY) || '[]') || []; } catch (_) { msgs = []; }
+    const saveMsgs = () => { try { sessionStorage.setItem(ASK_KEY, JSON.stringify(msgs.slice(-16))); } catch (_) {} };
+    const mdLite = (s) => esc(String(s || ''))
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+      .replace(/\n/g, '<br>');
+    let panel = null, sending = false, autoAsked = msgs.length > 0;
+
+    function bubble(role, html, pending) {
+      const box = panel.querySelector('.ask-msgs');
+      const el = document.createElement('div');
+      el.className = 'ask-msg ' + (role === 'user' ? 'user' : 'ai') + (pending ? ' pending' : '');
+      el.innerHTML = (role === 'ai' ? '<span class="ask-gem sm">♦</span>' : '') + `<div class="ask-body">${html}</div>`;
+      box.appendChild(el);
+      box.scrollTop = box.scrollHeight;
+      return el;
+    }
+    async function send(q) {
+      if (sending || !q) return;
+      sending = true;
+      msgs.push({ role: 'user', content: q });
+      saveMsgs();
+      bubble('user', esc(q));
+      const wait = bubble('ai', '<span class="ask-dots"><i></i><i></i><i></i></span>', true);
+      const inp = panel.querySelector('#ask-in');
+      if (inp) { inp.value = ''; inp.focus(); }
+      try {
+        const r = await api('/api/ask', {
+          method: 'POST', body: JSON.stringify({
+            videoId: id, title: d.title || '', channel: d.channel?.name || '',
+            description: d.description || '', question: q,
+            history: msgs.slice(-9, -1),
+          }),
+        });
+        wait.remove();
+        msgs.push({ role: 'assistant', content: r.answer });
+        saveMsgs();
+        bubble('ai', mdLite(r.answer));
+      } catch (e) {
+        wait.remove();
+        bubble('ai', esc(e.status === 429 ? e.message : '応答に失敗しました。少し待ってからもう一度お試しください。'));
+      }
+      sending = false;
+    }
+    function open() {
+      if (panel) { panel.classList.add('open'); return; }
+      const host = document.createElement('div');
+      host.innerHTML = `
+        <div class="ask-scrim" id="ask-scrim"></div>
+        <div class="ask-panel open" id="ask-panel">
+          <div class="ask-head">
+            <span class="ask-gem">♦</span>
+            <div class="ask-htx">
+              <div class="ask-title">Ask</div>
+              <div class="ask-sub">この動画の概要欄を読み込んで回答します</div>
+            </div>
+            <button class="icon-btn" id="ask-x" title="閉じる"><svg viewBox="0 0 24 24" class="ic"><path d="M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12z"/></svg></button>
+          </div>
+          <div class="ask-msgs"></div>
+          <div class="ask-chips">
+            <button class="ask-chip" data-q="この動画の概要欄を3行で要約して">概要欄を要約</button>
+            <button class="ask-chip" data-q="この動画の見どころを3つ教えて">見どころは？</button>
+            <button class="ask-chip" data-q="概要欄のリンクやタイムスタンプを整理して">リンク・章を整理</button>
+          </div>
+          <form class="ask-form">
+            <input id="ask-in" type="text" placeholder="この動画について質問…" autocomplete="off" maxlength="1000">
+            <button class="ask-send" type="submit" title="送信" aria-label="送信"><svg viewBox="0 0 24 24" class="ic"><path d="M3 20v-6l8-2-8-2V4l19 8z"/></svg></button>
+          </form>
+          <div class="ask-foot">♦Ask by HavocPianoAI ・ Vandal</div>
+        </div>`;
+      app.appendChild(host);
+      panel = host.querySelector('#ask-panel');
+      host.querySelector('#ask-scrim').addEventListener('click', close);
+      host.querySelector('#ask-x').addEventListener('click', close);
+      host.querySelector('.ask-form').addEventListener('submit', (e) => {
+        e.preventDefault();
+        const v = host.querySelector('#ask-in').value.trim();
+        if (v) send(v);
+      });
+      host.querySelectorAll('.ask-chip').forEach(c => c.addEventListener('click', () => send(c.dataset.q)));
+      for (const m of msgs) bubble(m.role, m.role === 'user' ? esc(m.content) : mdLite(m.content));
+      if (!autoAsked) { autoAsked = true; send('この動画の概要欄を3行で要約して'); }
+    }
+    function close() {
+      panel?.classList.remove('open');
+      document.querySelector('#ask-scrim')?.classList.remove('open');
+      panel?.closest('#app > div')?.remove?.(); // overlay ごと破棄（再オープンは再生成。msgs は sessionStorage で保持）
+      panel = null;
+    }
+    btn.addEventListener('click', open);
+    // ページ離脱時に掃除
+    const obs = new MutationObserver(() => { if (!document.body.contains(btn)) { panel?.closest('#app > div')?.remove?.(); obs.disconnect(); } });
+    obs.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function loadComments(d) {
+    const box = $('#comments');
+    if (!box) return;
+    // 高速化: watch 応答に同梱の commentsToken を再利用 → サーバー側の
+    // トークン発見往復が消えてコメント表示が約半分の速度に。
+    // （サーバーは watch 応答時にコメントを先行取得済み = キャッシュヒットが多い）
+    const token = d?.commentsToken ? '?token=' + encodeURIComponent(d.commentsToken) : '';
+    api('/api/comments/' + id + token, { ttl: 5 * 60e3 })
+      .then((c) => {
+        if (destroyed || !document.body.contains(box)) return;
+        if (c.disabled && !(c.comments || []).length) {
+          box.innerHTML = `<h3>コメント</h3><div class="cm-disabled">コメントはオフになっています。</div>`;
+          return;
+        }
+        let cont = c.continuation;
+        let loading = false;
+        box.innerHTML = `
+          <h3><span id="cm-count">${c.count ? esc(c.count) + ' 件のコメント' : 'コメント'}</span>
+          <span class="cm-sort"><svg viewBox="0 0 24 24" class="ic" style="width:20px;height:20px"><path d="M3 6h14v2H3zm0 5h10v2H3zm0 5h6v2H3z"/></svg>並べ替え</span></h3>
+          <div id="cm-list">${(c.comments || []).map(commentHtml).join('')}</div>`;
+        if (cont) {
+          const sent = lazySentinel(box, () => {
+            if (loading || !cont) return;
+            loading = true;
+            api('/api/comments/next?c=' + encodeURIComponent(cont), { ttl: 5 * 60e3 })
+              .then((n) => {
+                loading = false;
+                cont = n.continuation;
+                const list = $('#cm-list');
+                if (list) list.insertAdjacentHTML('beforeend', (n.comments || []).map(commentHtml).join(''));
+                if (!cont) sent.done();
+              })
+              .catch(() => { loading = false; sent.done(); });
+          });
+        }
+      })
+      .catch(() => { const b = $('#comments'); if (b) b.innerHTML = `<h3>コメント</h3><div class="cm-disabled">コメントを読み込めませんでした。</div>`; });
+  }
+
+  function commentHtml(cm) {
+    const authorHref = cm.authorChannelId ? '#/channel/' + cm.authorChannelId : '#';
+    const handle = cm.author?.startsWith('@') ? cm.author : (cm.author ? '@' + cm.author : '');
+    return `
+    <div class="cm">
+      <div class="vava" data-href="${authorHref}">${cm.avatar ? `<img loading="lazy" src="${esc(cm.avatar)}" alt="">` : ''}</div>
+      <div class="cm-body">
+        <div class="cm-head"><span class="cm-author" data-href="${authorHref}">${esc(handle)}</span><span class="cm-time">${esc(cm.published || '')}</span></div>
+        <div class="cm-text">${linkify(cm.text || '')}</div>
+        <div class="cm-acts">
+          <span class="icon-btn cm-ico"><svg viewBox="0 0 24 24" class="ic"><path d="M2 21h4V9H2zM22 10c0-1.1-.9-2-2-2h-6.3l.9-4.6c0-.9-.8-1.5-.8-1.5L12.7 1 6.2 8.6C5.8 8.9 5 9.5 5 10v10c0 1.1.9 2 2 2h9c.8 0 1.5-.5 1.8-1.2l3-7.1c.1-.2.2-.5.2-.7z"/></svg></span>
+          <span class="cm-likes">${esc(cm.likes || '')}</span>
+          <span class="icon-btn cm-ico"><svg viewBox="0 0 24 24" class="ic"><path d="M18 3h4v12h-4zM2 14c0 1.1.9 2 2 2h6.3l-.9 4.6c0 .9.8 1.5.8 1.5l1.1 1 6.5-6.5c.4-.4.6-.9.6-1.4V4.1c0-1.1-.9-2-2-2H7c-.8 0-1.5.5-1.8 1.2l-3 7.1c-.1.2-.2.5-.2.7z"/></svg></span>
+          ${cm.replyCount ? `<span class="cm-reply">返信 ${esc(String(cm.replyCount))} 件</span>` : ''}
+        </div>
+      </div>
+    </div>`;
+  }
+
+  /* ---------------- YouTube-style playlist panel + auto-advance ---------------- */
+  const ICON_LIST = '<svg viewBox="0 0 24 24" class="ic"><path d="M3 6h12v2H3zm0 4h12v2H3zm0 4h8v2H3zm14-8v7.5a3 3 0 1 0 2 2.8V8h3V6z"/></svg>';
+  const ICON_LOOP = '<svg viewBox="0 0 24 24" class="ic"><path d="M7 7h10v3l4-4-4-4v3H5v6h2zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2z"/></svg>';
+  const ICON_SHUFFLE = '<svg viewBox="0 0 24 24" class="ic"><path d="M10.6 9.2 8.9 7.5 4 7.5v2h4l1.7 1.7zm6.1 5.2-1.6 1.6-5.5-5.5 1.4-1.4 5.7 5.3zM14 4l4 4-4 4v-3c-4.95 0-7 3.5-8 8-.3-6 1.5-10 8-10z" opacity="0"/><path d="M14.1 7.4 10.6 3.9 14.1.4v2H18c3.3 0 6 2.7 6 6 0 1.6-.6 3-1.6 4.1l-1.4-1.4c.7-.8 1-1.7 1-2.7 0-2.2-1.8-4-4-4h-3.9zm-4.2 9.2 3.5 3.5-3.5 3.5v-2H6c-3.3 0-6-2.7-6-6 0-1.6.6-3 1.6-4.1l1.4 1.4c-.7.8-1 1.7-1 2.7 0 2.2 1.8 4 4 4h3.9z" transform="translate(-3 3)"/></svg>';
+  const plState = { items: [], idx: -1, loop: false, shuffle: false, title: '', owner: '', total: 0 };
+
+  /* プレイリスト文脈は sessionStorage 保存が一次情報源（即時・往復ゼロ・バグ耐性）。
+   * 読み込み順: (1)ローカルスナップショット即描画 → (2)裏で完全版を取得して追従。 */
+  const normPanelData = (p) => p?.items?.length ? {
+    title: p.title || '', owner: p.owner || '', total: p.totalText || p.total || 0,
+    items: p.items, continuation: p.continuation || null, usePanelNext: true,
+  } : null;
+  const normListData = (d) => d?.items?.length ? {
+    title: d.title || '', owner: d.channelName || '', total: d.items.length,
+    items: d.items, continuation: d.continuation || null, usePanelNext: !!d.panelNext,
+  } : null;
+  const normSnapData = (s) => s?.items?.length ? {
+    title: s.title || '', owner: s.owner || '', total: s.total || 0,
+    items: s.items, continuation: null, usePanelNext: true,
+  } : null;
+
+  let plCont = null, plUsePanelNext = true;
+
+  function adoptPanel(n) {
+    if (!n) return;
+    plState.title = n.title || plState.title || '再生リスト';
+    plState.owner = n.owner || plState.owner || '';
+    plState.total = n.total || plState.total || 0;
+    plState.items = n.items || plState.items;
+    plCont = n.continuation ?? plCont;
+    plUsePanelNext = !!n.usePanelNext;
+    plState.idx = plState.items.findIndex(x => x.id === id);
+  }
+
+  async function setupPlaylistPanel(lid, currentVid, panelData, snapshot) {
+    try {
+      const seeded = !!(normPanelData(panelData) || normSnapData(snapshot));
+      adoptPanel(normPanelData(panelData) || normSnapData(snapshot));
+      if (!seeded) adoptPanel(normListData(await api('/api/playlist/' + encodeURIComponent(lid), { ttl: 10 * 60e3 })));
+      if (destroyed || !document.body.contains(wrapEl)) return;
+      const nextUrl = () => (plUsePanelNext ? '/api/playlist/panel-next?c=' : '/api/playlist/next?c=') + encodeURIComponent(plCont);
+      // walk continuation pages until the current video shows up (max 3 more)
+      let guard = 0;
+      while (plState.idx < 0 && plCont && guard < 3) {
+        guard++;
+        const n = await api(nextUrl(), { ttl: 10 * 60e3 }).catch(() => null);
+        if (!n) break;
+        plCont = n.continuation;
+        plState.items = plState.items.concat(n.items || []);
+        plState.idx = plState.items.findIndex(x => x.id === currentVid);
+      }
+      // index unknown (huge list): treat as first
+      if (plState.idx < 0) plState.items.unshift({ id: currentVid, title: document.title, thumb: '', channel: plState.owner, duration: '' }), plState.idx = 0;
+      drawPanel();
+      PlCtx.save(lid, { title: plState.title, owner: plState.owner, total: plState.total, items: plState.items });
+      // auto-advance
+      video.addEventListener('ended', () => advance(1));
+      // スナップショット起点のときは、裏で完全版を取得して追従（タイトル/継続/残りの項目）
+      if (snapshot && !panelData) {
+        api('/api/playlist/' + encodeURIComponent(lid), { ttl: 10 * 60e3 }).then((full) => {
+          if (destroyed) return;
+          const n = normListData(full);
+          if (!n) return;
+          // ローカル保存済みの項目は信頼できるので、サーバー版が豊富なら差し替え
+          if (n.items.length >= plState.items.length || !plState.title || plState.title === '再生リスト') {
+            adoptPanel(n);
+            if (plState.idx < 0) { plState.items.unshift({ id: currentVid, title: document.title, thumb: '', channel: plState.owner, duration: '' }); plState.idx = 0; }
+            drawPanel();
+            PlCtx.save(lid, { title: plState.title, owner: plState.owner, total: plState.total, items: plState.items });
+          }
+        }).catch(() => { /* snapshot stays */ });
+      }
+    } catch (_) { /* playlist panel is additive — never fatal */ }
+  }
+
+  /** watch 応答にパネルが同梱されていた場合の後追い更新 */
+  function updatePlaylistPanel(panelData) {
+    const n = normPanelData(panelData);
+    if (!n) return;
+    adoptPanel(n);
+    if (plState.idx < 0) plState.idx = 0;
+    drawPanel();
+    PlCtx.save(listId, { title: plState.title, owner: plState.owner, total: plState.total, items: plState.items });
+  }
+
+  function drawPanel() {
+    const rail = $('#rail');
+    if (!rail) return;
+    rail.querySelector('.plp')?.remove();
+    const rows = plState.items.map((v, i) => `
+      <div class="plp-item ${i === plState.idx ? 'active' : ''}" data-plgo="${i}">
+        <span class="plp-idx">${i === plState.idx ? '<svg viewBox="0 0 24 24" class="ic" style="width:14px;height:14px"><path d="M8 5v14l11-7z"/></svg>' : (i + 1)}</span>
+        <div class="vthumb"><img loading="lazy" src="${esc(v.thumb || ('https://i.ytimg.com/vi/' + v.id + '/hqdefault.jpg'))}" alt="">${v.duration ? `<span class="dur">${esc(v.duration)}</span>` : ''}</div>
+        <div class="vinfo"><div class="plp-tt">${esc(v.title || '')}</div><div class="vsub" style="font-size:12px">${esc(v.channel || '')}</div></div>
+      </div>`).join('');
+    const totalTxt = plState.total && Number(plState.total) > plState.items.length ? plState.total : plState.items.length;
+    rail.insertAdjacentHTML('afterbegin', `
+      <div class="plp">
+        <div class="plp-head">
+          <div class="plp-t1">
+            <span class="plp-ic">${ICON_LIST}</span>
+            <span class="plp-name">${esc(plState.title)}</span>
+            <div class="plp-spacer"></div>
+            <button class="icon-btn plp-btn ${plState.shuffle ? 'on' : ''}" data-plact="shuffle" title="シャッフル">${ICON_SHUFFLE}</button>
+            <button class="icon-btn plp-btn ${plState.loop ? 'on' : ''}" data-plact="loop" title="ループ再生">${ICON_LOOP}</button>
+            <button class="icon-btn plp-btn" data-plact="fold" title="折りたたむ"><svg viewBox="0 0 24 24" class="ic"><path d="M7.4 8.6 12 13.2l4.6-4.6L18 10l-6 6-6-6z"/></svg></button>
+          </div>
+          <div class="plp-sub">${esc(plState.owner || '再生リスト')} ・ ${plState.idx + 1} / ${totalTxt}</div>
+        </div>
+        <div class="plp-items">${rows}</div>
+      </div>`);
+    const panel = rail.querySelector('.plp');
+    panel.querySelectorAll('[data-plgo]').forEach(r => r.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const i = +r.dataset.plgo;
+      const v = plState.items[i];
+      if (v) location.hash = '#/watch?v=' + v.id + '&list=' + encodeURIComponent(listId);
+    }));
+    panel.querySelectorAll('[data-plact]').forEach(b => b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const act = b.dataset.plact;
+      if (act === 'loop') { plState.loop = !plState.loop; b.classList.toggle('on', plState.loop); }
+      if (act === 'shuffle') { plState.shuffle = !plState.shuffle; b.classList.toggle('on', plState.shuffle); }
+      if (act === 'fold') { panel.classList.toggle('folded'); b.querySelector('svg').style.transform = panel.classList.contains('folded') ? 'rotate(180deg)' : ''; }
+    }));
+    panel.querySelector('.plp-item.active')?.scrollIntoView({ block: 'center' });
+  }
+
+  function advance(step) {
+    if (destroyed || !plState.items.length) return;
+    let next;
+    if (plState.shuffle) {
+      do { next = Math.floor(Math.random() * plState.items.length); } while (plState.items.length > 1 && next === plState.idx);
+    } else {
+      next = plState.idx + step;
+      if (next >= plState.items.length) {
+        if (!plState.loop) return;
+        next = 0;
+      }
+    }
+    const v = plState.items[next];
+    if (!v) return;
+    toast('次の動画を再生: ' + (v.title || v.id).slice(0, 30), 1800);
+    location.hash = '#/watch?v=' + v.id + '&list=' + encodeURIComponent(listId);
+  }
+
+  return { destroy() { cleanup(); } };
+
+  function fillRail(d) {
+    const rail = $('#rail');
+    if (!rail) return;
+    // 即時描画済みの再生リストパネルは生きたまま最上段に温存（イベントリスナごと）
+    const plp = rail.querySelector('.plp');
+    const vids = (d.related || []).filter(i => i.kind === 'video');
+    const shorts = (d.related || []).filter(i => i.kind === 'short');
+    rail.innerHTML =
+      vids.slice(0, 6).map(railCard).join('') +
+      (shorts.length ? shortsShelf(shorts, { compact: true }) : '') +
+      vids.slice(6).map(railCard).join('');
+    if (plp) rail.insertBefore(plp, rail.firstChild);
+  }
+}

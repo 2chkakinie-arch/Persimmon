@@ -1,0 +1,119 @@
+/* ------------------------------------------------------------------ router */
+const routes = [];
+function route(pattern, handler) { routes.push([pattern, handler]); }
+
+function parseHash() {
+  const raw = location.hash.replace(/^#/, '') || '/';
+  const [path, qs] = raw.split('?');
+  return { path, params: new URLSearchParams(qs || '') };
+}
+
+let currentPage = null;
+function render() {
+  const { path, params } = parseHash();
+  if (currentPage?.destroy) { try { currentPage.destroy(); } catch (_) {} }
+  currentPage = null;
+  window.scrollTo(0, 0);
+  // 狭い画面ではナビゲーション時にドロワーを自動で閉じる
+  if (window.innerWidth < 1100 && document.body.classList.contains('nav-open')) applyNav(false, { save: false });
+  for (const [pat, fn] of routes) {
+    const m = path.match(pat);
+    if (m) { currentPage = fn(...m.slice(1), params) || null; return; }
+  }
+  renderHome();
+}
+window.addEventListener('hashchange', render);
+
+/* ---------------------------------------------------------------- nav sync */
+function setActiveNav(key) {
+  $$('#mini-guide .guide-item').forEach(a => a.classList.toggle('active', a.dataset.nav === key));
+  $$('#bottom-nav a').forEach(a => a.classList.toggle('active', a.dataset.nav === key));
+}
+
+/* ==================================================================== HOME */
+const CHIPS = [
+  ['すべて', 'all'], ['音楽', 'music'], ['ゲーム', 'gaming'], ['ニュース', 'news'],
+  ['アニメ', 'anime'], ['料理', 'cooking'], ['スポーツ', 'sports'], ['テクノロジー', 'tech'], ['ASMR', 'asmr'],
+];
+
+function drawHomeItems(body, items, { personal = false } = {}) {
+  const vids = [], shorts = [];
+  for (const it of items || []) (it.kind === 'short' ? shorts : vids).push(it);
+  if (!vids.length) {
+    body.innerHTML = nudgeHtml('まずは検索してみましょう', '視聴した動画がここに表示されます。');
+    return;
+  }
+  const first = vids.slice(0, 8), rest = vids.slice(8);
+  body.innerHTML =
+    (personal ? `<div class="sec-title">あなたにおすすめ</div>` : '') +
+    `<div class="grid">${first.map(v => videoCard(v)).join('')}</div>` +
+    (shorts.length ? shortsShelf(shorts) : '') +
+    `<div class="grid">${rest.map(v => videoCard(v)).join('')}</div>`;
+}
+
+function renderHome(chip = sessionStorage.getItem('chip') || 'all') {
+  setActiveNav('home');
+  sessionStorage.setItem('chip', chip);
+  const profile = buildProfile();
+
+  // YouTube-faithful empty home: no chips, just the search nudge
+  if (!profile && chip === 'all') {
+    app.innerHTML = nudgeHtml(
+      'まずは検索してみましょう',
+      '視聴履歴がまだありません。上の検索バーから動画を検索すると、あなたの好みに合わせたおすすめがここに表示されます。'
+    );
+    return;
+  }
+
+  app.innerHTML = `
+    <div class="chips">${CHIPS.map(([label, key]) =>
+      `<button class="chip ${key === chip ? 'active' : ''}" data-chip="${key}">${label}</button>`).join('')}
+    </div>
+    <div id="home-body">${skGrid(12)}</div>`;
+  $$('.chip', app).forEach(b => b.addEventListener('click', () => renderHome(b.dataset.chip)));
+
+  const body = $('#home-body');
+
+  if (chip === 'all' && profile) {
+    // personalized: infer taste from history/likes/searches
+    api('/api/home/personal', {
+      method: 'POST', body: JSON.stringify(profile), ttl: 0,
+    }).then((d) => {
+      if (!document.body.contains(body)) return;
+      const watched = new Set(History.list().map(h => h.v));
+      const items = (d.items || []).filter(i => !watched.has(i.id));
+      const shorts = (d.shorts || []).filter(i => !watched.has(i.id));
+      if (!items.length) { renderHomePreset(body, chip); return; }
+      drawHomeItems(body, [...items.slice(0, 8), ...shorts.map(s => ({ ...s, kind: 'short' })) /* shorts split again in draw */, ...items.slice(8)], { personal: true });
+    }).catch(() => renderHomePreset(body, chip));
+    return;
+  }
+  renderHomePreset(body, chip);
+
+  function renderHomePreset(b, c) {
+    // 高速化: 前回表示したホームを localStorage スナップショットから即描画し、
+    // 裏で最新を取得（stale-while-revalidate）。2回目以降の訪問は一瞬で画面が出る。
+    const SNAP_KEY = 'snap:home:' + c;
+    const snap = Store.get(SNAP_KEY, null);
+    let snapDrawn = false;
+    if (snap?.items?.length && Date.now() - (snap.ts || 0) < 30 * 60e3) {
+      const watched = new Set(History.list().map(h => h.v));
+      const items = (snap.items || []).filter(i => !watched.has(i.id));
+      if (items.length) { drawHomeItems(b, items); snapDrawn = true; }
+    }
+    api('/api/home?chip=' + encodeURIComponent(c), { ttl: 15 * 60e3, persist: 10 * 60e3 })
+      .then((d) => {
+        if (!document.body.contains(b)) return;
+        if (d.items?.length) {
+          Store.set(SNAP_KEY, { ts: Date.now(), items: d.items.slice(0, 60) });
+          // スナップショット描画済み & 中身が同じなら再描画しない（カクつき防止）
+          const same = snapDrawn && snap?.items?.length
+            && snap.items.slice(0, 6).every((s, i) => d.items[i] && s.id === d.items[i].id);
+          if (!same) drawHomeItems(b, d.items || []);
+        } else if (!snapDrawn) {
+          drawHomeItems(b, []);
+        }
+      })
+      .catch(() => { if (!snapDrawn && document.body.contains(b)) errBox('ホームを読み込めませんでした', () => renderHome(chip)); });
+  }
+}
