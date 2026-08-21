@@ -66,13 +66,24 @@ class PipedProvider {
     try {
       const win = await new Promise((resolve, reject) => {
         let pending = order.length;
+        let settled = false;
         const errors = [];
+        // 修正: 旧実装は「HTTP 成功だが videoStreams が空」の応答を pending カウント
+        // から漏らしており、全インスタンスが空を返すと Promise が永久に未解決の
+        // ままハングしていた（last-resort 経路全体が固まる重大バグ）。
+        const checkDone = () => { if (!settled && pending <= 0) reject(errors[0] || new Error('all instances failed')); };
         for (const host of order) {
           this._fetchInstance(host, videoId)
-            .then((r) => { if (r?.j?.videoStreams?.length) resolve(r); })
+            .then((r) => {
+              if (settled) return;
+              if (r?.j?.videoStreams?.length) { settled = true; resolve(r); return; }
+              errors.push(new Error(host + ': empty streams'));
+              pending--; checkDone();
+            })
             .catch((e) => {
+              if (settled) return;
               errors.push(e);
-              if (--pending === 0) reject(errors[0] || new Error('all instances failed'));
+              pending--; checkDone();
             });
         }
       }).catch(() => null);

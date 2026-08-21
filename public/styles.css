@@ -66,7 +66,8 @@ input { font-family: inherit; }
 .icon-btn:hover { background: var(--hover); }
 .icon-btn:active { background: var(--hover-2); }
 .logo { display: flex; align-items: flex-start; padding: 8px 14px 8px 16px; margin-left: -8px; }
-.logo-svg { width: 90px; height: 20px; color: var(--text); }
+.logo-svg { width: 88px; height: 24px; color: var(--text); overflow: visible; }
+.logo-mark { filter: drop-shadow(0 2px 5px rgba(255, 90, 30, .38)); }
 .logo .country { font-size: 10px; color: var(--text-2); margin: 1px 0 0 2px; }
 
 /* search */
@@ -141,6 +142,12 @@ input { font-family: inherit; }
 /* ============ video grid ============ */
 .grid { display: grid; gap: 16px 16px; padding: 8px 24px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); row-gap: 40px; }
 .vcard { display: flex; flex-direction: column; cursor: pointer; min-width: 0; }
+/* 高速化: 画面外のカードはレイアウト/描画をスキップ（初回レンダリング大幅短縮） */
+.vcard, .rcard, .result-card {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 240px;
+}
+.result-card { contain-intrinsic-size: auto 200px; }
 .vthumb { position: relative; border-radius: 12px; overflow: hidden; aspect-ratio: 16/9; background: var(--skeleton); }
 .vthumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .vthumb .dur {
@@ -427,7 +434,7 @@ input { font-family: inherit; }
   #opts-btn { display: none; }
   .mh-center { padding: 0 8px; }
   .search-btn { width: 48px; }
-  .logo-svg { width: 80px; }
+  .logo-svg { width: 78px; height: 21px; }
   #search-input { height: 36px; font-size: 15px; }
   .search-btn { height: 36px; }
   .grid { padding: 8px 0; grid-template-columns: 1fr; row-gap: 24px; }

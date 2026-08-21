@@ -35,6 +35,36 @@ const wrap = (fn) => (req, res) => {
 
 /* ------------------------------------------------------------- media proxy */
 
+/**
+ * 高速化: 同一 (video, itag, Range) の並行リクエストを 1 本の上流フェッチに束ねる。
+ * ブラウザ（特に MSE の DashLite と二重 <video>/<audio> 構成）は同じセグメントを
+ * ほぼ同時に 2〜3 回要求してくることがあり、束ねると無料プロキシ帯域が
+ * リクエスト数分ではなく 1 本で済み、全クライアントの初バイトが速くなる。
+ * （巨大な full-file GET をメモリに溜めないよう、明示 Range 8MB 以下のみ対象）
+ */
+const _streamJobs = new Map(); // "v|itag|range" -> Promise<buffered|null>
+async function fetchStreamBytes(url, headers, dispatcher) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), 25000);
+  try {
+    const upstream = await undiciRequest(url, {
+      method: 'GET', headers, signal: ac.signal, dispatcher,
+      maxRedirections: 2, headersTimeout: 20000,
+    });
+    if (upstream.statusCode >= 400) { upstream.body.dump().catch(() => {}); return null; }
+    const pass = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'cache-control'];
+    const out = {};
+    for (const k of pass) { const val = upstream.headers[k]; if (val) out[k] = val; }
+    const chunks = [];
+    for await (const c of upstream.body) chunks.push(c);
+    return { status: upstream.statusCode === 206 ? 206 : 200, headers: out, buf: Buffer.concat(chunks) };
+  } catch (_) {
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 const PIPED_HOSTS = new Set(piped.instances);
 
 function isGoogleVideo(u) {
@@ -55,6 +85,11 @@ router.get('/api/stream', wrap(async (req, res) => {
 
   // HOT PATH: pre-buffered first bytes -> answer straight from RAM
   if (!rawRaw && hotChunks.serveIfHot(v, itag, req, res)) return;
+
+  // 重複排除対象: 明示 Range かつ 8MB 以下のセグメント系リクエストのみ
+  const rangeHdr = req.headers.range ? String(req.headers.range) : null;
+  const rm = rangeHdr ? /^bytes=(\d+)-(\d+)$/.exec(rangeHdr) : null;
+  const dedupe = !rawRaw && !!rm && (Number(rm[2]) - Number(rm[1])) <= 8 * 1024 * 1024;
 
   let attempt = 0;
   let lastErr = null;
@@ -79,6 +114,24 @@ router.get('/api/stream', wrap(async (req, res) => {
       if (req.headers.range) headers.Range = String(req.headers.range);
       // stream URLs are IP-bound to whichever egress fetched them: reuse it
       const dispatcher = proxyUrl ? proxyManager.dispatcherFor(proxyUrl) : undefined;
+      if (dedupe) {
+        const key = v + '|' + itag + '|' + headers.Range;
+        let job = _streamJobs.get(key);
+        if (!job) {
+          job = fetchStreamBytes(url, headers, dispatcher).finally(() => _streamJobs.delete(key));
+          _streamJobs.set(key, job);
+        }
+        const hit = await job;
+        if (!hit) throw new Error('upstream');
+        if (res.headersSent || req.destroyed) return;
+        res.writeHead(hit.status, {
+          ...hit.headers,
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': hit.headers['cache-control'] || 'private, max-age=3600',
+        });
+        res.end(hit.buf);
+        return;
+      }
       await pipeUpstream(url, headers, req, res, { dispatcher });
       return;
     } catch (e) {
