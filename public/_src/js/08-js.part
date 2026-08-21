@@ -1,0 +1,126 @@
+/* routes */
+route(/^\/$/, () => renderHome());
+route(/^\/results$/, (params) => renderResults(params));
+route(/^\/watch$/, (params) => renderWatch(params));
+route(/^\/channel\/(.+)$/, (id, params) => renderChannel(id, params));
+route(/^\/playlist$/, (params) => renderPlaylist(params));
+route(/^\/shorts$/, () => renderShortsHome());
+route(/^\/shorts\/([\w-]{11})$/, (id) => renderShort(id));
+route(/^\/feed\/subscriptions$/, () => renderSubscriptions());
+route(/^\/feed\/you$/, () => renderMyPage());
+route(/^\/settings$/, () => renderSettings());
+
+/* ------------------------------------------------------------ masthead wire */
+$('#search-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const q = $('#search-input').value.trim();
+  if (q) {
+    Searches.add(q);
+    location.hash = '/results?search_query=' + encodeURIComponent(q);
+  }
+  $('#suggest').classList.add('hidden');
+});
+
+const sInput = $('#search-input');
+const sBox = $('#suggest');
+let sgItems = [], sgIndex = -1;
+const doSuggest = debounce(async () => {
+  const q = sInput.value.trim();
+  if (!q) {
+    // empty query: surface recent searches like YouTube does
+    const recent = Searches.list().slice(0, 8);
+    if (!recent.length || document.activeElement !== sInput) { sBox.classList.add('hidden'); return; }
+    sgItems = recent; sgIndex = -1;
+    sBox.innerHTML = sgItems.map((s, i) => `
+      <div class="sg" data-i="${i}">
+        <svg viewBox="0 0 24 24"><path d="M13 3a9 9 0 1 0 .9 18H13v-2h.1A7 7 0 1 1 13 5v3l4.5-4L13 0zM12 7v5l4.2 2.5.8-1.2-3.5-2V7z" fill="currentColor"/></svg>
+        <span>${esc(s)}</span>
+      </div>`).join('');
+    sBox.classList.remove('hidden');
+    wireSgPicks();
+    return;
+  }
+  try {
+    const d = await api('/api/suggest?q=' + encodeURIComponent(q), { ttl: 10 * 60e3 });
+    sgItems = d.suggestions || [];
+    sgIndex = -1;
+    if (!sgItems.length || document.activeElement !== sInput) { sBox.classList.add('hidden'); return; }
+    sBox.innerHTML = sgItems.map((s, i) => `
+      <div class="sg" data-i="${i}">
+        <svg viewBox="0 0 24 24"><path d="M15.5 14h-.8l-.3-.3a6.5 6.5 0 1 0-.7.7l.3.3v.8l5 5 1.5-1.5zm-6 0a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9z" fill="currentColor"/></svg>
+        <span>${esc(s)}</span>
+      </div>`).join('');
+    sBox.classList.remove('hidden');
+    wireSgPicks();
+  } catch (_) { /* suggestions optional */ }
+}, 180);
+function wireSgPicks() {
+  $$('.sg', sBox).forEach(n => n.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    const pick = sgItems[+n.dataset.i];
+    sInput.value = pick;
+    sBox.classList.add('hidden');
+    Searches.add(pick);
+    location.hash = '/results?search_query=' + encodeURIComponent(pick);
+  }));
+}
+sInput.addEventListener('input', doSuggest);
+sInput.addEventListener('focus', doSuggest);
+sInput.addEventListener('blur', () => setTimeout(() => sBox.classList.add('hidden'), 140));
+sInput.addEventListener('keydown', (e) => {
+  if (sBox.classList.contains('hidden')) return;
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    sgIndex += e.key === 'ArrowDown' ? 1 : -1;
+    if (sgIndex < 0) sgIndex = sgItems.length - 1;
+    if (sgIndex >= sgItems.length) sgIndex = 0;
+    $$('.sg', sBox).forEach((n, i) => n.classList.toggle('active', i === sgIndex));
+    if (sgItems[sgIndex]) sInput.value = sgItems[sgIndex];
+  } else if (e.key === 'Escape') sBox.classList.add('hidden');
+});
+
+/* ============================================================ テーマ / ナビ */
+function applyTheme(dark, { save = true } = {}) {
+  document.documentElement.classList.toggle('dark', !!dark);
+  document.body.classList.toggle('dark', !!dark);
+  if (save) { try { localStorage.setItem('llytpr-theme', dark ? 'dark' : 'light'); } catch (_) {} }
+  $('meta[name=theme-color]')?.setAttribute('content', dark ? '#0f0f0f' : '#ffffff');
+}
+$('#theme-toggle').addEventListener('click', () => {
+  applyTheme(!document.documentElement.classList.contains('dark'));
+});
+
+/* ナビゲーションドロワー — 既定は「閉じた」状態。開閉状態は記憶するが、
+ * 狭い画面では次のナビゲーションで自動的に閉じる（オーバーレイ運用）。 */
+function applyNav(open, { save = true } = {}) {
+  document.body.classList.toggle('nav-open', !!open);
+  if (save) Store.set('nav', open ? 'open' : 'closed');
+}
+$('#menu-btn').addEventListener('click', () => {
+  applyNav(!document.body.classList.contains('nav-open'));
+});
+$('#nav-backdrop').addEventListener('click', () => applyNav(false));
+applyNav(Store.get('nav', 'closed') === 'open', { save: false });
+
+/* キーボードショートカット:
+ *   /        → 検索へフォーカス
+ *   Esc      → ドロワー/サジェストを閉じる
+ *   Ctrl+K   → 検索へフォーカス */
+document.addEventListener('keydown', (e) => {
+  const typing = /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName || '');
+  if ((e.key === '/' || (e.key.toLowerCase() === 'k' && (e.ctrlKey || e.metaKey))) && !typing) {
+    e.preventDefault();
+    $('#search-input')?.focus();
+    $('#search-input')?.select();
+    return;
+  }
+  if (e.key === 'Escape') {
+    if (document.body.classList.contains('nav-open')) applyNav(false);
+  }
+});
+
+/* done callback to signal full load */
+console.log('%c Vandal %c Made by Kakinie with llytpr-wl.v01nh TEAM. V1 ', 'background:linear-gradient(90deg,#ff4d4d,#ff0000);color:#fff;border-radius:4px;padding:2px 6px;font-weight:800', 'color:#888');
+render();
+
+})();

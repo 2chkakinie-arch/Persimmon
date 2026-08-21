@@ -1,0 +1,376 @@
+/* ================================================================= CHANNEL */
+function renderChannel(rawId, params) {
+  setActiveNav('subs');
+  const id = decodeURIComponent(rawId);
+  const tabParams = params.get('params') || undefined;
+  const cont = params.get('c') || undefined;
+
+  app.innerHTML = `
+    <div id="ch-wrap">
+      <div class="sk" style="height:210px;margin:16px 24px 0"></div>
+      <div class="ch-head"><div class="sk big-ava"></div><div style="flex:1"><div class="sk sk-line" style="width:240px;height:28px"></div><div class="sk sk-line" style="width:320px"></div></div></div>
+      ${skGrid(8)}
+    </div>`;
+
+  api(`/api/channel/${encodeURIComponent(id)}${tabParams ? '?params=' + encodeURIComponent(tabParams) : ''}${cont ? (tabParams ? '&' : '?') + 'c=' + encodeURIComponent(cont) : ''}`, { ttl: 8 * 60e3, persist: 5 * 60e3 })
+    .then((d) => {
+      const tabsHtml = (d.tabs || []).map(t =>
+        `<a class="ch-tab ${t.selected || (!tabParams && t.title === 'ホーム') ? 'active' : ''}" href="#/channel/${encodeURIComponent(id)}${t.params ? '?params=' + encodeURIComponent(t.params) : ''}">${esc(t.title)}</a>`).join('');
+      const vids = (d.items || []).filter(i => i.kind === 'video' || i.kind === 'short');
+      const others = (d.items || []).filter(i => i.kind === 'playlist');
+      const shorts = vids.filter(v => v.kind === 'short');
+      const longs = vids.filter(v => v.kind === 'video');
+      const subbed0 = Subs.has(d.id);
+      app.innerHTML = `
+      <div class="ch-page">
+        ${d.banner ? `<div class="ch-banner"><img src="${esc(d.banner)}" alt=""></div>` : ''}
+        <div class="ch-head">
+          <div class="big-ava">${d.avatar ? `<img src="${esc(d.avatar)}" alt="">` : ''}</div>
+          <div style="min-width:0">
+            <div class="ch-title">${esc(d.name || '')}</div>
+            <div class="ch-meta"><span class="handle">${esc(d.handle || '')}</span>${d.subs ? ' • ' + esc(d.subs) : ''}${d.videos ? ' • ' + esc(d.videos) : ''}</div>
+            <div class="ch-desc">${esc(d.description || '')}</div>
+            <div style="margin-top:12px"><button class="sub-btn ${subbed0 ? 'subbed' : ''}" id="ch-sub">${subbed0 ? '登録済み' : 'チャンネル登録'}</button></div>
+          </div>
+        </div>
+        <div class="ch-tabs">${tabsHtml}</div>
+        <div id="ch-content">
+          ${others.length ? `<div class="section-title" style="padding:16px 24px 0;font-size:16px;font-weight:600">作成した再生リスト</div><div class="grid">${others.map(playlistCard).join('')}</div>` : ''}
+          ${shorts.length ? shortsShelf(shorts) : ''}
+          <div class="grid">${longs.map(v => videoCard(v)).join('')}</div>
+        </div>
+      </div>`;
+      $('#ch-sub')?.addEventListener('click', function () {
+        const subbed = Subs.toggle({ id: d.id, name: d.name, avatar: d.avatar });
+        this.classList.toggle('subbed', subbed);
+        this.textContent = subbed ? '登録済み' : 'チャンネル登録';
+        toast(subbed ? 'チャンネル登録しました（この端末に保存）' : '登録を解除しました');
+      });
+      if (d.continuation) {
+        let cont2 = d.continuation, loading = false;
+        lazySentinel($('#ch-content'), () => {
+          if (loading) return;
+          loading = true;
+          api(`/api/channel/${encodeURIComponent(id)}?c=${encodeURIComponent(cont2)}`, { ttl: 8 * 60e3 })
+            .then((n) => {
+              loading = false;
+              cont2 = n.continuation;
+              const grid = $('#ch-content .grid:last-child');
+              grid?.insertAdjacentHTML('beforeend', (n.items || []).filter(i => i.kind === 'video').map(v => videoCard(v)).join(''));
+            })
+            .catch(() => { loading = false; });
+        });
+      }
+    })
+    .catch(e => errBox('チャンネルを読み込めませんでした: ' + e.message, () => renderChannel(rawId, params)));
+}
+
+/* ================================================================ PLAYLIST */
+function renderPlaylist(params) {
+  const list = params.get('list') || '';
+  if (!list) { errBox('再生リストIDが不正です', render); return; }
+  app.innerHTML = skGrid(10);
+  api('/api/playlist/' + encodeURIComponent(list), { ttl: 10 * 60e3 })
+    .then(d => {
+      const allItems = [...(d.items || [])];
+      // プレイリスト文脈をローカル保存（視聴ページはこれを一次情報源に即時描画）
+      PlCtx.save(list, { title: d.title, owner: d.channelName, total: d.total || allItems.length, items: allItems });
+      const rowHtml = (v, idx) => `
+            <div class="pl-item" data-href="#/watch?v=${esc(v.id)}&list=${esc(list)}">
+              <span class="idx">${idx}</span>
+              <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(v))}" alt="">${v.duration ? `<span class="dur">${esc(v.duration)}</span>` : ''}</div>
+              <div class="vinfo"><div class="vtitle">${esc(v.title)}</div><div class="vsub">${esc(v.channel || '')}</div></div>
+            </div>`;
+      app.innerHTML = `
+      <div class="pl-page">
+        <div class="pl-side">
+          ${allItems[0] ? `<div class="pl-thumb"><img src="${esc(thumbUrl(allItems[0]))}" alt=""></div>` : ''}
+          <h1>${esc(d.title || '再生リスト')}</h1>
+          <div class="pl-meta">${esc(d.channelName || '')}<br>${d.views ? esc(d.views) + '<br>' : ''}${allItems.length} 本の動画${d.isInfinite ? '（ミックス）' : ''}</div>
+        </div>
+        <div id="pl-items">
+          ${allItems.map((v, i) => rowHtml(v, i + 1)).join('')}
+        </div>
+      </div>`;
+      if (d.continuation) {
+        let cont = d.continuation, loading = false;
+        // ミックス (panelNext=true) は browse 系ではなく next 系の続き読み込みへ正しく振り分け
+        const nextBase = d.panelNext ? '/api/playlist/panel-next?c=' : '/api/playlist/next?c=';
+        const box = $('#pl-items');
+        let loaded = allItems.length; // 専用カウンタ（sentinel を件数に数えない）
+        const sent = lazySentinel(box, () => {
+          if (loading || !cont) return;
+          loading = true;
+          api(nextBase + encodeURIComponent(cont), { ttl: 10 * 60e3 })
+            .then(n => {
+              loading = false;
+              const items = n.items || [];
+              cont = n.continuation;
+              if (!cont) sent.done();
+              // sentinel 直前に挿入（構造の破壊・番号のズレを防ぐ）
+              sent.el.insertAdjacentHTML('beforebegin', items.map((v, i) => rowHtml(v, loaded + i + 1)).join(''));
+              loaded += items.length;
+              allItems.push(...items);
+              PlCtx.save(list, { title: d.title, owner: d.channelName, total: loaded, items: allItems });
+            })
+            .catch(() => { loading = false; });
+        });
+      }
+    })
+    .catch(e => errBox('再生リストを読み込めませんでした: ' + e.message, () => renderPlaylist(params)));
+}
+
+/* ================================================================== SHORTS */
+const SHORT_CHIPS = [['おすすめ', null], ['おもしろ', 'ショート おもしろ'], ['音楽', 'ショート 音楽'], ['動物', 'ショート かわいい 動物'], ['ゲーム', 'ショート ゲーム'], ['コント', 'コント ショート']];
+
+function renderShortsHome(chip = 0) {
+  setActiveNav('shorts');
+  app.innerHTML = `
+    <div class="chips">${SHORT_CHIPS.map(([label], i) =>
+      `<button class="chip ${i === chip ? 'active' : ''}" data-sc="${i}">${label}</button>`).join('')}
+    </div>
+    <div id="shorts-body"><div class="sec-title">ショート</div>${skGrid(10)}</div>`;
+  $$('#app [data-sc]').forEach(b => b.addEventListener('click', () => renderShortsHome(+b.dataset.sc)));
+  const body = $('#shorts-body');
+  const draw = (shorts, title) => {
+    if (!document.body.contains(body)) return;
+    if (!shorts.length) { body.innerHTML = `<div class="sec-title">${esc(title)}</div><div class="empty-state"><h1>ショート動画が見つかりません</h1></div>`; return; }
+    body.innerHTML = `<div class="sec-title">${esc(title)}</div><div class="shorts-grid">${shorts.map(shortCard).join('')}</div>`;
+  };
+  const q = SHORT_CHIPS[chip][1];
+  if (!q) {
+    api('/api/shorts', { ttl: 15 * 60e3, persist: 10 * 60e3 })
+      .then(d => draw(d.items || [], 'ショート'))
+      .catch(() => errBox('読み込めませんでした', () => renderShortsHome(chip)));
+  } else {
+    Promise.allSettled([api('/api/search?q=' + encodeURIComponent(q), { ttl: 15 * 60e3 }), api('/api/shorts', { ttl: 15 * 60e3 })])
+      .then(([s, base]) => {
+        const shorts = (s.status === 'fulfilled' ? s.value.items : []).filter(i => i.kind === 'short');
+        const feed = base.status === 'fulfilled' ? base.value.items : [];
+        const merged = []; const seen = new Set();
+        for (const it of [...shorts, ...feed]) { if (!seen.has(it.id)) { seen.add(it.id); merged.push(it); } }
+        draw(merged, 'ショート');
+      });
+  }
+}
+
+/* ---------------- dedicated Shorts player (本家ショート風・全画面縦型) --------
+ * 下スクロール / スワイプ / ↓キーで次のショートへ移行。キューはクリック元の
+ * シェルフから sessionStorage 経由で引き継ぎ、末尾近くでフィードを自動補充。 */
+function renderShort(firstId) {
+  setActiveNav('shorts');
+  document.documentElement.classList.add('sh-lock');
+
+  let q = shqLoad() || { ids: [], meta: {} };
+  if (!q.ids.includes(firstId)) { q.ids.unshift(firstId); }
+  let idx = q.ids.indexOf(firstId);
+  let destroyed = false;
+  let navCool = 0;
+  let watchData = null;
+  let rescuedFor = null; // 動画ごと1回だけのストリーム復旧
+
+  app.innerHTML = `
+  <div class="shp" id="shp">
+    <div class="shp-stage" id="shp-stage">
+      <video class="shp-video" id="shp-video" playsinline autoplay preload="auto"></video>
+      <div class="shp-spin" data-sh-spin><div class="mini-spin light"></div></div>
+      <div class="shp-grad"></div>
+      <div class="shp-info">
+        <div class="shp-title" id="shp-title"></div>
+        <div class="shp-ch">
+          <div class="shp-ava" id="shp-ava"></div>
+          <span class="shp-chname" id="shp-chname"></span>
+          <button class="shp-sub" id="shp-sub">登録</button>
+        </div>
+      </div>
+      <div class="shp-progress"><div class="shp-bar" id="shp-bar"></div></div>
+      <div class="shp-rail" id="shp-rail">
+        <button class="shp-act" data-sh="like" title="高く評価"><svg viewBox="0 0 24 24" class="ic"><path d="M2 21h4V9H2zM22 10c0-1.1-.9-2-2-2h-6.3l.9-4.6c0-.9-.8-1.5-.8-1.5L12.7 1 6.2 8.6C5.8 8.9 5 9.5 5 10v10c0 1.1.9 2 2 2h9c.8 0 1.5-.5 1.8-1.2l3-7.1c.1-.2.2-.5.2-.7z"/></svg><span id="shp-likes"></span></button>
+        <button class="shp-act" data-sh="comments" title="コメント"><svg viewBox="0 0 24 24" class="ic"><path d="M20 2H4a2 2 0 0 0-2 2v18l4-4h14a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z"/></svg><span id="shp-cmcount"></span></button>
+        <button class="shp-act" data-sh="share" title="共有"><svg viewBox="0 0 24 24" class="ic"><path d="M14 9V5l7 7-7 7v-4.1c-5 0-8.5 1.6-11 5.1 1-5 4-10 11-11z"/></svg><span>共有</span></button>
+        <button class="shp-act" data-sh="save" title="保存"><svg viewBox="0 0 24 24" class="ic"><path d="M17 3H7a2 2 0 0 0-2 2v16l7-5 7 5V5a2 2 0 0 0-2-2z"/></svg><span>保存</span></button>
+        <button class="shp-act" data-sh="open" title="通常プレイヤーで開く"><svg viewBox="0 0 24 24" class="ic"><path d="M4 4h7v2H6v12h12v-5h2v7H4zM14 4h6v6h-2V7.4l-6.3 6.3-1.4-1.4L16.6 6H14z"/></svg><span>詳細</span></button>
+      </div>
+    </div>
+    <div class="shp-navs">
+      <button class="shp-nav" id="shp-prev" title="前の動画 (↑)"><svg viewBox="0 0 24 24" class="ic"><path d="M7.4 15.4 12 10.8l4.6 4.6L18 14l-6-6-6 6z"/></svg></button>
+      <button class="shp-nav" id="shp-next" title="次の動画 (↓)"><svg viewBox="0 0 24 24" class="ic"><path d="M7.4 8.6 12 13.2l4.6-4.6L18 10l-6 6-6-6z"/></svg></button>
+    </div>
+  </div>`;
+
+  const video = $('#shp-video');
+  const stage = $('#shp-stage');
+  const spin = () => { const s = stage.querySelector('[data-sh-spin]'); return s; };
+  const showSpin = (on) => spin()?.classList.toggle('hidden', !on);
+
+  function entry() {
+    const id = q.ids[idx];
+    const m = (q.meta || {})[id] || {};
+    return { v: id, t: watchData?.title || m.title || '', cn: watchData?.channel?.name || '', ch: watchData?.channel?.id || '', d: watchData?.lengthSeconds || 0 };
+  }
+
+  async function loadCurrent(animate) {
+    const id = q.ids[idx];
+    if (!id) return;
+    watchData = null;
+    rescuedFor = null;
+    history.replaceState(null, '', '#/shorts/' + id);
+    const m = (q.meta || {})[id] || {};
+    $('#shp-title').textContent = m.title || '';
+    $('#shp-chname').textContent = '';
+    $('#shp-ava').innerHTML = '';
+    $('#shp-likes').textContent = '';
+    $('#shp-cmcount').textContent = '';
+    showSpin(true);
+    try {
+      video.removeAttribute('src'); video.load();
+      video.src = `/api/stream?v=${id}&itag=18`;
+      video.muted = false;
+      await video.play().catch(() => { video.muted = true; return video.play().catch(() => {}); });
+      document.title = (m.title || 'ショート') + ' - Vandal';
+    } catch (_) { /* watchdog below covers */ }
+    // メタは裏で充填（タイトル/チャンネル/高評価数/コメント数）
+    api('/api/watch/' + id, { ttl: 3 * 60e3 }).then((d) => {
+      if (destroyed || q.ids[idx] !== id) return;
+      watchData = d;
+      $('#shp-title').textContent = d.title || m.title || '';
+      $('#shp-chname').textContent = d.channel?.name || '';
+      $('#shp-ava').innerHTML = d.channel?.avatar ? `<img src="${esc(d.channel.avatar)}" alt="">` : '';
+      $('#shp-likes').textContent = d.likeCount || '';
+      $('#shp-cmcount').textContent = d.commentsCount || '';
+      document.title = (d.title || 'ショート') + ' - Vandal';
+      const subbed = Subs.has(d.channel?.id);
+      const sb = $('#shp-sub');
+      if (sb) { sb.textContent = subbed ? '登録済み' : '登録'; sb.classList.toggle('subbed', !!subbed); }
+    }).catch(() => {});
+    History.add(entry());
+    // 次の1本を温める（スクロールした瞬間に再生が始まるように）
+    const nx = q.ids[idx + 1];
+    if (nx) { fetch('/api/warm/' + nx).catch(() => {}); api('/api/watch/' + nx).catch(() => {}); }
+    // 末尾接近: フィードでキューを自動補充
+    if (idx + 3 >= q.ids.length) refill();
+    if (animate) {
+      stage.animate([{ transform: 'translateY(14px)', opacity: 0 }, { transform: 'none', opacity: 1 }], { duration: 180, easing: 'ease-out' });
+    }
+  }
+
+  let refilling = false;
+  async function refill() {
+    if (refilling) return;
+    refilling = true;
+    try {
+      const d = await api('/api/shorts', { ttl: 15 * 60e3 });
+      const fresh = (d.items || []).map(i => i.id).filter(v => /^[\w-]{11}$/.test(v || ''));
+      const seen = new Set(q.ids);
+      for (const id of fresh) if (!seen.has(id)) { seen.add(id); q.ids.push(id); }
+      for (const it of d.items || []) if (it.id && !q.meta[it.id]) q.meta[it.id] = { title: it.title || '', views: it.views || '' };
+      shqSave(q.ids, q.meta);
+    } catch (_) { /* additive */ }
+    refilling = false;
+  }
+
+  function nav(step) {
+    const now = Date.now();
+    if (now - navCool < 420) return;
+    const n = idx + step;
+    if (n < 0 || n >= q.ids.length) {
+      if (n >= q.ids.length) refill();
+      return;
+    }
+    navCool = now;
+    idx = n;
+    stage.animate(
+      [{ transform: `translateY(0)`, opacity: 1 }, { transform: `translateY(${step > 0 ? -26 : 26}px)`, opacity: 0 }],
+      { duration: 130, easing: 'ease-in' });
+    setTimeout(() => { if (!destroyed) loadCurrent(true); }, 120);
+  }
+
+  video.addEventListener('playing', () => showSpin(false));
+  video.addEventListener('waiting', () => showSpin(true));
+  video.addEventListener('ended', () => nav(1));
+  video.addEventListener('click', () => { video.paused ? video.play().catch(() => {}) : video.pause(); });
+  video.addEventListener('timeupdate', () => {
+    const bar = $('#shp-bar');
+    if (bar && video.duration) bar.style.width = ((video.currentTime / video.duration) * 100).toFixed(2) + '%';
+  });
+  video.addEventListener('error', async () => {
+    const id = q.ids[idx];
+    if (!id || rescuedFor === id) return;
+    rescuedFor = id;
+    showSpin(true);
+    await api('/api/player/refresh', { method: 'POST', body: JSON.stringify({ v: id }) }).catch(() => null);
+    if (destroyed || q.ids[idx] !== id) return;
+    api.invalidate('/api/watch/' + id);
+    video.src = `/api/stream?v=${id}&itag=18&_=${Date.now()}`;
+    video.play().catch(() => {});
+  });
+
+  // wheel / touch / keyboard navigation
+  const onWheel = (e) => {
+    e.preventDefault();
+    if (Math.abs(e.deltaY) < 32) return;
+    nav(e.deltaY > 0 ? 1 : -1);
+  };
+  let tsY = null;
+  const onTs = (e) => { tsY = e.touches[0].clientY; };
+  const onTe = (e) => {
+    if (tsY == null) return;
+    const dy = tsY - e.changedTouches[0].clientY;
+    tsY = null;
+    if (Math.abs(dy) > 52) nav(dy > 0 ? 1 : -1);
+  };
+  const onKey = (e) => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); nav(1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); nav(-1); }
+  };
+  stage.addEventListener('wheel', onWheel, { passive: false });
+  stage.addEventListener('touchstart', onTs, { passive: true });
+  stage.addEventListener('touchend', onTe, { passive: true });
+  document.addEventListener('keydown', onKey);
+
+  $('#shp-prev').addEventListener('click', () => nav(-1));
+  $('#shp-next').addEventListener('click', () => nav(1));
+  $('#shp-rail').addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-sh]');
+    if (!b) return;
+    const act = b.dataset.sh;
+    const en = entry();
+    if (act === 'like') {
+      const liked = Likes.toggle(en);
+      b.classList.toggle('on', liked);
+      toast(liked ? '高く評価しました（この端末に保存）' : '取り消しました');
+    } else if (act === 'comments') {
+      location.hash = '#/watch?v=' + en.v;
+    } else if (act === 'share') {
+      const url = location.origin + location.pathname + '#/shorts/' + en.v;
+      try { await navigator.clipboard.writeText(url); toast('リンクをコピーしました'); } catch (_) { toast(url, 6000); }
+    } else if (act === 'save') {
+      const saved = Saves.toggle(en);
+      b.classList.toggle('on', saved);
+      toast(saved ? '保存しました（この端末に保存）' : '取り消しました');
+    } else if (act === 'open') {
+      location.hash = '#/watch?v=' + en.v;
+    }
+  });
+  $('#shp-sub').addEventListener('click', function () {
+    const ch = watchData?.channel;
+    if (!ch?.id) return;
+    const subbed = Subs.toggle({ id: ch.id, name: ch.name, avatar: ch.avatar });
+    this.textContent = subbed ? '登録済み' : '登録';
+    this.classList.toggle('subbed', subbed);
+    toast(subbed ? 'チャンネル登録しました（この端末に保存）' : '登録を解除しました');
+  });
+  // ローカル保存状態の初期反映
+  $('#shp-rail [data-sh="like"]').classList.toggle('on', false);
+  app.querySelector('[data-sh="like"]')?.classList.toggle('on', Likes.has(q.ids[idx]));
+  app.querySelector('[data-sh="save"]')?.classList.toggle('on', Saves.has(q.ids[idx]));
+
+  loadCurrent(false);
+
+  return { destroy() {
+    destroyed = true;
+    document.documentElement.classList.remove('sh-lock');
+    document.removeEventListener('keydown', onKey);
+    try { video.pause(); video.removeAttribute('src'); video.load(); } catch (_) { /* noop */ }
+  } };
+}

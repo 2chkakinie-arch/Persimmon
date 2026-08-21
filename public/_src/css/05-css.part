@@ -1,0 +1,219 @@
+/* =====================================================================
+   VANDAL V7 — 「最強 UI」リデザインレイヤー
+   ナビゲーションは既定で閉じたドロワー / ガラス風マストヘッド /
+   柿オレンジ〜クリムゾンのブランドグラデーション / 設定・診断ページ。
+   （既存クラスの上に重ねる上書きレイヤーとして機能する）
+   Made by Kakinie with llytpr-wl.v01nh TEAM. V1
+   ===================================================================== */
+
+/* ---- 新パレット ---- */
+:root {
+  --bg: #ffffff;
+  --bg-elev: #ffffff;
+  --bg-glass: rgba(255, 255, 255, .78);
+  --text: #0f0f0f;
+  --text-2: #606060;
+  --text-3: #909090;
+  --hover: rgba(20, 24, 40, .06);
+  --hover-2: rgba(20, 24, 40, .11);
+  --chip-bg: rgba(20, 24, 40, .06);
+  --chip-active: #0f0f0f;
+  --chip-active-text: #fff;
+  --border: rgba(20, 24, 40, .12);
+  --btn-black: #0f0f0f;
+  --btn-black-text: #fff;
+  --blue: #065fd4;
+  --red: #ff0000;
+  --accent: #ff0000;
+  --accent-2: #cc0000;
+  --accent-ink: #ffffff;
+  --accent-grad: linear-gradient(96deg, #ff4d4d, #ff0000 50%, #e60000);
+  --shadow: 0 6px 24px rgba(16, 20, 40, .10);
+  --shadow-lg: 0 14px 44px rgba(16, 20, 40, .16);
+  --focus: #1c62b9;
+  --skeleton: #e5e5e5;
+  --radius: 16px;
+  --dur: .18s;
+}
+html.dark {
+  --bg: #0f0f0f;
+  --bg-elev: #212121;
+  --bg-glass: rgba(15, 16, 20, .8);
+  --text: #f1f1f1;
+  --text-2: #aaaaaa;
+  --text-3: #717171;
+  --hover: rgba(255, 255, 255, .07);
+  --hover-2: rgba(255, 255, 255, .13);
+  --chip-bg: rgba(255, 255, 255, .08);
+  --chip-active: #f1f1f1;
+  --chip-active-text: #0f0f0f;
+  --border: rgba(255, 255, 255, .1);
+  --btn-black: #f1f1f1;
+  --btn-black-text: #0f0f0f;
+  --shadow: 0 6px 24px rgba(0, 0, 0, .4);
+  --shadow-lg: 0 14px 44px rgba(0, 0, 0, .55);
+  --skeleton: #272727;
+}
+
+body { background: var(--bg); }
+::selection { background: rgba(255, 0, 0, .28); }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 8px; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-3); }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ============ マストヘッド（ガラス + 微グロー） ============ */
+#masthead {
+  height: 60px;
+  background: var(--bg-glass);
+  -webkit-backdrop-filter: blur(14px) saturate(1.6);
+  backdrop-filter: blur(14px) saturate(1.6);
+  border-bottom: 1px solid var(--border);
+  padding: 0 12px 0 8px;
+  z-index: 300;
+}
+.mh-start { min-width: auto; }
+.logo { padding: 8px 12px; }
+.logo-img {
+  height: 32px; width: auto; display: block;
+  filter: drop-shadow(0 2px 8px rgba(255, 0, 0, .28)) drop-shadow(0 1px 2px rgba(0, 0, 0, .18));
+  transition: transform var(--dur), filter var(--dur);
+}
+.logo:hover { background: var(--hover); border-radius: 12px; }
+.logo:hover .logo-img {
+  transform: translateY(-1px);
+  filter: drop-shadow(0 4px 12px rgba(255, 0, 0, .4)) drop-shadow(0 2px 4px rgba(0, 0, 0, .2));
+}
+.icon-btn { border-radius: 12px; transition: background var(--dur), transform var(--dur); }
+.icon-btn:active { transform: scale(.92); }
+#menu-btn { margin-right: 2px; }
+#search-input {
+  border-radius: 999px; border: 1.5px solid var(--border); background: var(--bg-elev);
+  transition: border-color var(--dur), box-shadow var(--dur), background var(--dur);
+  padding: 0 18px;
+}
+#search-input:focus {
+  border-color: var(--focus); background: var(--bg-elev);
+  box-shadow: 0 0 0 4px rgba(28, 98, 185, .12);
+}
+.search-btn { border-radius: 999px; border: 1.5px solid var(--border); background: var(--bg-elev); transition: all var(--dur); }
+.search-btn:hover { background: var(--hover-2); color: var(--text); border-color: var(--border); box-shadow: none; }
+#search-form .mic { background: var(--chip-bg); }
+.suggest { border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow-lg); }
+html.dark #theme-toggle .theme-ic-sun { display: none; }
+html.dark #theme-toggle .theme-ic-moon { display: none; }
+html:not(.dark) #theme-toggle .theme-ic-sun { display: none; }
+#theme-toggle .ic { pointer-events: none; }
+
+/* ============ ナビゲーションドロワー（既定: 閉） ============ */
+#page { padding-top: 60px; }
+#mini-guide {
+  position: fixed; top: 60px; left: 0; bottom: 0; width: 256px; flex: none;
+  padding: 10px 10px 14px; z-index: 290;
+  background: var(--bg-elev); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  transform: translateX(-105%);
+  visibility: hidden;
+  transition: transform .22s cubic-bezier(.2, .9, .3, 1), visibility .22s;
+  box-shadow: none;
+  height: auto; overflow: hidden;
+}
+body.nav-open #mini-guide {
+  transform: none; visibility: visible;
+  box-shadow: 14px 0 44px rgba(8, 10, 20, .18);
+}
+.guide-scroll { overflow-y: auto; display: flex; flex-direction: column; gap: 2px; margin: 0 -4px; padding: 0 4px; }
+.guide-item {
+  display: flex; flex-direction: row; align-items: center; gap: 14px;
+  padding: 11px 14px; margin: 0; border-radius: 12px;
+  font-size: 14.5px; font-weight: 500; color: var(--text); letter-spacing: .1px;
+  transition: background var(--dur);
+}
+.guide-item .ic { width: 22px; height: 22px; fill: var(--text-2); transition: fill var(--dur); }
+.guide-item:hover { background: var(--hover); }
+.guide-item.active { background: var(--hover); color: var(--text); }
+.guide-item.active .ic { fill: var(--text); }
+.guide-sep { height: 1px; background: var(--border); margin: 10px 12px; }
+.guide-foot { margin-top: auto; display: block; padding: 12px 14px; border-top: 1px solid var(--border); }
+.foot-links { display: none; }
+.foot-credit { line-height: 1.55; color: var(--text-3); font-size: 10.5px; }
+#nav-backdrop {
+  position: fixed; inset: 60px 0 0 0; z-index: 280; display: none;
+  background: rgba(8, 10, 20, .4);
+  -webkit-backdrop-filter: blur(2px); backdrop-filter: blur(2px);
+}
+body.nav-open #nav-backdrop { display: block; animation: fadeIn .2s; }
+#content { padding-bottom: 24px; }
+
+/* ============ チップス（pill + グラデーション活性） ============ */
+.chips { top: 60px; padding: 12px 20px; gap: 8px; background: var(--bg); }
+.chip { height: 34px; padding: 0 16px; border-radius: 999px; font-size: 13.5px; font-weight: 500; transition: all var(--dur); }
+.chip:hover { background: var(--hover-2); transform: translateY(-1px); }
+.chip.active { background: var(--chip-active); color: var(--chip-active-text); box-shadow: none; }
+
+/* ============ カード（浮遊 + ホバー演出） ============ */
+.grid { padding: 10px 20px; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); row-gap: 36px; }
+.vthumb { border-radius: 14px; transition: transform .22s cubic-bezier(.2,.9,.3,1), box-shadow .22s; }
+.vcard:hover .vthumb, .result-card:hover .vthumb { transform: translateY(-3px) scale(1.012); box-shadow: 0 12px 32px rgba(8, 10, 24, .22); }
+.vthumb .dur { right: 8px; bottom: 8px; border-radius: 6px; font-weight: 600; padding: 2px 6px; background: rgba(0,0,0,.78); }
+.vthumb .live-badge { background: var(--red); font-weight: 800; }
+.vtitle { font-weight: 600; font-size: 15.5px; }
+.vava { border-radius: 50%; }
+.scard .sthumb { border-radius: 14px; transition: transform .22s; }
+.scard:hover .sthumb { transform: translateY(-3px); box-shadow: 0 10px 26px rgba(8, 10, 24, .2); }
+.sec-title { font-size: 17px; font-weight: 700; padding: 18px 20px 8px; }
+.section-title { font-size: 17px; font-weight: 700; }
+.empty-state, .nudge-card { border: 1px solid var(--border); box-shadow: var(--shadow); border-radius: 20px; }
+.nudge-icon { background: var(--chip-bg); }
+.nudge-icon svg { fill: var(--text-2); }
+
+/* ============ ウォッチページ ============ */
+.watch { padding: 20px; gap: 20px; }
+.player-wrap { border-radius: var(--radius); box-shadow: var(--shadow-lg); }
+.wtitle { font-size: 21px; font-weight: 800; letter-spacing: -.2px; }
+.sub-btn { background: var(--btn-black); color: var(--btn-black-text); font-weight: 600; transition: all var(--dur); }
+.sub-btn:hover { filter: brightness(1.08); box-shadow: none; }
+.sub-btn.subbed { background: var(--chip-bg); color: var(--text); box-shadow: none; }
+.btn-pill { border-radius: 999px; font-weight: 500; }
+.like-group { border-radius: 999px; }
+.desc-card { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 14px; }
+.desc-body a { color: var(--blue); }
+.error-box .retry { background: var(--blue); }
+.seek::-webkit-slider-thumb { background: var(--accent); }
+.seek::-webkit-slider-runnable-track { background: linear-gradient(to right, var(--accent) var(--prog), rgba(255,255,255,.35) var(--prog)); }
+.seek::-moz-range-thumb { background: var(--accent); }
+.seek::-moz-range-track { background: linear-gradient(to right, var(--accent) var(--prog), rgba(255,255,255,.35) var(--prog)); }
+.spin::after { border-top-color: var(--accent); }
+.mp-clear { color: var(--blue); }
+.mp-clear:hover { background: rgba(6,95,212,.1); }
+.ch-tab.active::after { background: var(--text); height: 3px; }
+.pl-side { background: linear-gradient(160deg, #3b6ea5, #1d3a5f); border-radius: 20px; box-shadow: 0 14px 40px rgba(0, 0, 0, .25); }
+.plp { background: var(--bg-elev); border: 1px solid var(--border); }
+
+/* ============ モバイルボトムナビ ============ */
+#bottom-nav {
+  display: none;
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 260;
+  height: 62px; padding-bottom: env(safe-area-inset-bottom);
+  background: var(--bg-glass);
+  -webkit-backdrop-filter: blur(14px) saturate(1.6); backdrop-filter: blur(14px) saturate(1.6);
+  border-top: 1px solid var(--border);
+  justify-content: space-around; align-items: center;
+}
+#bottom-nav a {
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  font-size: 10.5px; font-weight: 600; color: var(--text-2); padding: 6px 10px; border-radius: 12px;
+  transition: color var(--dur);
+}
+#bottom-nav a .ic { width: 22px; height: 22px; fill: currentColor; }
+#bottom-nav a.active { color: var(--text); }
+@media (max-width: 760px) {
+  #bottom-nav { display: flex; }
+  #mini-guide { width: min(300px, 84vw); }
+  body { padding-bottom: 62px; }
+  .chips { top: 60px; }
+  .ch-tabs { top: 60px; }
+  .logo-img { height: 28px; }
+  #settings-btn { display: grid; } /* モバイルでも設定へ */
+}

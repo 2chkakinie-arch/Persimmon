@@ -1,0 +1,259 @@
+/* -------------------------------------------------------------- card maker */
+const ICON_PLAY = '<svg viewBox="0 0 24 24" class="ic"><path d="M8 5v14l11-7z"/></svg>';
+const ICON_PAUSE = '<svg viewBox="0 0 24 24" class="ic"><path d="M7 5h4v14H7zm6 0h4v14h-4z"/></svg>';
+const ICON_CHECK = '<svg viewBox="0 0 24 24" class="verified"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-1.2 14.2l-4-4L8.2 11l2.6 2.6 5-5L17.2 10z"/></svg>';
+const ICON_SHORTS = '<svg viewBox="0 0 24 24"><path d="M17.7 4.1a10 10 0 1 0 .7 15.7 12.4 12.4 0 0 1-2.2 1.6 8.3 8.3 0 1 1 1.5-17.3z"/><path d="M10 15l5.2-3L10 9z"/></svg>';
+const ICON_SEARCH = '<svg viewBox="0 0 24 24"><path d="M15.5 14h-.8l-.3-.3a6.5 6.5 0 1 0-.7.7l.3.3v.8l5 5 1.5-1.5zm-6 0a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9z"/></svg>';
+
+function thumbUrl(it) {
+  if (it.thumb) return it.thumb;
+  if (it.id && (it.kind === 'video' || it.kind === 'short')) return `https://i.ytimg.com/vi/${it.id}/hqdefault.jpg`;
+  return '';
+}
+
+function videoCard(it, { rail = false } = {}) {
+  if (it.kind === 'short') return shortCard(it, { rail });
+  if (it.kind === 'channel') return channelRow(it);
+  if (it.kind === 'playlist') return playlistCard(it);
+  const href = it.url || ('/watch?v=' + it.id);
+  const meta = it.metaTop?.join(' • ') || [it.views, it.published].filter(Boolean).join(' • ');
+  return `
+  <div class="vcard" data-href="#${href.replace(/^#?/, '')}" data-vid="${esc(it.id)}">
+    <div class="vthumb">
+      <img loading="lazy" src="${esc(thumbUrl(it))}" alt="" onerror="this.onerror=null;this.src='https://i.ytimg.com/vi/${esc(it.id)}/hqdefault.jpg'">
+      ${it.duration ? `<span class="dur">${esc(it.duration)}</span>` : (it.live ? '<span class="dur live-badge">LIVE</span>' : '')}
+    </div>
+    <div class="vmeta">
+      <div class="vava">${it.channelAvatar ? `<img src="${esc(it.channelAvatar)}" alt="">` : '<svg viewBox="0 0 24 24" class="ic" style="fill:var(--text-3)"><path d="M12 4a3.5 3.5 0 1 1 0 7 3.5 3.5 0 0 1 0-7zm0 18c-3.2 0-6-.5-6-1.5 0-2.5 3.5-4 6-4s6 1.5 6 4c0 1-2.8 1.5-6 1.5z"/></svg>'}</div>
+      <div class="vinfo">
+        <div class="vtitle">${esc(it.title)}</div>
+        <div class="vsub">${it.channel ? `<span class="vch">${esc(it.channel)}</span>` : ''}</div>
+        <div class="vsub">${esc(meta || '')}</div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function railCard(it) {
+  if (it.kind === 'short') {
+    return `
+    <div class="rcard" data-href="#/shorts/${esc(it.id)}" data-vid="${esc(it.id)}">
+      <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt="">
+        <span class="dur" style="background:rgba(0,0,0,.8)">ショート</span>
+      </div>
+      <div class="vinfo">
+        <div class="vtitle">${esc(it.title)}</div>
+        <div class="vsub">${esc(it.views || '')}</div>
+      </div>
+    </div>`;
+  }
+  if (it.kind !== 'video') return '';
+  const href = '#/watch?v=' + it.id;
+  return `
+  <div class="rcard" data-href="${href}" data-vid="${esc(it.id)}">
+    <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt="">
+      ${it.duration ? `<span class="dur">${esc(it.duration)}</span>` : ''}
+    </div>
+    <div class="vinfo">
+      <div class="vtitle">${esc(it.title)}</div>
+      <div class="vsub">${esc(it.channel || '')}</div>
+      <div class="vsub">${esc(it.metaTop?.join(' • ') || '')}</div>
+    </div>
+  </div>`;
+}
+
+function shortCard(it) {
+  const href = '#/shorts/' + it.id;
+  return `
+  <div class="scard" data-href="${href}" data-vid="${esc(it.id)}">
+    <div class="sthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt=""></div>
+    <div class="stitle">${esc(it.title)}</div>
+    <div class="sviews">${esc(it.views || '')}</div>
+  </div>`;
+}
+
+/** dedicated shorts shelf — vertical videos get their own section */
+function shortsShelf(shorts, { compact = false } = {}) {
+  if (!shorts?.length) return '';
+  return `
+  <div class="shorts-row ${compact ? 'compact' : ''}">
+    <div class="shorts-title">${ICON_SHORTS}ショート</div>
+    <div class="shorts-scroll">${shorts.map(s => shortCard(s)).join('')}</div>
+  </div>`;
+}
+
+function playlistCard(it) {
+  return `
+  <div class="vcard" data-href="#${(it.url || '/playlist?list=' + it.id).replace(/^#?/, '')}">
+    <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt="">
+      <span class="pl-strip"><svg viewBox="0 0 24 24" class="ic"><path d="M3 6h12v2H3zm0 4h12v2H3zm0 4h8v2H3zm13-8v9l7-4.5z"/></svg>${esc(it.count || '再生リスト')}</span>
+    </div>
+    <div class="vmeta">
+      <div class="vinfo">
+        <div class="vtitle">${esc(it.title)}</div>
+        <div class="vsub">${esc(it.channel || '')}</div>
+        <div class="vsub">再生リストをすべて見る</div>
+      </div>
+    </div>
+  </div>`;
+}
+
+/** search-result-style playlist row (fixes the "giant thumbnail" bug) */
+function playlistRow(it) {
+  const href = (it.url || '/playlist?list=' + it.id).replace(/^#?/, '');
+  const count = it.count || '';
+  return `
+  <div class="result-card" data-href="#${esc(href)}">
+    <div class="vthumb"><img loading="lazy" src="${esc(thumbUrl(it))}" alt="">
+      <span class="pl-strip"><svg viewBox="0 0 24 24" class="ic"><path d="M3 6h12v2H3zm0 4h12v2H3zm0 4h8v2H3zm13-8v9l7-4.5z"/></svg>${esc(count || '再生リスト')}</span>
+    </div>
+    <div class="vinfo result-info">
+      <div class="vtitle">${esc(it.title)}</div>
+      <div class="pl-kind">再生リスト</div>
+      ${it.channel ? `<div class="result-ch" style="margin-top:2px"><span>${esc(it.channel)}</span></div>` : ''}
+      <div class="result-sub" style="margin-top:10px">再生リストをすべて見る</div>
+    </div>
+  </div>`;
+}
+
+function channelRow(it) {
+  return `
+  <div class="vcard" data-href="#${(it.url || '/channel/' + it.id).replace(/^#?/, '')}">
+    <div class="result-channel-row">
+      <div class="vava" style="width:96px;height:96px">${it.thumb ? `<img src="${esc(it.thumb)}" style="width:100%;height:100%">` : ''}</div>
+      <div class="vinfo">
+        <div class="vtitle" style="font-size:18px">${esc(it.title)}</div>
+        <div class="vsub">${[esc(it.subs || ''), esc(it.videos || '')].filter(Boolean).join(' • ')}</div>
+        <div class="vsub" style="margin-top:6px">${esc(it.description || '')}</div>
+      </div>
+      <button class="sub-btn" style="flex:none">チャンネル登録</button>
+    </div>
+  </div>`;
+}
+
+/** shorts playback queue — ショートカード群から文脈ごと保存（下スクロール遷移の土台） */
+const SHQ_KEY = 'llytpr:shq';
+function shqLoad() {
+  try {
+    const j = JSON.parse(sessionStorage.getItem(SHQ_KEY) || 'null');
+    if (j && j.ids?.length && Date.now() - j.ts < 3600e3) return j;
+  } catch (_) { /* ignore */ }
+  return null;
+}
+function shqSave(ids, meta = {}) {
+  try { sessionStorage.setItem(SHQ_KEY, JSON.stringify({ ids: ids.slice(0, 250), meta, ts: Date.now() })); } catch (_) { /* quota */ }
+}
+
+/** card for local-storage entries (history/likes/saves) */
+function storedCard(h, { onRemove } = {}) {
+  return `
+  <div class="vcard" data-href="#/watch?v=${esc(h.v)}" data-vid="${esc(h.v)}">
+    <div class="vthumb"><img loading="lazy" src="https://i.ytimg.com/vi/${esc(h.v)}/hqdefault.jpg" alt="">
+      ${h.d ? `<span class="dur">${esc(fmtDur(h.d))}</span>` : ''}
+    </div>
+    <div class="vmeta">
+      <div class="vava"><svg viewBox="0 0 24 24" class="ic" style="fill:var(--text-3)"><path d="M12 4a3.5 3.5 0 1 1 0 7 3.5 3.5 0 0 1 0-7zm0 18c-3.2 0-6-.5-6-1.5 0-2.5 3.5-4 6-4s6 1.5 6 4c0 1-2.8 1.5-6 1.5z"/></svg></div>
+      <div class="vinfo">
+        <div class="vtitle">${esc(h.t || h.v)}</div>
+        <div class="vsub">${esc(h.cn || '')}</div>
+      </div>
+      ${onRemove ? `<button class="icon-btn stored-del" data-del-hist="${esc(h.v)}" title="履歴から削除"><svg viewBox="0 0 24 24" class="ic"><path d="M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12z"/></svg></button>` : ''}
+    </div>
+  </div>`;
+}
+
+/* delegation for card clicks + hover prefetch */
+document.addEventListener('click', (e) => {
+  const del = e.target.closest('[data-del-hist]');
+  if (del) {
+    e.stopPropagation();
+    History.remove(del.dataset.delHist);
+    toast('履歴から削除しました');
+    render();
+    return;
+  }
+  const card = e.target.closest('[data-href]');
+  if (!card) return;
+  // ショートカード: 同一シェルフ/グリッドの並びをそのまま再生キューに保存
+  const sc = e.target.closest('.scard');
+  if (sc) {
+    const box = sc.closest('.shorts-scroll, .shorts-grid');
+    if (box) {
+      const cards = [...box.querySelectorAll('.scard')];
+      const ids = cards.map(c => c.dataset.vid).filter(v => /^[\w-]{11}$/.test(v || ''));
+      const meta = {};
+      cards.forEach(c => {
+        if (c.dataset.vid) meta[c.dataset.vid] = {
+          title: c.querySelector('.stitle')?.textContent || '',
+          views: c.querySelector('.sviews')?.textContent || '',
+        };
+      });
+      if (ids.length) shqSave(ids, meta);
+    }
+  }
+  location.hash = card.dataset.href.startsWith('#') ? card.dataset.href.slice(1) : card.dataset.href;
+});
+// ---- 先読みプリフェッチ（メタ情報限界高速化）------------------------------
+// カードに 120ms ホバーした時点で /api/watch（メタ+直結判定＋先頭チャンクwarm）を
+// 裏取得し、クリック時にはメモリキャッシュから即座に反映されるようにする。
+// data-vid 属性も data-href の URL も両方を解析する（検索行カード等も網羅）。
+const _prefetched = new Map(); // vid -> ts
+document.addEventListener('mouseover', debounce((e) => {
+  const card = e.target.closest?.('[data-vid],[data-href]');
+  if (!card) return;
+  let vid = card.dataset.vid || '';
+  if (!/^[\w-]{11}$/.test(vid)) {
+    // 修正: 旧パターンは "?v=" 形式（プレイリスト行など）に一致せず先読みが
+    // 働いていなかった。?v= / /shorts/ の両形式を確実に捕まえる。
+    const m = String(card.dataset.href || '').match(/[?&]v=([\w-]{11})|\/shorts\/([\w-]{11})/);
+    vid = m ? (m[1] || m[2] || '') : '';
+  }
+  if (!/^[\w-]{11}$/.test(vid)) return;
+  const last = _prefetched.get(vid) || 0;
+  if (Date.now() - last < 300000) return;
+  _prefetched.set(vid, Date.now());
+  api('/api/watch/' + vid).catch(() => {});            // メタ＋直結判定（SWRキャッシュ入り）
+  fetch('/api/warm/' + vid).catch(() => {});           // 先頭 768KB をサーバーRAMへ保温
+}, 120), { passive: true });
+document.addEventListener('touchstart', (e) => { // モバイルはホバーが無いのでタッチ即先読み
+  const card = e.target.closest?.('[data-vid],[data-href]');
+  if (!card) return;
+  const vid = card.dataset.vid || '';
+  if (!/^[\w-]{11}$/.test(vid)) return;
+  api('/api/watch/' + vid).catch(() => {});
+  fetch('/api/warm/' + vid).catch(() => {});
+}, { passive: true });
+
+/* skeleton screens */
+function skGrid(n = 12, rail = false) {
+  let s = '';
+  for (let i = 0; i < n; i++) {
+    s += `<div>
+      <div class="sk sk-thumb"></div>
+      <div class="sk-row" style="margin-top:12px"><div class="sk sk-ava"></div>
+      <div style="flex:1"><div class="sk sk-line"></div><div class="sk sk-line w60"></div></div></div>
+    </div>`;
+  }
+  return `<div class="grid">${s}</div>`;
+}
+
+function errBox(msg, retryFn) {
+  app.innerHTML = `<div class="error-box">
+    <p style="font-size:44px;margin-bottom:8px">:(</p>
+    <p>${esc(msg)}</p>
+    <button class="retry" id="err-retry">再試行</button>
+  </div>`;
+  $('#err-retry')?.addEventListener('click', retryFn);
+}
+
+/** YouTube logged-out style nudge */
+function nudgeHtml(title, body, icon = ICON_SEARCH) {
+  return `
+  <div class="nudge">
+    <div class="nudge-card">
+      <div class="nudge-icon">${icon}</div>
+      <h1>${esc(title)}</h1>
+      <p>${esc(body)}</p>
+    </div>
+  </div>`;
+}

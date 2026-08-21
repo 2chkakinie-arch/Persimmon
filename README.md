@@ -43,10 +43,22 @@ Made by Kakinie with llytpr-wl.v01nh TEAM. V1
 
 | ファイル | 用途 |
 |---|---|
-| `public/logo.svg` | ヘッダーのロックアップ（マーク + Vandal ワードマーク） |
-| `public/logo-mark.svg` | ファビコン・設定ページのマーク単体 |
+| `public/logo.png` | ヘッダーのロックアップ + ファビコン + 設定ページのマーク |
 
-SVG 推奨（任意サイズに対応）。PNG を使う場合は `public/index.html` 内の `<img src="/logo.svg">` と `<link rel="icon">` のパスを書き換えてください。
+透明 PNG 推奨（任意サイズに対応。透過余白は表示時に自動で詰められます）。パスを変える場合は `public/index.html` 内の `<img src="/logo.png">` と `<link rel="icon">` を書き換えてください。
+
+### 🗂️ ソース分散（V8）
+
+サーバー・クライアントのソースは読み取りにくくするため複数ファイルへ意図的に分散しています:
+
+| 場所 | 内容 |
+|---|---|
+| `server/parse.js` / `server/transport.js` / `server/caches.js` / `server/errors.js` | InnerTube エンジンの分割モジュール（`server/innertube.js` が束ねる） |
+| `server/routes/*.js` | ルーティングの分割モジュール（`server/routes.js` がファサード） |
+| `public/_src/js/*.part` + `js.manifest.json` | フロント SPA の部品群（`server/client-bundle.js` が連結して `/app.js` として配信） |
+| `public/_src/css/*.part` + `css.manifest.json` | スタイルの部品群（同じく `/styles.css` として配信） |
+
+配信は従来どおり **1 リクエスト**（サーバー起動時に連結済みのバンドルをキャッシュ）。読み込み速度は変わりません。マニフェストが無い場合は部品を辞書順に連結するフォールバックが働きます。
 
 ## 実行
 
