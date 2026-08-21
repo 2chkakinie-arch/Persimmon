@@ -44,6 +44,22 @@ function linkify(text) {
 const Store = {
   get(k, def) { try { const v = JSON.parse(localStorage.getItem('llytpr:' + k)); return v ?? def; } catch (_) { return def; } },
   set(k, v) { try { localStorage.setItem('llytpr:' + k, JSON.stringify(v)); } catch (_) { /* private mode */ } },
+  del(k) { try { localStorage.removeItem('llytpr:' + k); } catch (_) { /* private mode */ } },
+};
+/** 期限付きローカル保存（直結学習など鮮度が命の情報用）。
+ *  かつて directOk / directBlocked が無期限の localStorage フラグだったため、
+ *  「一時的な直結失敗が永遠に残り、直結できる動画がプロキシされ続ける」
+ *  バグが発生していた。期限切れ自動失効で構造的に再発防止する。 */
+const DIRECT_OK_TTL = 24 * 3600e3;     // 「この回線は直結OK」学習の有効期限
+const DIRECT_BLOCK_TTL = 10 * 60e3;    // 「直結不安定」判定の有効期限（10分で再挑戦）
+Store.setExp = (k, v, ttl) => Store.set('exp:' + k, { v, e: Date.now() + ttl });
+Store.getExp = (k, def) => {
+  const r = Store.get('exp:' + k, null);
+  if (r && typeof r === 'object' && typeof r.e === 'number') {
+    if (r.e > Date.now()) return r.v;
+    Store.del('exp:' + k); // 期限切れは即掃除
+  }
+  return def;
 };
 
 /** watch history: [{v,t,cn,ch,d,ts}] newest-first, unique per video */
@@ -409,7 +425,9 @@ document.addEventListener('mouseover', debounce((e) => {
   if (!card) return;
   let vid = card.dataset.vid || '';
   if (!/^[\w-]{11}$/.test(vid)) {
-    const m = String(card.dataset.href || '').match(/[?&/]v[=/]([\w-]{11})|\/shorts\/([\w-]{11})/);
+    // 修正: 旧パターンは "?v=" 形式（プレイリスト行など）に一致せず先読みが
+    // 働いていなかった。?v= / /shorts/ の両形式を確実に捕まえる。
+    const m = String(card.dataset.href || '').match(/[?&]v=([\w-]{11})|\/shorts\/([\w-]{11})/);
     vid = m ? (m[1] || m[2] || '') : '';
   }
   if (!/^[\w-]{11}$/.test(vid)) return;
@@ -948,7 +966,9 @@ class PlayerUI {
     this.el.settings.addEventListener('click', (e) => { e.stopPropagation(); this.toggleMenu(); });
     this.wrap.addEventListener('dblclick', (e) => { if (!e.target.closest('.qmenu')) this.toggleFs(); });
     v.addEventListener('click', () => this.togglePlay());
-    document.addEventListener('keydown', (e) => {
+    // 修正: document レベルのキーハンドラは destroy() で必ず外す
+    // （動画を渡り歩くたびにハンドラが累積し、ショートカットが多重発火していた）
+    this._key = (e) => {
       if (!document.body.contains(this.wrap)) return;
       if (/INPUT|TEXTAREA/.test(document.activeElement?.tagName || '')) return;
       if (e.key === 'k' || (e.key === ' ' && document.fullscreenElement === this.wrap)) { e.preventDefault(); this.togglePlay(); }
@@ -956,7 +976,8 @@ class PlayerUI {
       if (e.key === 'm') v.muted = !v.muted;
       if (e.key === 'ArrowRight') v.currentTime += 5;
       if (e.key === 'ArrowLeft') v.currentTime -= 5;
-    });
+    };
+    document.addEventListener('keydown', this._key);
   }
   togglePlay() { const v = this.video; v.paused ? v.play().catch(() => {}) : v.pause(); }
   toggleFs() {
@@ -983,7 +1004,10 @@ class PlayerUI {
       q.classList.add('hidden');
     }));
   }
-  destroy() {}
+  destroy() {
+    if (this._key) { document.removeEventListener('keydown', this._key); this._key = null; }
+    clearTimeout(this._ft);
+  }
 }
 
 /* --------------------------------- watch page -------------------------------- */
@@ -1051,6 +1075,7 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
     destroyed = true;
     try { dash?.destroy(); } catch (_) {}
     try { hlsInst?.destroy(); } catch (_) {}
+    try { ui?.destroy(); } catch (_) {}
     killPair();
     try { video.pause(); video.removeAttribute('src'); video.load(); } catch (_) {}
   }
@@ -1098,6 +1123,11 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
         fillMeta(d);
         loadComments(d);
         fillRail(d);
+        // 高速化: 関連動画の先頭2本のメタを先読み（視聴完了→次動画の初速短縮）。
+        // ホバー先読みと同じ /api/watch なのでサーバー側 90 秒キャッシュに乗る。
+        for (const r of (d.related || []).filter(i => i?.kind === 'video' && i.id).slice(0, 2)) {
+          if (/^[\w-]{11}$/.test(r.id)) api('/api/watch/' + r.id, { ttl: 2 * 60e3 }).catch(() => {});
+        }
         if (listId) {
           if (!panelStarted) { panelStarted = true; setupPlaylistPanel(listId, id, d.panel, PlCtx.load(listId)); }
           else if (d.panel?.items?.length) updatePlaylistPanel(d.panel);
@@ -1121,7 +1151,15 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
   function unplayableBox(msg, sub) {
     rescueVeil(0);
     wrapEl.innerHTML = `<div class="unplayable"><div>${esc(msg)}<br><span style="opacity:.6;font-size:12px">${esc(sub || '')}</span><br><button class="retry" id="un-retry" style="margin-top:14px;background:#fff;color:#000;border-radius:18px;padding:0 20px;height:36px;font-size:13px">もう一度試す</button></div></div>`;
-    $('#un-retry')?.addEventListener('click', () => { location.hash = '#/watch?refresh=1&v=' + id; renderWatch(new URLSearchParams('v=' + id), { vertical, shortId }); });
+    // 修正: 旧実装は location.hash 変更（hashchange→render）と手動 renderWatch の
+    // 両方を起こし、watch ページが二重に初期化されていた。router 経由で
+    // 旧ページを必ず destroy してから再構築する（同値 hash は手動 render）。
+    $('#un-retry')?.addEventListener('click', () => {
+      rescues = 0;
+      api.invalidate('/api/watch/' + id);
+      const target = vertical ? '/shorts/' + id : ('/watch?v=' + id + (listId ? '&list=' + encodeURIComponent(listId) : ''));
+      if (location.hash === '#' + target) render(); else location.hash = target;
+    });
   }
 
   /** full rebuild when every playback route fails (rotates proxies server-side) */
@@ -1166,12 +1204,20 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
     const canDash = !!(audTrack && autoTrack && DashLite.isSupported(autoTrack, audTrack));
     let activeTrack = null;
 
-    // llytpr++ 直結: サーバーが Range 実測で「生URLが通る」と判定した動画は
-    // 既定の自動画質からプロキシを一切介さず googlevideo 直再生にする。
-    // ※ directBlocked はセッション中に変化するため、判定は必ず都度評価する
-    const directReady0 = !!(streams.playDirect && direct?.url && !Store.get('directBlocked', false));
-    const canDirect = () => !!((streams.playDirect || Store.get('directOk', false)) && direct?.url && !Store.get('directBlocked', false));
-    const canHdRaw = () => !!(canDirect() && streams.hdDirect && streams.directUrls);
+    // llytpr++ 直結: 生 URL がある限り常に「影武者プローブ」で直結を試す。
+    // 従来はサーバー側実測 (streams.playDirect) が true の時しか試さず、
+    // 「サーバー egress は 403 でも ユーザー網からは直接再生できる」動画が
+    // 無条件にプロキシされ続けるバグがあった。影武者はリレー再生を一切妨げない
+    // ため、判定は毎動画クライアント実機で行うのが最善。サーバー実測値と
+    // directOk 学習は HD 直結の信頼度ボーナス（＝高速に開始できる保証）として使う。
+    // ※ directOk / directBlocked は TTL 付き学習に変更（一時不調の永久化を防止）。
+    const dBlocked = () => Store.getExp('directBlocked', false);
+    const dOk = () => Store.getExp('directOk', false);
+    const directReady0 = !!(direct?.url && !dBlocked() && (streams.playDirect || dOk()));
+    const canDirect = () => !!(direct?.url && !dBlocked());
+    const canHdRaw = () => !!(canDirect() && streams.directUrls && (streams.hdDirect || dOk()));
+    const markDirectOn = () => { Store.del('exp:directBlocked'); Store.setExp('directOk', true, DIRECT_OK_TTL); };
+    const markDirectOff = () => { Store.setExp('directBlocked', true, DIRECT_BLOCK_TTL); Store.del('exp:directOk'); };
     const qualities = [
       { key: 'auto', label: directReady0 ? ('自動 (' + (direct?.height || 360) + 'p・直結最速)') : '自動 (360p・最速)' },
       ...((canDash || (autoTrack && audTrack)) ? [{ key: 'hdauto', label: '自動HD (' + (autoTrack?.qualityLabel || '720p') + ')' }] : []),
@@ -1316,10 +1362,10 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
           if (raw) {
             const t0p = video.currentTime;
             setTimeout(() => {
-              if (destroyed || !pair || Store.get('directBlocked', false)) return;
+              if (destroyed || !pair || dBlocked()) return;
               if (video.paused || video.seeking) return;
               if (video.currentTime - t0p < 0.15 && video.readyState < 3) {
-                Store.set('directBlocked', true);
+                Store.setExp('directBlocked', true, DIRECT_BLOCK_TTL);
                 toast('直結HDが不安定なため切り替えます');
                 killPair();
                 (async () => {
@@ -1352,7 +1398,7 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
      */
     function tryDirect(d, resumeAt) {
       if (!d?.url) return Promise.resolve(false);
-      if (Store.get('directBlocked', false)) return Promise.resolve(false);
+      if (dBlocked()) return Promise.resolve(false);
       const shadowOk = instantAttached && !video.error;
       if (shadowOk) return new Promise((resolve) => {
         const probe = document.createElement('video');
@@ -1379,9 +1425,9 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
           settled = true;
           clearTimeout(timer);
           if (ok) {
-            Store.set('directBlocked', false);
-            Store.set('directOk', true);
+            markDirectOn(); // 学習: この回線は生 URL 再生可能（24h キャッシュ）
             mode = 'auto'; // 「自動」のまま = 直結が既定動作
+            if (qualities[0]) qualities[0].label = '自動 (' + (d.height || 360) + 'p・直結最速)';
             const carry = Math.max(probe.currentTime, video.currentTime || 0, resumeAt || 0);
             cleanup();
             video.src = d.url;
@@ -1415,18 +1461,18 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
           video.removeEventListener('playing', onPlay);
           suppressErrorHook = false;
           if (ok) {
-            Store.set('directBlocked', false);
-            Store.set('directOk', true);   // learned: this network can play raw urls
-            mode = 'auto';                 // 「自動」画質のまま = 直結が既定動作
+            markDirectOn();                            // learned: this network can play raw urls
+            if (qualities[0]) qualities[0].label = '自動 (' + (d.height || 360) + 'p・直結最速)';
+            mode = 'auto';                             // 「自動」画質のまま = 直結が既定動作
             // post-success stall watchdog: 「playing は出たが秒数が進まない」
             // （発信元 IP レピュテーション等で途中 stall）を検知してリレーへ強制復帰
             const t0 = video.currentTime;
             setTimeout(() => {
-              if (destroyed || dash || pair || Store.get('directBlocked', false)) return;
+              if (destroyed || dash || pair || dBlocked()) return;
               if (mode !== 'auto') return;
               if (video.paused || video.seeking || video.ended) return;
               if (video.currentTime - t0 < 0.15 && video.readyState < 3) {
-                Store.set('directBlocked', true);
+                Store.setExp('directBlocked', true, DIRECT_BLOCK_TTL);
                 toast('直結が不安定なためリレーに切り替えます');
                 startProg(bestProg, video.currentTime || resumeAt || 0);
               }
@@ -1434,8 +1480,8 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
             armProgressWatchdog('direct', resumeAt);
             resolve(true);
           } else {
-            // 直結不可（ユーザ網が googlevideo を遮断等）: このセッションはリレー固定
-            Store.set('directBlocked', true); Store.set('directOk', false);
+            // 直結不可（ユーザ網が googlevideo を遮断等）: しばらく（10分）リレー固定
+            markDirectOff();
             try { video.pause(); video.removeAttribute('src'); video.load(); } catch (_) {}
             resolve(false);
           }
@@ -1482,16 +1528,25 @@ function renderWatch(params, { vertical = false, shortId = null } = {}) {
     }
 
     /** 進行watchdog: src 装着後に再生が一向に進まない（経路 stall）場合の
-     *  最終安全網。直結/リレーを問わず、URL 再生成→再挑戦する。 */
+     *  最終安全網。直結はリレーへ即無段階復帰、リレーは URL 再生成→再挑戦する。 */
     function armProgressWatchdog(tag, resumeAt) {
       const t0 = video.currentTime;
       setTimeout(() => {
         if (destroyed || dash || pair) return;
         if (video.paused || video.seeking || video.ended) return;
         if (video.currentTime - t0 >= 0.15 || video.readyState >= 3) return; // 健康
+        if (tag === 'direct') {
+          // 直結スワップ後に止まった: ページ全体を再構築せずリレーへ即復帰
+          // （従来は fatalRescue で全面リロードしており、再生できる状態まで
+          // 画面を落としてしまう過剰反応だった）
+          console.warn('[llytpr++] direct stall detected — reverting to relay');
+          Store.setExp('directBlocked', true, DIRECT_BLOCK_TTL);
+          toast('直結が不安定なためリレーに切り替えます');
+          startProg(bestProg, Math.max(video.currentTime, resumeAt || 0));
+          return;
+        }
         if (rescues < 3) {
           console.warn('[llytpr++] stall detected (' + tag + ') — rescuing');
-          Store.set('directBlocked', true);
           fatalRescue(true);
         } else {
           unplayableBox('ストリームに接続できませんでした', 'ネットワークが googlevideo への接続を制限している可能性があります');

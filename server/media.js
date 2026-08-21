@@ -46,16 +46,33 @@ class HotChunks {
 
   /** Serve-from-memory if possible. Returns true when the response was fully handled. */
   serveIfHot(v, itag, req, res) {
-    // only Range requests are safely answerable with a partial prefix —
-    // a plain full-file GET must go upstream so the client gets everything.
     const m = /^bytes=(\d+)-(\d*)$/.exec(String(req.headers.range || ''));
-    if (!m) return false;
+    const k = this._key(v, itag);
+    const entry = this.map.get(k);
+    const fresh = entry && entry.exp >= Date.now() ? entry : null;
+    if (!fresh) { if (entry) this.map.delete(k); return false; }
+    // 高速化: ファイル全体が RAM に載っている（ショート等の小動画）場合は
+    // Range 無しのフル GET も含めて上流へ渡さず即完了させる
+    // （Content-Length が正確に載るのでプログレッシブ再生も正しく終端判定できる）
+    if (!m) {
+      if (!fresh.full) return false;
+      this.map.delete(k); this.map.set(k, fresh); // recency
+      res.writeHead(200, {
+        'Content-Type': 'video/mp4',
+        'Content-Length': fresh.buf.length,
+        'Accept-Ranges': 'bytes',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=3600',
+        'X-Hot-Cache': 'FULL',
+      });
+      res.end(fresh.buf);
+      return true;
+    }
     const start = Number(m[1]);
     if (m[2]) {
       // explicit end (MSE segment math!): only serving a FULLY covered range
       // is safe — a truncated segment would corrupt the append pipeline.
-      const entry = this.map.get(this._key(v, itag));
-      if (!entry || entry.exp < Date.now() || Number(m[2]) > entry.buf.length - 1) return false;
+      if (Number(m[2]) > fresh.buf.length - 1) return false;
     }
     const end = m[2] ? Number(m[2]) : null;
     const buf = this.get(v, itag, start, end);
@@ -63,7 +80,7 @@ class HotChunks {
     res.writeHead(206, {
       'Content-Type': 'video/mp4',
       'Content-Length': buf.length,
-      'Content-Range': `bytes ${start}-${start + buf.length - 1}/*`,
+      'Content-Range': `bytes ${start}-${start + buf.length - 1}/${fresh.full ? fresh.buf.length : '*'}`,
       'Accept-Ranges': 'bytes',
       'Access-Control-Allow-Origin': '*',
       'Cache-Control': 'public, max-age=3600',
@@ -100,6 +117,10 @@ class HotChunks {
           headersTimeout: 12000,
         });
         if (up.statusCode >= 400) { up.body.dump().catch(() => {}); return; }
+        // Content-Range から総ファイルサイズを読む（"bytes 0-786431/1234567"）
+        const crHeader = String(up.headers['content-range'] || '');
+        const totalMatch = /^bytes \d+-\d+\/(\d+)$/.exec(crHeader);
+        const total = totalMatch ? Number(totalMatch[1]) : 0;
         const chunks = [];
         for await (const c of up.body) {
           chunks.push(c);
@@ -109,7 +130,9 @@ class HotChunks {
         ac.abort(); // we took what we need
         const buf = Buffer.concat(chunks).subarray(0, WARM_BYTES);
         if (buf.length >= 64 * 1024) {
-          this.map.set(key, { buf, exp: Date.now() + TTL });
+          // full=true: ファイル全体（終端まで）が RAM に載っている状態。
+          // ショート動画など小さいファイルはこれで完全サーブ＝上流往復ゼロ。
+          this.map.set(key, { buf, exp: Date.now() + TTL, full: total > 0 && total <= buf.length });
           while (this.map.size > MAX_ENTRIES) this.map.delete(this.map.keys().next().value);
         }
       } catch (_) {

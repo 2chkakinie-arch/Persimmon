@@ -321,14 +321,32 @@ async function getHls(videoId) {
 
 /* ------------------------------------------------------------- visitor data */
 
+let _vdJob = null; // 同時多発の visitor 取得を 1 本に束ねる
 async function getVisitorId() {
   let vd = caches.visitor.get('vd');
   if (vd) return vd;
-  try {
-    const res = await callApi('search', { query: 'youtube' }, CLIENTS.WEB);
-    vd = decodeURIComponent(res?.responseContext?.visitorData || '');
-    if (vd) caches.visitor.set('vd', vd, 20 * CACHE_MIN);
-  } catch (_) { /* stays undefined; most endpoints work without */ }
+  if (_vdJob) return _vdJob;
+  _vdJob = (async () => {
+    try {
+      const res = await callApi('search', { query: 'youtube' }, CLIENTS.WEB);
+      const v = decodeURIComponent(res?.responseContext?.visitorData || '');
+      if (v) caches.visitor.set('vd', v, 20 * CACHE_MIN);
+    } catch (_) { /* stays undefined; most endpoints work without */ }
+    finally { _vdJob = null; }
+  })();
+  return _vdJob;
+}
+
+/**
+ * 高速化: visitorData が無い場合も現在のリクエストを待たせない。
+ * かつては await getVisitorId()（最大1 RTT = プロキシ経由で数百ms〜数秒）が
+ * 検索/視聴/コメント等の初回リクエスト前に直列に挟まっていた。
+ * 大半のエンドポイントは visitorId 無しで動作するため、初回は即座に発行し、
+ * visitor 取得は並行で回して次回リクエストから使えばよい。
+ */
+function getVisitorIdFast() {
+  const vd = caches.visitor.get('vd');
+  if (!vd) getVisitorId().catch(() => {});
   return vd || undefined;
 }
 
@@ -636,7 +654,7 @@ function extractItems(root) {
 async function search(query, { sp, hl = 'ja', gl = 'JP' } = {}) {
   const key = `s:${query}:${sp || ''}:${hl}${gl}`;
   return caches.api.wrap(key, 10 * CACHE_MIN, async () => {
-    const visitorId = await getVisitorId();
+    const visitorId = getVisitorIdFast(); // 高速化: 未取得なら並行取得し、今回のリクエストは待たせない
     const payload = { query };
     if (sp) payload.params = sp;
     let lastSearchError = null;
@@ -675,7 +693,7 @@ async function search(query, { sp, hl = 'ja', gl = 'JP' } = {}) {
 
 async function searchNext(continuation) {
   return caches.api.wrap('sn:' + continuation, 10 * CACHE_MIN, async () => {
-    const visitorId = await getVisitorId();
+    const visitorId = getVisitorIdFast(); // 高速化: 未取得なら並行取得し、今回のリクエストは待たせない
     const res = await callApi('search', { continuation }, CLIENTS.WEB, { visitorId });
     const roots = res?.onResponseReceivedCommands || res?.onResponseReceivedEndpoints || [];
     const items = [];
@@ -731,7 +749,7 @@ function parsePrimaryInfo(c) {
 async function watchNext(videoId, { hl = 'ja', gl = 'JP', playlistId } = {}) {
   const cacheKey = 'w:' + videoId + hl + gl + (playlistId ? ':' + playlistId : '');
   return caches.api.wrap(cacheKey, 10 * CACHE_MIN, async () => {
-    const visitorId = await getVisitorId();
+    const visitorId = getVisitorIdFast(); // 高速化: 未取得なら並行取得し、今回のリクエストは待たせない
     const payload = { videoId, contentCheckOk: true, racyCheckOk: true };
     if (playlistId) payload.playlistId = playlistId;
     const res = await callApi('next', payload, CLIENTS.WEB, { visitorId });
@@ -792,7 +810,7 @@ async function watchNext(videoId, { hl = 'ja', gl = 'JP', playlistId } = {}) {
 async function panelNext(continuation) {
   // キーは全文（末尾24文字はトークン中盤の共通パディングで衝突し得る）
   return caches.api.wrap('pn:' + continuation, 10 * CACHE_MIN, async () => {
-    const visitorId = await getVisitorId();
+    const visitorId = getVisitorIdFast(); // 高速化: 未取得なら並行取得し、今回のリクエストは待たせない
     const res = await callApi('next', { continuation }, CLIENTS.WEB, { visitorId });
     const eps = res?.onResponseReceivedEndpoints || res?.onResponseReceivedCommands || [];
     let items = [], cont = null;
@@ -1157,48 +1175,28 @@ async function getVideoFullUncached(videoId, opts = {}) {
     }
   }
 
-  // ---- llytpr++ 直結判定: 生 URL を Range 実測し、ブラウザ直再生の可否を検証。
-  // 「発信元 egress では 403 / 別 egress では 206」（ノード別 IP レピュテーション）が
-  // 実在するため、自 egress とトンネル可能プロキシを並列で試し、どこか一箇所でも
-  // 通れば ip 強制なし = ユーザのブラウザからも直結できると判定する。
-  // 同時にリレー用ピンも実働 egress へ自動修復する（結果は 55 分メモ化）。
-  // 判定（pd）とリレー修復（pin）は並行実行して初回ウォッチの遅延を最小化する。
+  // ---- llytpr++ 直結判定は応答を待たせない（初速高速化の要）:
+  // かつては Range 実測（プロキシ経由で最大 9 秒）とピン修復の完了を await して
+  // から watch 応答を返しており、コールド視聴が最悪数秒遅かった。
+  // 新方式:
+  //   (1) キャッシュ済み判定 (pd) だけを同期的に載せる
+  //   (2) 未検証なら実測をすべてバックグラウンドで続行し、次回リクエスト以降に反映
+  //   (3) 生 URL (directUrls) は常時クライアントへ渡し、可否はフロントの
+  //       「影武者プローブ」がユーザー網で実測する（リレーを妨げないので失敗も無害）
+  // これにより「サーバー側 egress は 403 でもユーザー網から直結できる」動画が
+  // プロキシされ続けるバグも同時に根治される。
   let pd = pdGet(videoId);
-  const pinJob = (async () => {
-    if (p?.__urlMap && !mapEntry?.pinnedVerified) {
-      try { return await ensureWorkingPin(videoId); } catch (_) { /* best effort */ }
-    }
-    return mapEntry;
-  })();
   if (p && !pd) {
     if (p.__piped) {
       pd = { playDirect: true, hdDirect: true }; // Piped プロキシURLは IP 非バインド（実測済み）
+      pdSet(videoId, pd, 55 * CACHE_MIN);
     } else if (p.__urlMap) {
-      const dualProbe = async (url) => {
-        if (!url) return false;
-        const tps = await getTunnelProxies(2);
-        const jobs = [
-          probePlayable(url, { timeout: 6000 }),                                            // 自 egress
-          ...tps.map(px => probePlayable(url, { dispatcher: proxyManager.dispatcherFor(px), timeout: 9000 })),
-        ];
-        const rs = await Promise.all(jobs);
-        return rs.some(Boolean);
-      };
-      const progItag = p.progressive?.[0]?.itag ?? (p.__urlMap[18] ? 18 : Number(Object.keys(p.__urlMap)[0]));
-      const vidTrack = p.videos.find(v => (v.height || 0) <= 720 && (v.fps || 30) <= 60) || p.videos[0];
-      const audTrack = p.audios[0];
-      const [progOk, vOk, aOk] = await Promise.all([
-        dualProbe(p.__urlMap[progItag]),
-        dualProbe(p.__urlMap[vidTrack?.itag]),
-        dualProbe(p.__urlMap[audTrack?.itag]),
-      ]);
-      pd = { playDirect: progOk, hdDirect: !!(vOk && aOk) };
-    } else {
-      pd = { playDirect: false, hdDirect: false };
+      probeDirectness(videoId, p).catch(() => {});  // 裏で実測 → pd キャッシュへ反映
+      if (!mapEntry?.pinnedVerified) {
+        ensureWorkingPin(videoId).catch(() => {});  // 裏でリレー用ピンを修復
+      }
     }
-    pdSet(videoId, pd, 55 * CACHE_MIN);
   }
-  mapEntry = await pinJob;
   const direct = pickDirect(p);
   if (direct) {
     direct.verified = !!pd?.playDirect;
@@ -1230,11 +1228,12 @@ async function getVideoFullUncached(videoId, opts = {}) {
       hls: p.hls,
       direct,
       source: p.source || 'innertube',
-      // llytpr++ 直結エンジン: 実測で 206 が返った生 URL 一式（プロキシ不要で
-      // ブラウザがそのまま再生できる）。MSE は CORS の都合で従来どおりリレー。
-      playDirect: !!pd?.playDirect,
-      hdDirect: !!pd?.hdDirect,
-      directUrls: (pd?.playDirect || pd?.hdDirect) ? p.__urlMap : undefined,
+      // llytpr++ 直結エンジン: 生 URL は常時一式返す（可否はクライアントの影武者
+      // プローブ＋サーバー裏実測の両輪で判定）。MSE は CORS の都合で従来どおりリレー。
+      // playDirect/hdDirect は true（実測済）/false（実測失敗）/null（未検証）。
+      playDirect: pd ? !!pd.playDirect : null,
+      hdDirect: pd ? !!pd.hdDirect : null,
+      directUrls: p.__urlMap,
     } : null,
     playable: !!p && (p.progressive.length > 0 || p.videos.length > 0 || !!p.hls),
     playability: p ? null : { status: pl.reason?.statusHint || 'ERROR', reason: pl.reason?.reason || pl.reason?.message || 'この動画は再生できません' },
@@ -1278,6 +1277,46 @@ function buildMapEntry(p) {
     ttlMs: Math.min(5 * 3600 * 1000, Math.max(300 * 1000, ((p.expiresInSeconds || 21600) - 300) * 1000)),
     pinnedVerified: false,
   };
+}
+
+/**
+ * probeDirectness — 生 URL の直結可否を実測し pd キャッシュへ反映する
+ * （getVideoFull の応答は待たない: 呼び出し側は fire-and-forget で使う）。
+ * 「発信元 egress では 403 / 別 egress では 206」（ノード別 IP レピュテーション）が
+ * 実在するため、自 egress とトンネル可能プロキシを並列で試し、どこか一箇所でも
+ * 通れば ip 強制なし = ユーザのブラウザからも直結できると判定する。
+ * 結果（pd）は 55 分メモ化され、次回の watch 応答と HD 直結判定に使われる。
+ * 実行中の重複実行は 1 本に束ねる（ホバー先読み＋視聴＋warm が同時に走り得るため）。
+ */
+const _pdPending = new Map();
+function probeDirectness(videoId, p) {
+  const running = _pdPending.get(videoId);
+  if (running) return running;
+  const job = (async () => {
+    const dualProbe = async (url) => {
+      if (!url) return false;
+      const tps = await getTunnelProxies(2);
+      const jobs = [
+        probePlayable(url, { timeout: 6000 }), // 自 egress
+        ...tps.map(px => probePlayable(url, { dispatcher: proxyManager.dispatcherFor(px), timeout: 9000 })), // トンネル egress
+      ];
+      const rs = await Promise.all(jobs);
+      return rs.some(Boolean);
+    };
+    const progItag = p.progressive?.[0]?.itag ?? (p.__urlMap[18] ? 18 : Number(Object.keys(p.__urlMap)[0]));
+    const vidTrack = p.videos.find(v => (v.height || 0) <= 720 && (v.fps || 30) <= 60) || p.videos[0];
+    const audTrack = p.audios[0];
+    const [progOk, vOk, aOk] = await Promise.all([
+      dualProbe(p.__urlMap[progItag]),
+      dualProbe(p.__urlMap[vidTrack?.itag]),
+      dualProbe(p.__urlMap[audTrack?.itag]),
+    ]);
+    const pd = { playDirect: progOk, hdDirect: !!(vOk && aOk) };
+    pdSet(videoId, pd, 55 * CACHE_MIN);
+    return pd;
+  })().finally(() => { _pdPending.delete(videoId); });
+  _pdPending.set(videoId, job);
+  return job;
 }
 
 /**
@@ -1329,13 +1368,23 @@ async function getStreamUrl(videoId, itag, { verify = false } = {}) {
   return { url: entry.map?.[itag] || entry.map?.[18] || Object.values(entry.map || {})[0] || null, proxyUrl: entry.proxyUrl, source: entry.source };
 }
 
-async function refreshStreamMap(videoId) {
-  streamInvalidate(videoId);
-  caches.api.deletePrefix('vf:' + videoId); // 古い URL を抱えたフル応答も破棄
-  const p = await player(videoId);
-  const entry = buildMapEntry(p);
-  streamMapSet(videoId, entry);
-  return entry;
+/** 同一動画への同時 refresh を 1 本に束ねる。かつては rescue が連打されると
+ * そのたびに player() （最大数十秒・全クライアント×全トランスポート）が
+ * 並行して走り、無料プロキシを押し潰してさらに失敗する悪循環になっていた。 */
+const _mapPending = new Map();
+function refreshStreamMap(videoId) {
+  const inflight = _mapPending.get(videoId);
+  if (inflight) return inflight;
+  const job = (async () => {
+    streamInvalidate(videoId);
+    caches.api.deletePrefix('vf:' + videoId); // 古い URL を抱えたフル応答も破棄
+    const p = await player(videoId);
+    const entry = buildMapEntry(p);
+    streamMapSet(videoId, entry);
+    return entry;
+  })().finally(() => { _mapPending.delete(videoId); });
+  _mapPending.set(videoId, job);
+  return job;
 }
 
 /** Hard invalidation for the client-side "rescue" flow. */
@@ -1437,7 +1486,7 @@ function parseCommentPage(res) {
 
 async function comments(videoId) {
   return caches.api.wrap('c0:' + videoId, 5 * CACHE_MIN, async () => {
-    const visitorId = await getVisitorId();
+    const visitorId = getVisitorIdFast(); // 高速化: 未取得なら並行取得し、今回のリクエストは待たせない
     const res = await callApi('next', { videoId, contentCheckOk: true }, CLIENTS.WEB, { visitorId });
     const panels = res?.engagementPanels || [];
     let token = null;
@@ -1458,7 +1507,7 @@ async function comments(videoId) {
 
 async function commentsNext(continuation) {
   return caches.api.wrap('cx:' + continuation, 5 * CACHE_MIN, async () => {
-    const visitorId = await getVisitorId();
+    const visitorId = getVisitorIdFast(); // 高速化: 未取得なら並行取得し、今回のリクエストは待たせない
     const res = await callApi('next', { continuation }, CLIENTS.WEB, { visitorId });
     return parseCommentPage(res);
   });
@@ -1511,7 +1560,7 @@ function parseChannelTabs(res) {
 
 async function channel(idOrHandle, { params, continuation, hl = 'ja', gl = 'JP' } = {}) {
   const browseId = await resolveChannelId(idOrHandle);
-  const visitorId = await getVisitorId();
+  const visitorId = getVisitorIdFast(); // 高速化: 未取得なら並行取得し、今回のリクエストは待たせない
   const payload = { browseId };
   if (params) payload.params = params;
   if (continuation) {
@@ -1589,7 +1638,7 @@ async function playlist(listId) {
   if (/^VL(?=RD|OLAK5uy)/.test(raw)) raw = raw.slice(2);
   const mixLike = /^(RD|OLAK5uy)/.test(raw);
   return caches.api.wrap('pl:' + raw, 10 * CACHE_MIN, async () => {
-  const visitorId = await getVisitorId();
+  const visitorId = getVisitorIdFast(); // 高速化: 未取得なら並行取得し、今回のリクエストは待たせない
 
   // ミックス/自動生成リストは browse 系では空 or 例外 → 初めから next 系へ振り分け
   const buildFromNext = async () => {
@@ -1650,7 +1699,7 @@ async function playlist(listId) {
 
 async function playlistNext(continuation) {
   return caches.api.wrap('pln:' + continuation, 10 * CACHE_MIN, async () => {
-  const visitorId = await getVisitorId();
+  const visitorId = getVisitorIdFast(); // 高速化: 未取得なら並行取得し、今回のリクエストは待たせない
   const res = await callApi('browse', { continuation }, CLIENTS.WEB, { visitorId });
   const eps = res?.onResponseReceivedEndpoints || [];
   let items = [], cont = null;
