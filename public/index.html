@@ -11,13 +11,9 @@
 <link rel="preconnect" href="https://yt3.ggpht.com" crossorigin>
 <link rel="dns-prefetch" href="https://yt3.ggpht.com">
 <title>Vandal</title>
-<!-- ロゴ差し替え: public/logo.svg（ロックアップ）と public/logo-mark.svg（マーク単体）
-     を同じファイル名で上書きするだけで、ヘッダー・ファビコン・設定ページがすべて変わります -->
-<link rel="icon" href="/logo-mark.svg" type="image/svg+xml">
+<link rel="icon" href="/logo.png" type="image/png">
 <link rel="stylesheet" href="/styles.css">
 <script>
-/* テーマの初期適用（チラつき防止のため CSS より前のインラインで実行）
-   既定値は OS のダークモード設定に追従（保存があればそれを優先） */
 (function () {
   try {
     var saved = localStorage.getItem('llytpr-theme');
@@ -33,9 +29,8 @@
     <button id="menu-btn" class="icon-btn" aria-label="メニュー（ナビゲーション）" title="ナビゲーション">
       <svg viewBox="0 0 24 24" class="ic"><path d="M3 5h18v2H3zm0 6h18v2H3zm0 6h18v2H3z"/></svg>
     </button>
-    <!-- ロゴ: /logo.svg を差し替えるだけで変更可能 -->
     <a class="logo" href="#/" aria-label="Vandal ホーム">
-      <img src="/logo.svg" alt="Vandal" class="logo-img">
+      <img src="/logo.png" alt="Vandal" class="logo-img">
     </a>
   </div>
   <div class="mh-center">
@@ -64,7 +59,6 @@
 </header>
 
 <div id="page">
-  <!-- ナビゲーションドロワー（既定は閉じた状態。menu-btn で開閉、状態は記憶） -->
   <nav id="mini-guide" aria-label="ナビゲーション">
     <div class="guide-scroll">
     <a class="guide-item" href="#/" data-nav="home">
@@ -100,7 +94,6 @@
   </main>
 </div>
 
-<!-- モバイル用ボトムナビ -->
 <nav id="bottom-nav" aria-label="モバイルナビゲーション">
   <a href="#/" data-nav="home"><svg viewBox="0 0 24 24" class="ic"><path d="M12 3l9 8h-3v9h-4v-6h-4v6H6v-9H3z"/></svg><span>ホーム</span></a>
   <a href="#/shorts" data-nav="shorts"><svg viewBox="0 0 24 24" class="ic"><path d="M10 15l5.2-3L10 9zM20.2 4.2a10 10 0 0 0-9.6.3A10 9 0 0 0 5 14 10 10 0 0 0 20.2 4.2zm-2.5 13A8.3 8.3 0 0 1 8.3 4.9a8.3 8.3 0 0 1 9.4 12.3z"/></svg><span>ショート</span></a>
