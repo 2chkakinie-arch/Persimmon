@@ -13,7 +13,10 @@ const express = require('express');
 const compression = require('compression');
 
 const { router } = require('./server/routes');
+const { router: diagRouter } = require('./server/diag');
 const { proxyManager } = require('./server/proxies');
+const it = require('./server/innertube');
+const { logbus } = require('./server/logbus');
 
 const app = express();
 app.disable('x-powered-by');
@@ -21,14 +24,20 @@ app.set('trust proxy', true);
 
 // gzip 圧縮（転送量 ~7割減）。動画中継・サムネ等のバイナリは除外する
 // （再圧縮できない上に CPU 消費と初バイト遅延だけが増えるため）。
+// 高速化: level 1 — JSON は level 6 と比べて圧縮率が ~5% 落ちるだけで
+// CPU 時間が 1/3 以下になり、多数の小さな API 応答の初バイトが速くなる。
+// /api/diag/logs (SSE) は圧縮するとバッファリングされてライブ性が死ぬため除外。
 app.use(compression({
+  level: 1,
   filter(req, res) {
+    if (req.path.startsWith('/api/diag/')) return false; // SSE・テストは生で流す
     if (/^\/api\/(stream|thumb)\b/.test(req.path)) return false; // 動画/画像リレーは生で流す
     return compression.filter(req, res);
   },
 }));
 
 // API
+app.use(diagRouter);
 app.use(router);
 
 // Static SPA assets
@@ -74,7 +83,14 @@ if (require.main === module) {
   app.listen(port, '0.0.0.0', () => {
     console.log(`[llytpr-wl.v01nh] listening on 0.0.0.0:${port}`);
     console.log('[llytpr-wl.v01nh] Made by Kakinie with llytpr-wl.v01nh TEAM. V1');
-    // warm the proxy pool in the background
+    // 高速化（初回待ち短縮）: 起動と同時に裏で3つ同時に暖機する —
+    //   1. プロキシプール（L1 スキャン → L2/L3 認定へ直行）
+    //   2. ホームフィード（最初の /api/home がいきなりキャッシュヒット）
+    //   3. visitorData（検索・watch の初回リクエストに同梱できる状態にする）
+    // ユーザーの最初のリクエストが来る頃には、重い初期化が全部終わっている。
     proxyManager.refresh().catch(() => {});
+    it.home('all').catch(() => {});
+    it.getVisitorId().catch(() => {});
+    logbus.info('engine', 'サーバー起動 — バックグラウンド暖機開始（プロキシ/ホーム/visitor）');
   });
 }

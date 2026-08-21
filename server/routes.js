@@ -8,6 +8,8 @@ const { request: undiciRequest } = require('undici');
 const { proxyManager } = require('./proxies');
 const { piped } = require('./piped');
 const { hotChunks } = require('./media');
+const { logbus } = require('./logbus');
+const { engineConfig } = require('./config');
 const it = require('./innertube');
 
 const router = express.Router();
@@ -19,6 +21,16 @@ async function warmDefault(v) {
     const { url, proxyUrl } = await it.getStreamUrl(v, 18);
     if (url) hotChunks.warm(v, 18, url, proxyUrl);
   } catch (_) { /* warm is best-effort */ }
+}
+
+/**
+ * 高速化: /api/watch 応答後にコメントを先行取得（prefetch）。
+ * ユーザーがコメント欄をスクロールで開く頃には 5 分キャッシュへ載っていて、
+ * /api/comments は一瞬で返る。設定 (commentsPrefetch) で ON/OFF 可能。
+ */
+function warmComments(v, token) {
+  if (!engineConfig.get('commentsPrefetch')) return;
+  it.comments(v, token || undefined).catch(() => {});
 }
 
 const wrap = (fn) => (req, res) => {
@@ -84,7 +96,10 @@ router.get('/api/stream', wrap(async (req, res) => {
   if (!rawRaw && !/^[\w-]{11}$/.test(v)) { res.status(400).json({ error: 'bad id' }); return; }
 
   // HOT PATH: pre-buffered first bytes -> answer straight from RAM
-  if (!rawRaw && hotChunks.serveIfHot(v, itag, req, res)) return;
+  if (!rawRaw && hotChunks.serveIfHot(v, itag, req, res)) {
+    logbus.trace('stream', 'RAM 即応答 (hot-cache HIT)', { v, itag, range: req.headers.range || null });
+    return;
+  }
 
   // 重複排除対象: 明示 Range かつ 8MB 以下のセグメント系リクエストのみ
   const rangeHdr = req.headers.range ? String(req.headers.range) : null;
@@ -120,6 +135,7 @@ router.get('/api/stream', wrap(async (req, res) => {
         if (!job) {
           job = fetchStreamBytes(url, headers, dispatcher).finally(() => _streamJobs.delete(key));
           _streamJobs.set(key, job);
+          logbus.debug('stream', '上流フェッチ（並行リクエスト束ね）', { v, itag, range: headers.Range, via: proxyUrl ? 'proxy' : 'direct' });
         }
         const hit = await job;
         if (!hit) throw new Error('upstream');
@@ -132,6 +148,7 @@ router.get('/api/stream', wrap(async (req, res) => {
         res.end(hit.buf);
         return;
       }
+      logbus.debug('stream', '上流リレー', { v, itag, range: headers.Range || '(full)', via: proxyUrl ? 'proxy' : 'direct', raw: !!rawRaw });
       await pipeUpstream(url, headers, req, res, { dispatcher });
       return;
     } catch (e) {
@@ -253,8 +270,34 @@ router.post('/api/proxies/refresh', wrap(async (req, res) => {
 }));
 
 router.get('/api/home', wrap(async (req, res) => {
-  res.json(await it.home(String(req.query.chip || 'all')));
+  const chip = String(req.query.chip || 'all');
+  homeHits.set(chip, Date.now());
+  const t0 = Date.now();
+  const out = await it.home(chip);
+  logbus.info('http', 'GET /api/home', { chip, ms: Date.now() - t0, items: out.items?.length || 0 });
+  res.json(out);
 }));
+
+/**
+ * 高速化（ホーム常時暖機）: 誰かが最近見たチップのキャッシュは、期限が切れる
+ * 少し前に裏で再構築しておく。利用者がいる間は初回待ちが一度も復帰しない。
+ * （見られていないチップは再構築しない = 無駄なプロキシ消費ゼロ）
+ */
+const homeHits = new Map(); // chip -> last request ts
+setInterval(() => {
+  if (!engineConfig.get('homeKeepWarm')) return;
+  const now = Date.now();
+  for (const [chip, ts] of [...homeHits]) {
+    if (now - ts > 10 * 60 * 1000) { homeHits.delete(chip); continue; }
+    const e = it.caches.api.map.get('home:' + chip);
+    const expiring = !e || (e.exp !== 0 && e.exp - now < 2 * 60 * 1000);
+    if (expiring) {
+      it.caches.api.delete('home:' + chip);
+      logbus.debug('engine', 'ホーム再暖機', { chip });
+      it.home(chip).catch(() => {});
+    }
+  }
+}, 60 * 1000).unref?.();
 
 /** personalized home — profile comes from client-local history/likes */
 router.post('/api/home/personal', wrap(async (req, res) => {
@@ -292,11 +335,18 @@ router.get('/api/watch/:id', wrap(async (req, res) => {
   const id = String(req.params.id || '');
   if (!/^[\w-]{11}$/.test(id)) { res.status(400).json({ error: 'bad id' }); return; }
   const list = String(req.query.list || '');
+  const t0 = Date.now();
   const data = await it.getVideoFull(id, list && /^[\w-]{1,64}$/.test(list) ? { playlistId: list } : {});
   res.json(data);
+  logbus.info('http', 'GET /api/watch/:id', {
+    v: id, ms: Date.now() - t0, playable: !!data.playable,
+    source: data.streams?.source || null, direct: !!data.streams?.direct?.url,
+  });
   // speculative warm: by the time the user presses play, the first bytes
   // of the default 360p stream are already in RAM.
   if (data.playable) warmDefault(id);
+  // コメント先行取得（高速化: コメント欄オープン時はキャッシュヒットで即応答）
+  warmComments(id, data.commentsToken);
 }));
 
 /** explicit warmer: fired by card-hover on the client */
@@ -312,7 +362,13 @@ router.get('/api/hotstat', (req, res) => res.json(hotChunks.status()));
 router.get('/api/comments/:id', wrap(async (req, res) => {
   const id = String(req.params.id || '');
   if (!/^[\w-]{11}$/.test(id)) { res.status(400).json({ error: 'bad id' }); return; }
-  res.json(await it.comments(id));
+  // 高速化: watch 応答に同梱された commentsToken を再利用すると、トークン発見の
+  // 往復が丸ごと消えてコメント取得が約半分のレイテンシになる。
+  const token = req.query.token ? String(req.query.token).slice(0, 8000) : undefined;
+  const t0 = Date.now();
+  const out = await it.comments(id, token);
+  logbus.info('http', 'GET /api/comments/:id', { v: id, ms: Date.now() - t0, n: (out.comments || []).length, tokenReuse: !!token });
+  res.json(out);
 }));
 
 router.get('/api/comments/next', wrap(async (req, res) => {

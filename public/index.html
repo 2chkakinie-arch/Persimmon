@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="theme-color" content="#ffffff">
+<meta name="theme-color" content="#0c0d10">
 <meta name="description" content="Vandal — the fastest video experience. Powered by llytpr++ direct-play engine.">
 <meta name="generator" content="llytpr++ direct-play engine (llytpr-wl.v01nh) — Vandal">
 <link rel="preconnect" href="https://i.ytimg.com" crossorigin>
@@ -11,35 +11,37 @@
 <link rel="preconnect" href="https://yt3.ggpht.com" crossorigin>
 <link rel="dns-prefetch" href="https://yt3.ggpht.com">
 <title>Vandal</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 22 22'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23ffb02e'/%3E%3Cstop offset='.5' stop-color='%23ff5a1e'/%3E%3Cstop offset='1' stop-color='%23e3143f'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='22' height='22' rx='6.5' fill='url(%23g)'/%3E%3Cpath fill='%23fff' d='M4.7 4.4h3.9l2.4 6.9 2.4-6.9h3.9l-4.6 11.1-1.7 1.3-1.7-1.3z'/%3E%3C/svg%3E">
+<!-- ロゴ差し替え: public/logo.svg（ロックアップ）と public/logo-mark.svg（マーク単体）
+     を同じファイル名で上書きするだけで、ヘッダー・ファビコン・設定ページがすべて変わります -->
+<link rel="icon" href="/logo-mark.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/styles.css">
+<script>
+/* テーマの初期適用（チラつき防止のため CSS より前のインラインで実行）
+   既定値は OS のダークモード設定に追従（保存があればそれを優先） */
+(function () {
+  try {
+    var saved = localStorage.getItem('llytpr-theme');
+    var dark = saved ? saved === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+    if (dark) document.documentElement.classList.add('dark');
+  } catch (_) {}
+})();
+</script>
 </head>
 <body>
 <header id="masthead">
   <div class="mh-start">
-    <button id="menu-btn" class="icon-btn" aria-label="メニュー" title="メニュー">
+    <button id="menu-btn" class="icon-btn" aria-label="メニュー（ナビゲーション）" title="ナビゲーション">
       <svg viewBox="0 0 24 24" class="ic"><path d="M3 5h18v2H3zm0 6h18v2H3zm0 6h18v2H3z"/></svg>
     </button>
+    <!-- ロゴ: /logo.svg を差し替えるだけで変更可能 -->
     <a class="logo" href="#/" aria-label="Vandal ホーム">
-      <svg viewBox="0 0 88 24" class="logo-svg" aria-hidden="true">
-        <defs>
-          <linearGradient id="vdl-g" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0" stop-color="#ffb02e"/>
-            <stop offset=".5" stop-color="#ff5a1e"/>
-            <stop offset="1" stop-color="#e3143f"/>
-          </linearGradient>
-        </defs>
-        <rect x="1" y="1" width="22" height="22" rx="6.5" fill="url(#vdl-g)" class="logo-mark"/>
-        <path fill="#fff" d="M5.7 5.4h3.9l2.4 6.9 2.4-6.9h3.9l-4.6 11.1-1.7 1.3-1.7-1.3z"/>
-        <text x="29.5" y="17.6" font-size="17" font-weight="800" font-family="'Roboto Condensed','Arial Narrow',Arial,sans-serif" letter-spacing="-0.5" fill="currentColor">Vandal</text>
-      </svg>
-      <sup class="country">β</sup>
+      <img src="/logo.svg" alt="Vandal" class="logo-img">
     </a>
   </div>
   <div class="mh-center">
     <form id="search-form" class="search" autocomplete="off">
       <div class="search-box">
-        <input id="search-input" type="text" placeholder="検索" aria-label="検索" spellcheck="false">
+        <input id="search-input" type="text" placeholder="検索 （ / でフォーカス）" aria-label="検索" spellcheck="false">
         <div id="suggest" class="suggest hidden"></div>
       </div>
       <button class="search-btn" type="submit" aria-label="検索" title="検索">
@@ -51,24 +53,20 @@
     </form>
   </div>
   <div class="mh-end">
-    <button id="opts-btn" class="icon-btn" aria-label="設定" title="設定">
-      <svg viewBox="0 0 24 24" class="ic"><path d="M12 8a1.2 1.2 0 1 0 0-2.4A1.2 1.2 0 0 0 12 8zm0 6.2a1.2 1.2 0 1 0 0-2.4 1.2 1.2 0 0 0 0 2.4zm0 6.2a1.2 1.2 0 1 0 0-2.4 1.2 1.2 0 0 0 0 2.4z"/></svg>
+    <button id="theme-toggle" class="icon-btn" aria-label="テーマ切り替え" title="テーマ切り替え">
+      <svg viewBox="0 0 24 24" class="ic theme-ic-moon"><path d="M12 22a10 10 0 0 1-6.9-17 10 10 0 1 0 14 15.6A10 10 0 0 1 12 22z"/></svg>
+      <svg viewBox="0 0 24 24" class="ic theme-ic-sun"><path d="M12 7a5 5 0 1 0 0 10 5 5 0 0 0 0-10zm0-6h0M11 1h2v3h-2zm0 19h2v3h-2zM1 11h3v2H1zm19 0h3v2h-3zM4.2 4.2l1.4 1.4-1.4 1.4L2.8 5.6zm14.2 14.2 1.4 1.4-1.4 1.4-1.4-1.4zM4.2 19.8l1.4-1.4 1.4 1.4-1.4 1.4zM18.4 5.6l1.4-1.4 1.4 1.4-1.4 1.4z"/></svg>
     </button>
-    <div id="opts-menu" class="menu hidden">
-      <button class="menu-item" id="theme-toggle">
-        <svg viewBox="0 0 24 24" class="ic"><path d="M12 22a10 10 0 0 1-6.9-17 10 10 0 1 0 14 15.6A10 10 0 0 1 12 22z"/></svg>
-        <span id="theme-label">ダーク モードに切り替え</span>
-      </button>
-      <button class="menu-item" onclick="toast('Vandal — Made by Kakinie with llytpr-wl.v01nh TEAM. V1')">
-        <svg viewBox="0 0 24 24" class="ic"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm1 15h-2v-6h2zm0-8h-2V7h2z"/></svg>
-        <span>Vandal について</span>
-      </button>
-    </div>
+    <a id="settings-btn" class="icon-btn" href="#/settings" aria-label="設定" title="設定・診断">
+      <svg viewBox="0 0 24 24" class="ic"><path d="M12 15.5A3.5 3.5 0 1 1 15.5 12 3.5 3.5 0 0 1 12 15.5zm7.4-2.6c.04-.3.07-.63.07-.95s-.02-.64-.08-.94l2.1-1.65a.5.5 0 0 0 .12-.64l-2-3.46a.5.5 0 0 0-.6-.22l-2.49 1a7.3 7.3 0 0 0-1.63-.95l-.38-2.65A.5.5 0 0 0 14 2h-4a.5.5 0 0 0-.5.42l-.38 2.65c-.59.24-1.13.56-1.63.95l-2.48-1a.5.5 0 0 0-.61.22l-2 3.46a.5.5 0 0 0 .12.64l2.1 1.65c-.06.3-.08.62-.08.94s.02.64.08.94l-2.1 1.65a.5.5 0 0 0-.12.64l2 3.46c.13.22.39.31.6.22l2.49-1c.5.38 1.04.7 1.63.94l.38 2.66a.5.5 0 0 0 .5.41h4a.5.5 0 0 0 .5-.42l.38-2.65c.59-.24 1.13-.56 1.63-.95l2.48 1a.5.5 0 0 0 .61-.22l2-3.46a.5.5 0 0 0-.12-.64z"/></svg>
+    </a>
   </div>
 </header>
 
 <div id="page">
-  <nav id="mini-guide">
+  <!-- ナビゲーションドロワー（既定は閉じた状態。menu-btn で開閉、状態は記憶） -->
+  <nav id="mini-guide" aria-label="ナビゲーション">
+    <div class="guide-scroll">
     <a class="guide-item" href="#/" data-nav="home">
       <svg viewBox="0 0 24 24" class="ic"><path d="M12 3l9 8h-3v9h-4v-6h-4v6H6v-9H3z"/></svg>
       <span>ホーム</span>
@@ -85,18 +83,30 @@
       <svg viewBox="0 0 24 24" class="ic"><path d="M12 4a3.5 3.5 0 1 1 0 7 3.5 3.5 0 0 1 0-7zm0 18c-3.2 0-6-.5-6-1.5 0-2.5 3.5-4 6-4s6 1.5 6 4c0 1-2.8 1.5-6 1.5z"/></svg>
       <span>マイページ</span>
     </a>
+    <div class="guide-sep"></div>
+    <a class="guide-item" href="#/settings" data-nav="settings">
+      <svg viewBox="0 0 24 24" class="ic"><path d="M12 15.5A3.5 3.5 0 1 1 15.5 12 3.5 3.5 0 0 1 12 15.5zm7.4-2.6c.04-.3.07-.63.07-.95s-.02-.64-.08-.94l2.1-1.65a.5.5 0 0 0 .12-.64l-2-3.46a.5.5 0 0 0-.6-.22l-2.49 1a7.3 7.3 0 0 0-1.63-.95l-.38-2.65A.5.5 0 0 0 14 2h-4a.5.5 0 0 0-.5.42l-.38 2.65c-.59.24-1.13.56-1.63.95l-2.48-1a.5.5 0 0 0-.61.22l-2 3.46a.5.5 0 0 0 .12.64l2.1 1.65c-.06.3-.08.62-.08.94s.02.64.08.94l-2.1 1.65a.5.5 0 0 0-.12.64l2 3.46c.13.22.39.31.6.22l2.49-1c.5.38 1.04.7 1.63.94l.38 2.66a.5.5 0 0 0 .5.41h4a.5.5 0 0 0 .5-.42l.38-2.65c.59-.24 1.13-.56 1.63-.95l2.48 1a.5.5 0 0 0 .61-.22l2-3.46a.5.5 0 0 0-.12-.64z"/></svg>
+      <span>設定・診断</span>
+    </a>
+    </div>
     <div class="guide-foot">
-      <div class="foot-links">
-        <span>概要</span><span>プレス</span><span>著作権</span><span>お問い合わせ</span><span>クリエイター</span><span>広告</span><span>デベロッパー</span>
-      </div>
       <div class="foot-credit">Made by Kakinie<br>with llytpr-wl.v01nh TEAM. V1</div>
     </div>
   </nav>
+  <div id="nav-backdrop" aria-hidden="true"></div>
 
   <main id="content" tabindex="-1">
     <div id="app"></div>
   </main>
 </div>
+
+<!-- モバイル用ボトムナビ -->
+<nav id="bottom-nav" aria-label="モバイルナビゲーション">
+  <a href="#/" data-nav="home"><svg viewBox="0 0 24 24" class="ic"><path d="M12 3l9 8h-3v9h-4v-6h-4v6H6v-9H3z"/></svg><span>ホーム</span></a>
+  <a href="#/shorts" data-nav="shorts"><svg viewBox="0 0 24 24" class="ic"><path d="M10 15l5.2-3L10 9zM20.2 4.2a10 10 0 0 0-9.6.3A10 9 0 0 0 5 14 10 10 0 0 0 20.2 4.2zm-2.5 13A8.3 8.3 0 0 1 8.3 4.9a8.3 8.3 0 0 1 9.4 12.3z"/></svg><span>ショート</span></a>
+  <a href="#/feed/you" data-nav="you"><svg viewBox="0 0 24 24" class="ic"><path d="M12 4a3.5 3.5 0 1 1 0 7 3.5 3.5 0 0 1 0-7zm0 18c-3.2 0-6-.5-6-1.5 0-2.5 3.5-4 6-4s6 1.5 6 4c0 1-2.8 1.5-6 1.5z"/></svg><span>マイページ</span></a>
+  <a href="#/settings" data-nav="settings"><svg viewBox="0 0 24 24" class="ic"><path d="M12 15.5A3.5 3.5 0 1 1 15.5 12 3.5 3.5 0 0 1 12 15.5zm7.4-2.6c.04-.3.07-.63.07-.95s-.02-.64-.08-.94l2.1-1.65a.5.5 0 0 0 .12-.64l-2-3.46a.5.5 0 0 0-.6-.22l-2.49 1a7.3 7.3 0 0 0-1.63-.95l-.38-2.65A.5.5 0 0 0 14 2h-4a.5.5 0 0 0-.5.42l-.38 2.65c-.59.24-1.13.56-1.63.95l-2.48-1a.5.5 0 0 0-.61.22l-2 3.46a.5.5 0 0 0 .12.64l2.1 1.65c-.06.3-.08.62-.08.94s.02.64.08.94l-2.1 1.65a.5.5 0 0 0-.12.64l2 3.46c.13.22.39.31.6.22l2.49-1c.5.38 1.04.7 1.63.94l.38 2.66a.5.5 0 0 0 .5.41h4a.5.5 0 0 0 .5-.42l.38-2.65c.59-.24 1.13-.56 1.63-.95l2.48 1a.5.5 0 0 0 .61-.22l2-3.46a.5.5 0 0 0-.12-.64z"/></svg><span>設定</span></a>
+</nav>
 
 <div id="toast" class="hidden"></div>
 <script src="/vendor/hls.min.js" defer></script>
